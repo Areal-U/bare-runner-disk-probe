@@ -1,0 +1,187 @@
+name: Bare ARM64 compile probe
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  compile-probe:
+    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    concurrency:
+      group: bare-arm64-compile-probe
+      cancel-in-progress: false
+    env:
+      BARE_REV: e776f77629bb915e0f3df63449f1f993cc1b0648
+      CHROMIUM_REV: 2f9a11097447f226133bc1a31c787291a5eeab98
+      DEPOT_REV: 96a7c1418eedaa6bea333a8941e8a0078681b4d0
+      GIT_TERMINAL_PROMPT: '0'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Reclaim runner space and start the pinned Bare container
+        timeout-minutes: 25
+        run: |
+          if [[ $GITHUB_EVENT_NAME != workflow_dispatch || $RUNNER_ENVIRONMENT != github-hosted || $RUNNER_ARCH != X64 ]]; then
+            echo 'Expected a manually started GitHub-hosted x64 runner.' >&2
+            exit 1
+          fi
+          . /etc/os-release
+          [[ $ID == ubuntu && $VERSION_ID == 24.04 ]]
+          docker_root=$(sudo -n docker info --format '{{.DockerRootDir}}')
+          [[ $docker_root == /* ]]
+          echo "Runner image: ${ImageVersion:-unknown}"
+          sudo -n df -B1 -- "$docker_root"
+          awk '/^(MemTotal|MemAvailable|SwapTotal):/' /proc/meminfo
+
+          tool_dirs=(
+            /usr/local/lib/android
+            /usr/local/share/boost
+            /usr/share/dotnet
+            /usr/share/swift
+            /usr/local/.ghcup
+            /opt/ghc
+            /usr/lib/google-cloud-sdk
+          )
+          for path in "${tool_dirs[@]}"; do
+            if [[ -d $path && $(realpath -- "$path") == "$path" ]] && ! mountpoint -q -- "$path"; then
+              sudo -n rm -rf --one-file-system -- "$path"
+            fi
+          done
+          sudo -n df -B1 -- "$docker_root"
+
+          mkdir "$RUNNER_TEMP/bare-official"
+          cd "$RUNNER_TEMP/bare-official"
+          git init -q
+          git fetch --no-tags --depth=1 https://github.com/BareBrowser/bare-browser.git "$BARE_REV"
+          git checkout --detach FETCH_HEAD
+          [[ $(git rev-parse HEAD) == "$BARE_REV" ]]
+          shopt -s nullglob
+          patches=(patches/*.patch)
+          [[ ${#patches[@]} == 296 ]]
+          cp -R patches exchange/
+          crx=third_party/ublock_origin/uBlockOrigin-1.75.0.crx
+          printf '%s  %s\n' d688ed3f0262ec4f8bdcd4c8f65987c5444c560aeb387a9e02aca1facdfa7046 "$crx" | sha256sum --check --strict
+          cp "$crx" exchange/ublock_origin.crx
+          awk '/^```gn$/ { gn = 1; next } gn && /^```$/ { exit } gn { print }' docs/build-from-source.md > exchange/args.gn
+          printf '%s  %s\n' 6fb681205a50bf9b20d6c1f18a4dd5708bcd99cfc258e577069442a8be2114ab exchange/args.gn | sha256sum --check --strict
+          [[ $(python3 tools/version.py gn arm64) == "$(grep '^android_override_version_' exchange/args.gn)" ]]
+
+          bash builder.sh build
+          bash builder.sh start
+          docker compose exec -T chromium-builder bash -seu <<'CONTAINER'
+          id
+          test -w /work
+          df -B1 /work
+          free_bytes=$(df -B1 --output=avail /work | awk 'NR == 2 { print $1 }')
+          if (( free_bytes < 100000000000 )); then
+            echo 'Stopping before checkout: the build volume has less than 100 GB free.' >&2
+            exit 1
+          fi
+          CONTAINER
+
+      - name: Fetch only the pinned Chromium revision and Android dependencies
+        timeout-minutes: 220
+        run: |
+          cd "$RUNNER_TEMP/bare-official"
+          docker compose exec -T -e "DEPOT_REV=$DEPOT_REV" -e "CHROMIUM_REV=$CHROMIUM_REV" -e GIT_TERMINAL_PROMPT=0 chromium-builder \
+            timeout --kill-after=2m 210m bash -seu <<'CONTAINER'
+          set -o pipefail
+          export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
+          git init -q "$HOME/depot_tools"
+          git -C "$HOME/depot_tools" fetch --no-tags --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_REV"
+          git -C "$HOME/depot_tools" checkout --detach FETCH_HEAD
+          [[ $(git -C "$HOME/depot_tools" rev-parse HEAD) == "$DEPOT_REV" ]]
+          "$HOME/depot_tools/ensure_bootstrap"
+          mkdir /work/chromium
+          cd /work/chromium
+          cat > .gclient <<'GCLIENT'
+          solutions = [{
+              'name': 'src',
+              'url': 'https://chromium.googlesource.com/chromium/src.git',
+              'deps_file': 'DEPS',
+              'managed': False,
+              'custom_deps': {},
+              'custom_vars': {},
+          }]
+          target_os = ['linux', 'android']
+          cache_dir = None
+          GCLIENT
+          gclient sync --no-history --nohooks --revision "src@$CHROMIUM_REV" --jobs 4
+          [[ $(git -C src rev-parse HEAD) == "$CHROMIUM_REV" ]]
+          df -B1 /work
+          CONTAINER
+
+      - name: Install build tools, apply Bare patches, and generate ARM64 build rules
+        timeout-minutes: 65
+        run: |
+          cd "$RUNNER_TEMP/bare-official"
+          docker compose exec -T -e GIT_TERMINAL_PROMPT=0 chromium-builder \
+            timeout --kill-after=2m 60m bash -seu <<'CONTAINER'
+          set -o pipefail
+          export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
+          cd /work/chromium/src
+          echo 'Installing Chromium build dependencies'
+          ./build/install-build-deps.sh --android --no-prompt
+          echo 'Running Chromium checkout hooks'
+          gclient runhooks
+          df -B1 /work
+          echo 'Applying the official Bare patch series'
+          git apply --index /exchange/patches/*.patch
+          mkdir -p chrome/browser/resources/bare out/Bare
+          cp /exchange/ublock_origin.crx chrome/browser/resources/bare/ublock_origin.crx
+          cp /exchange/args.gn out/Bare/args.gn
+          echo 'Generating ARM64 build rules'
+          gn gen out/Bare
+          df -B1 /work
+          CONTAINER
+
+      - name: Compile a Chromium C++ target for Android ARM64
+        timeout-minutes: 18
+        run: |
+          cd "$RUNNER_TEMP/bare-official"
+          docker compose exec -T -e GIT_TERMINAL_PROMPT=0 chromium-builder \
+            timeout --kill-after=2m 15m bash -seu <<'CONTAINER'
+          set -o pipefail
+          export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
+          cd /work/chromium/src
+          autoninja -C out/Bare -j 1 -v base/third_party/cityhash:cityhash
+          object=$(find out/Bare/obj/base/third_party/cityhash -type f -name city.o -print -quit)
+          [[ -n $object && -s $object ]]
+          format=$(file -b "$object")
+          printf 'Compiled %s: %s\n' "$object" "$format"
+          if [[ $format == *LLVM*bitcode* ]]; then
+            # ThinLTO can emit bitcode. Infer the architecture from this one object.
+            relocatable=out/Bare/city-probe.elf
+            third_party/llvm-build/Release+Asserts/bin/ld.lld -r --threads=1 -o "$relocatable" "$object"
+            object=$relocatable
+          fi
+          header=$(LC_ALL=C readelf -h "$object")
+          printf '%s\n' "$header"
+          grep -Eq 'Machine:[[:space:]]+AArch64' <<< "$header"
+          echo 'ARM64 compile probe passed.'
+          CONTAINER
+
+      - name: Record final disk and memory diagnostics
+        if: ${{ always() }}
+        timeout-minutes: 3
+        run: |
+          awk '/^(MemTotal|MemAvailable|SwapTotal):/' /proc/meminfo
+          df -B1 /
+          if [[ -f $RUNNER_TEMP/bare-official/docker-compose.yml ]]; then
+            cd "$RUNNER_TEMP/bare-official"
+            docker inspect --format 'Container status={{.State.Status}} OOMKilled={{.State.OOMKilled}}' chromium-android-builder || true
+            docker compose exec -T chromium-builder bash -c '
+              df -B1 /work
+              for file in memory.max memory.peak memory.swap.max memory.events; do
+                path=/sys/fs/cgroup/$file
+                if test -r "$path"; then
+                  printf "%s:\n" "$file"
+                  cat "$path"
+                fi
+              done
+            ' || true
+          fi
