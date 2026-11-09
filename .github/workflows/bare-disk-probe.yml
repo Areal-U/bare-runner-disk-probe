@@ -1,0 +1,82 @@
+name: Bare runner disk probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      reclaim:
+        description: Measure again after removing listed unused tools from the temporary runner
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  measure:
+    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RECLAIM: ${{ inputs.reclaim }}
+    steps:
+      - name: Measure runner disk and optional reclamation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ${GITHUB_EVENT_NAME:-} != workflow_dispatch ||
+                ${RUNNER_ENVIRONMENT:-} != github-hosted ||
+                ${RUNNER_ARCH:-} != X64 ]]; then
+            echo 'Expected a manually started GitHub-hosted x64 runner.' >&2
+            exit 1
+          fi
+
+          . /etc/os-release
+          if [[ $ID != ubuntu || $VERSION_ID != 24.04 ]]; then
+            echo 'Expected Ubuntu 24.04.' >&2
+            exit 1
+          fi
+
+          docker_root=$(sudo -n docker info --format '{{.DockerRootDir}}')
+          if [[ $docker_root != /* ]] || ! sudo -n test -d "$docker_root"; then
+            echo 'Cannot locate the Docker data directory.' >&2
+            exit 1
+          fi
+
+          report_disk() {
+            for path in / /mnt "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "$docker_root"; do
+              if sudo -n test -d "$path"; then
+                printf '\n%s\n' "$path"
+                sudo -n df -B1 --output=source,fstype,size,used,avail,itotal,iavail,target -- "$path"
+              fi
+            done
+          }
+
+          printf 'Image: %s\n' "${ImageVersion:-unknown}"
+          lsblk --bytes --output NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS
+          echo 'Before reclaim'
+          report_disk
+
+          # These preinstalled toolchains are outside the official Bare build container.
+          tool_dirs=(
+            /usr/local/lib/android
+            /usr/local/share/boost
+            /usr/share/dotnet
+            /usr/share/swift
+            /usr/local/.ghcup
+            /opt/ghc
+            /usr/lib/google-cloud-sdk
+          )
+          echo 'Allocated bytes in optional tool directories'
+          for path in "${tool_dirs[@]}"; do
+            if [[ -d $path && $(realpath -- "$path") == "$path" ]] && ! mountpoint -q -- "$path"; then
+              sudo -n du -s -x -B1 -- "$path"
+              if [[ $RECLAIM == true ]]; then
+                sudo -n rm -rf --one-file-system -- "$path"
+              fi
+            fi
+          done
+
+          if [[ $RECLAIM == true ]]; then
+            echo 'After reclaim'
+            report_disk
+          fi
