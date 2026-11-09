@@ -126,9 +126,11 @@ jobs:
 
       - name: Install build tools, apply Bare patches, and generate ARM64 build rules
         timeout-minutes: 65
+        env:
+          PROBE_MODE: ${{ inputs.probe }}
         run: |
           cd "$RUNNER_TEMP/bare-official"
-          docker compose exec -T -e GIT_TERMINAL_PROMPT=0 chromium-builder \
+          docker compose exec -T -e GIT_TERMINAL_PROMPT=0 -e "PROBE_MODE=$PROBE_MODE" chromium-builder \
             timeout --kill-after=2m 60m bash -seu <<'CONTAINER'
           set -o pipefail
           export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
@@ -137,6 +139,15 @@ jobs:
           ./build/install-build-deps.sh --android --no-prompt
           echo 'Running Chromium checkout hooks'
           gclient runhooks
+          if [[ $PROBE_MODE == apk ]]; then
+            echo 'Fetching and validating the V8 builtin PGO profiles for the pinned revision'
+            (
+              cd /work/chromium
+              python3 src/v8/tools/builtins-pgo/download_profiles.py download \
+                --depot-tools src/third_party/depot_tools --check-v8-revision --quiet
+              test -s src/v8/tools/builtins-pgo/profiles/x64.profile
+            )
+          fi
           df -B1 /work
           echo 'Applying the official Bare patch series'
           git apply --index /exchange/patches/*.patch
