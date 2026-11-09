@@ -2,6 +2,14 @@ name: Bare ARM64 compile probe
 
 on:
   workflow_dispatch:
+    inputs:
+      probe:
+        description: Build target to test (APK mode leaves only logs)
+        type: choice
+        default: smoke
+        options:
+          - smoke
+          - apk
 
 permissions: {}
 
@@ -25,6 +33,7 @@ jobs:
       - name: Reclaim runner space and start the pinned Bare container
         timeout-minutes: 25
         run: |
+          date +%s > "$RUNNER_TEMP/bare-probe-start"
           if [[ $GITHUB_EVENT_NAME != workflow_dispatch || $RUNNER_ENVIRONMENT != github-hosted || $RUNNER_ARCH != X64 ]]; then
             echo 'Expected a manually started GitHub-hosted x64 runner.' >&2
             exit 1
@@ -140,6 +149,7 @@ jobs:
           CONTAINER
 
       - name: Compile a Chromium C++ target for Android ARM64
+        if: ${{ inputs.probe == 'smoke' }}
         timeout-minutes: 18
         run: |
           cd "$RUNNER_TEMP/bare-official"
@@ -164,6 +174,118 @@ jobs:
           grep -Eq 'Machine:[[:space:]]+AArch64' <<< "$header"
           echo 'ARM64 compile probe passed.'
           CONTAINER
+
+      - name: Build and verify the official ARM64 APK within runner limits
+        if: ${{ inputs.probe == 'apk' }}
+        timeout-minutes: 330
+        run: |
+          cd "$RUNNER_TEMP/bare-official"
+          remaining=$(( 325 * 60 - ($(date +%s) - $(cat "$RUNNER_TEMP/bare-probe-start")) ))
+          if (( remaining <= 0 )); then
+            echo 'No time left for the APK target in the probe budget.' >&2
+            exit 124
+          fi
+          docker compose exec -T -w /work/chromium/src -e "BARE_BUILD_SECONDS=$remaining" \
+            -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 -e GIT_TERMINAL_PROMPT=0 \
+            chromium-builder python3 -u - <<'PYTHON'
+          import contextlib
+          import os
+          from pathlib import Path
+          import shutil
+          import signal
+          import subprocess
+          import time
+          from zipfile import ZipFile
+
+          cgroup = Path('/sys/fs/cgroup')
+          disk_floor = 10_000_000_000
+          sample_interval = 120
+          start = time.monotonic()
+          budget = int(os.environ['BARE_BUILD_SECONDS'])
+
+          def fields(path, keys):
+              try:
+                  with path.open() as stream:
+                      return {name.rstrip(':'): value for name, value, *_ in
+                              (line.split() for line in stream) if name.rstrip(':') in keys}
+              except OSError:
+                  return {}
+
+          def sample():
+              free = shutil.disk_usage('/work').free
+              host = fields(Path('/proc/meminfo'), {'MemAvailable', 'SwapFree'})
+              memory = fields(cgroup / 'memory.stat', {'anon', 'file'})
+              events = fields(cgroup / 'memory.events', {'oom', 'oom_kill'})
+              print(f'sample elapsed_s={int(time.monotonic() - start)} work_free_bytes={free} '
+                    f'host_kib={host} container_bytes={memory} memory_events={events}')
+              return free, events.get('oom_kill')
+
+          def stop(build):
+              with contextlib.suppress(ProcessLookupError):
+                  os.killpg(build.pid, signal.SIGINT)
+              try:
+                  build.wait(timeout=120)
+              except subprocess.TimeoutExpired:
+                  print('Build did not stop after SIGINT; sending SIGKILL to its process group.')
+                  with contextlib.suppress(ProcessLookupError):
+                      os.killpg(build.pid, signal.SIGKILL)
+                  build.wait()
+
+          print(f'Building chrome_public_apk with -j 2, budget={budget}s, disk floor={disk_floor} bytes.')
+          free, oom_before = sample()
+          if free < disk_floor:
+              print('Probe stopped before compilation: free disk below guard threshold.')
+              raise SystemExit(75)
+
+          build = subprocess.Popen(['autoninja', '-C', 'out/Bare', '-j', '2', 'chrome_public_apk'],
+                                   stdin=subprocess.DEVNULL, start_new_session=True)
+          stop_code = 0
+          try:
+              while build.poll() is None:
+                  remaining = budget - (time.monotonic() - start)
+                  if remaining <= 0:
+                      print('Probe stopping at the planned wall-time limit.')
+                      stop_code = 124
+                      break
+                  try:
+                      build.wait(timeout=min(sample_interval, remaining))
+                  except subprocess.TimeoutExpired:
+                      free, _ = sample()
+                      if free < disk_floor:
+                          print('Probe stopping at the free-disk guard threshold.')
+                          stop_code = 75
+                          break
+          finally:
+              if build.poll() is None:
+                  stop(build)
+              _, oom_after = sample()
+
+          if oom_before is not None and oom_after is not None:
+              print(f'Build-stage container oom_kill delta: {int(oom_after) - int(oom_before)}')
+          print(f'Build process exit status: {build.returncode}')
+          subprocess.run(['timeout', '60s', 'du', '-sx', '-B1', 'out/Bare'], check=False)
+          if stop_code:
+              raise SystemExit(stop_code)
+          if build.returncode:
+              raise SystemExit(build.returncode if build.returncode > 0 else 128 - build.returncode)
+
+          apk = Path('out/Bare/apks/ChromePublic.apk')
+          with ZipFile(apk) as archive:
+              invalid = archive.testzip()
+              if invalid is not None:
+                  raise SystemExit(f'APK ZIP integrity check failed: {invalid}')
+              for name in archive.namelist():
+                  if name.startswith('lib/arm64-v8a/') and name.endswith('.so'):
+                      with archive.open(name) as member:
+                          header = member.read(20)
+                      if header[:6] == b'\x7fELF\x02\x01' and header[18:20] == b'\xb7\x00':
+                          print(f'APK contains AArch64 ELF: {name}')
+                          break
+              else:
+                  raise SystemExit('APK contains no verified AArch64 ELF library.')
+          print(f'APK built and verified: {apk} ({apk.stat().st_size} bytes)')
+          subprocess.run(['sha256sum', str(apk)], check=True)
+          PYTHON
 
       - name: Record final disk and memory diagnostics
         if: ${{ always() }}
