@@ -1,426 +1,583 @@
-name: Bare ARM64 compile probe
-
-on:
+name: Bare ARM64 compile and checkpoint probe
+'on':
   workflow_call:
     inputs:
       probe:
         type: string
         default: smoke
+      expected_checkpoint_key:
+        type: string
+        default: ''
       expected_checkpoint_sha:
         type: string
         default: ''
+      expected_checkpoint_identity:
+        type: string
+        default: ''
+      expected_base_image:
+        type: string
+        default: ''
     outputs:
+      checkpoint_key:
+        value: ${{ jobs.compile-probe.outputs.checkpoint_key }}
       checkpoint_sha:
         value: ${{ jobs.compile-probe.outputs.checkpoint_sha }}
+      checkpoint_identity:
+        value: ${{ jobs.compile-probe.outputs.checkpoint_identity }}
+      base_image:
+        value: ${{ jobs.compile-probe.outputs.base_image }}
   workflow_dispatch:
     inputs:
       probe:
-        description: Build target to test (APK mode leaves only logs)
+        description: Only the short ARM64 smoke target; use the transfer workflow for APK interruption
         type: choice
         default: smoke
         options:
-          - smoke
-          - apk
-
+        - smoke
 permissions: {}
-
 jobs:
   compile-probe:
-    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' && github.ref == 'refs/heads/main' }}
+    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' && github.ref == 'refs/heads/main'
+      }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    timeout-minutes: 120
     concurrency:
       group: bare-arm64-compile-probe
       cancel-in-progress: false
     outputs:
+      checkpoint_key: ${{ steps.identity.outputs.key }}
       checkpoint_sha: ${{ steps.pack-checkpoint.outputs.sha }}
+      checkpoint_identity: ${{ steps.pack-checkpoint.outputs.identity }}
+      base_image: ${{ steps.prepare.outputs.base_image }}
     env:
       BARE_REV: e776f77629bb915e0f3df63449f1f993cc1b0648
       CHROMIUM_REV: 2f9a11097447f226133bc1a31c787291a5eeab98
       DEPOT_REV: 96a7c1418eedaa6bea333a8941e8a0078681b4d0
       GIT_TERMINAL_PROMPT: '0'
+      PROBE_MODE: ${{ inputs.probe }}
     defaults:
       run:
         shell: bash
     steps:
-      - name: Reclaim runner space and start the pinned Bare container
-        timeout-minutes: 25
-        run: |
-          date +%s > "$RUNNER_TEMP/bare-probe-start"
-          if [[ $GITHUB_EVENT_NAME != workflow_dispatch || $RUNNER_ENVIRONMENT != github-hosted || $RUNNER_ARCH != X64 ]]; then
-            echo 'Expected a manually started GitHub-hosted x64 runner.' >&2
-            exit 1
-          fi
-          . /etc/os-release
-          [[ $ID == ubuntu && $VERSION_ID == 24.04 ]]
-          docker_root=$(sudo -n docker info --format '{{.DockerRootDir}}')
-          [[ $docker_root == /* ]]
-          echo "Runner image: ${ImageVersion:-unknown}"
-          sudo -n df -B1 -- "$docker_root"
-          awk '/^(MemTotal|MemAvailable|SwapTotal):/' /proc/meminfo
-
-          tool_dirs=(
-            /usr/local/lib/android
-            /usr/local/share/boost
-            /usr/share/dotnet
-            /usr/share/swift
-            /usr/local/.ghcup
-            /opt/ghc
-            /usr/lib/google-cloud-sdk
-          )
-          for path in "${tool_dirs[@]}"; do
-            if [[ -d $path && $(realpath -- "$path") == "$path" ]] && ! mountpoint -q -- "$path"; then
-              sudo -n rm -rf --one-file-system -- "$path"
-            fi
-          done
-          sudo -n df -B1 -- "$docker_root"
-
-          mkdir "$RUNNER_TEMP/bare-official"
-          cd "$RUNNER_TEMP/bare-official"
-          git init -q
-          git fetch --no-tags --depth=1 https://github.com/BareBrowser/bare-browser.git "$BARE_REV"
-          git checkout --detach FETCH_HEAD
-          [[ $(git rev-parse HEAD) == "$BARE_REV" ]]
-          shopt -s nullglob
-          patches=(patches/*.patch)
-          [[ ${#patches[@]} == 296 ]]
-          cp -R patches exchange/
-          crx=third_party/ublock_origin/uBlockOrigin-1.75.0.crx
-          printf '%s  %s\n' d688ed3f0262ec4f8bdcd4c8f65987c5444c560aeb387a9e02aca1facdfa7046 "$crx" | sha256sum --check --strict
-          cp "$crx" exchange/ublock_origin.crx
-          awk '/^```gn$/ { gn = 1; next } gn && /^```$/ { exit } gn { print }' docs/build-from-source.md > exchange/args.gn
-          printf '%s  %s\n' 6fb681205a50bf9b20d6c1f18a4dd5708bcd99cfc258e577069442a8be2114ab exchange/args.gn | sha256sum --check --strict
-          [[ $(python3 tools/version.py gn arm64) == "$(grep '^android_override_version_' exchange/args.gn)" ]]
-
-          bash builder.sh build
-          bash builder.sh start
-          docker compose exec -T chromium-builder bash -seu <<'CONTAINER'
-          id
-          test -w /work
-          df -B1 /work
-          free_bytes=$(df -B1 --output=avail /work | awk 'NR == 2 { print $1 }')
-          if (( free_bytes < 100000000000 )); then
-            echo 'Stopping before checkout: the build volume has less than 100 GB free.' >&2
-            exit 1
-          fi
-          CONTAINER
-
-      - name: Fetch only the pinned Chromium revision and Android dependencies
-        timeout-minutes: 220
-        run: |
-          cd "$RUNNER_TEMP/bare-official"
-          docker compose exec -T -e "DEPOT_REV=$DEPOT_REV" -e "CHROMIUM_REV=$CHROMIUM_REV" -e GIT_TERMINAL_PROMPT=0 chromium-builder \
-            timeout --kill-after=2m 210m bash -seu <<'CONTAINER'
-          set -o pipefail
-          export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
-          git init -q "$HOME/depot_tools"
-          git -C "$HOME/depot_tools" fetch --no-tags --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_REV"
-          git -C "$HOME/depot_tools" checkout --detach FETCH_HEAD
-          [[ $(git -C "$HOME/depot_tools" rev-parse HEAD) == "$DEPOT_REV" ]]
-          "$HOME/depot_tools/ensure_bootstrap"
-          mkdir /work/chromium
-          cd /work/chromium
-          cat > .gclient <<'GCLIENT'
-          solutions = [{
-              'name': 'src',
-              'url': 'https://chromium.googlesource.com/chromium/src.git',
-              'deps_file': 'DEPS',
-              'managed': False,
-              'custom_deps': {},
-              'custom_vars': {},
-          }]
-          target_os = ['linux', 'android']
-          cache_dir = None
-          GCLIENT
-          gclient sync --no-history --nohooks --revision "src@$CHROMIUM_REV" --jobs 4
-          [[ $(git -C src rev-parse HEAD) == "$CHROMIUM_REV" ]]
-          df -B1 /work
-          CONTAINER
-
-      - name: Install build tools, apply Bare patches, and generate ARM64 build rules
-        timeout-minutes: 65
-        env:
-          PROBE_MODE: ${{ inputs.probe }}
-        run: |
-          cd "$RUNNER_TEMP/bare-official"
-          docker compose exec -T -e GIT_TERMINAL_PROMPT=0 -e "PROBE_MODE=$PROBE_MODE" chromium-builder \
-            timeout --kill-after=2m 60m bash -seu <<'CONTAINER'
-          set -o pipefail
-          export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
-          cd /work/chromium/src
-          echo 'Installing Chromium build dependencies'
-          ./build/install-build-deps.sh --android --no-prompt
-          echo 'Running Chromium checkout hooks'
-          gclient runhooks
-          if [[ $PROBE_MODE == apk ]]; then
-            echo 'Fetching and validating the V8 builtin PGO profiles for the pinned revision'
-            (
-              cd /work/chromium
-              python3 src/v8/tools/builtins-pgo/download_profiles.py download \
-                --depot-tools src/third_party/depot_tools --check-v8-revision --quiet
-              test -s src/v8/tools/builtins-pgo/profiles/x64.profile
-            )
-          fi
-          df -B1 /work
-          echo 'Applying the official Bare patch series'
-          git apply --index /exchange/patches/*.patch
-          mkdir -p chrome/browser/resources/bare out/Bare
-          cp /exchange/ublock_origin.crx chrome/browser/resources/bare/ublock_origin.crx
-          cp /exchange/args.gn out/Bare/args.gn
-          echo 'Generating ARM64 build rules'
-          gn gen out/Bare
-          df -B1 /work
-          CONTAINER
-
-      - name: Prepare the checkpoint helper
-        if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
-        timeout-minutes: 3
-        run: |
-          cd "$RUNNER_TEMP/bare-official"
+    - name: Validate the bounded mode and producer checkpoint identity
+      id: identity
+      env:
+        EXPECTED_KEY: ${{ inputs.expected_checkpoint_key }}
+        EXPECTED_SHA: ${{ inputs.expected_checkpoint_sha }}
+        EXPECTED_IDENTITY: ${{ inputs.expected_checkpoint_identity }}
+        EXPECTED_BASE: ${{ inputs.expected_base_image }}
+      run: |
+        date +%s > "$RUNNER_TEMP/bare-probe-start"
+        if [[ $GITHUB_EVENT_NAME != workflow_dispatch || $RUNNER_ENVIRONMENT != github-hosted || $RUNNER_ARCH != X64 ]]; then
+          echo 'Expected a manually started GitHub-hosted x64 runner.' >&2
+          exit 1
+        fi
+        case "$PROBE_MODE" in
+          smoke|checkpoint-seed) ;;
+          checkpoint-restore)
+            [[ $EXPECTED_KEY =~ ^bare-transfer-v2-[0-9]+-[0-9]+-checkpoint-seed$ ]]
+            [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_IDENTITY =~ ^[0-9a-f]{64}$ ]]
+            [[ $EXPECTED_BASE =~ ^ubuntu@sha256:[0-9a-f]{64}$ ]]
+            ;;
+          *) echo 'Only smoke and the bounded two-job checkpoint probe are enabled. The old logs-only APK mode is disabled.' >&2; exit 1 ;;
+        esac
+        if [[ $PROBE_MODE != checkpoint-restore ]]; then
+          [[ -z $EXPECTED_KEY && -z $EXPECTED_SHA && -z $EXPECTED_IDENTITY && -z $EXPECTED_BASE ]]
+        fi
+        if [[ $PROBE_MODE == checkpoint-* ]]; then
+          echo "key=bare-transfer-v2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$PROBE_MODE" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Load the exact CI code before costly preparation
+      if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
+      timeout-minutes: 5
+      run: |
+        mkdir -p "$RUNNER_TEMP/bare-ci"
+        for file in checkpoint.py build_trial.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+          source=$file
+          [[ $file != *.yml ]] || source=".github/workflows/$file"
           curl --fail --location --retry 2 --max-time 60 \
-            "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/checkpoint.py" \
-            --output exchange/checkpoint.py
+            "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/$source" \
+            --output "$RUNNER_TEMP/bare-ci/$file"
+        done
+        python3 -m py_compile "$RUNNER_TEMP/bare-ci/checkpoint.py" "$RUNNER_TEMP/bare-ci/build_trial.py"
+    - name: Check repository cache headroom without deleting older checkpoints
+      if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
+      timeout-minutes: 5
+      run: |
+        python3 - <<'PYTHON'
+        import json, os, time, urllib.request
+        base = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/actions'
+        def get(suffix):
+            for attempt in range(3):
+                try:
+                    request = urllib.request.Request(base + suffix, headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'bare-bounded-checkpoint'})
+                    with urllib.request.urlopen(request, timeout=15) as response:
+                        return json.load(response)
+                except (OSError, ValueError):
+                    if attempt == 2:
+                        raise
+                    time.sleep(2)
+        usage = get('/cache/usage')
+        caches = []
+        for page in range(1, 11):
+            batch = get(f'/caches?per_page=100&page={page}')['actions_caches']
+            caches.extend(batch)
+            if len(batch) < 100:
+                break
+        else:
+            raise SystemExit('Cannot bound cache inventory; stopping before compilation.')
+        used = max(usage['active_caches_size_in_bytes'], sum(item['size_in_bytes'] for item in caches))
+        # Two <=1GiB archives plus cache wrapping/other metadata. Never raise the repository limit.
+        reserve = 3 * 1024**3
+        if used + reserve > 10 * 1024**3:
+            raise SystemExit('Insufficient cache headroom; retain existing checkpoints and choose storage first.')
+        print(json.dumps({'cache_bytes_observed': used, 'reserved_bytes': reserve, 'limit_bytes': 10 * 1024**3}))
+        PYTHON
+    - name: Restore the producer key exactly, including on a consumer-only rerun
+      id: restore-checkpoint
+      if: ${{ inputs.probe == 'checkpoint-restore' }}
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+      with:
+        path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+        key: ${{ inputs.expected_checkpoint_key }}
+        fail-on-cache-miss: true
+    - name: Validate the received archive before checkout
+      if: ${{ inputs.probe == 'checkpoint-restore' }}
+      timeout-minutes: 4
+      env:
+        CACHE_HIT: ${{ steps.restore-checkpoint.outputs.cache-hit }}
+        MATCHED_KEY: ${{ steps.restore-checkpoint.outputs.cache-matched-key }}
+        EXPECTED_KEY: ${{ inputs.expected_checkpoint_key }}
+        EXPECTED_SHA: ${{ inputs.expected_checkpoint_sha }}
+      run: |
+        [[ $CACHE_HIT == true && $MATCHED_KEY == "$EXPECTED_KEY" ]]
+        archive="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
+        printf '%s  %s\n' "$EXPECTED_SHA" "$archive" | sha256sum --check --strict
+        python3 "$RUNNER_TEMP/bare-ci/checkpoint.py" validate-archive "$archive"
+    - name: Reclaim runner space and start the pinned Bare container
+      timeout-minutes: 25
+      run: |
+        if [[ $GITHUB_EVENT_NAME != workflow_dispatch || $RUNNER_ENVIRONMENT != github-hosted || $RUNNER_ARCH != X64 ]]; then
+          echo 'Expected a manually started GitHub-hosted x64 runner.' >&2
+          exit 1
+        fi
+        . /etc/os-release
+        [[ $ID == ubuntu && $VERSION_ID == 24.04 ]]
+        docker_root=$(sudo -n docker info --format '{{.DockerRootDir}}')
+        [[ $docker_root == /* ]]
+        echo "Runner image: ${ImageVersion:-unknown}"
+        sudo -n df -B1 -- "$docker_root"
+        awk '/^(MemTotal|MemAvailable|SwapTotal):/' /proc/meminfo
+
+        tool_dirs=(
+          /usr/local/lib/android
+          /usr/local/share/boost
+          /usr/share/dotnet
+          /usr/share/swift
+          /usr/local/.ghcup
+          /opt/ghc
+          /usr/lib/google-cloud-sdk
+        )
+        for path in "${tool_dirs[@]}"; do
+          if [[ -d $path && $(realpath -- "$path") == "$path" ]] && ! mountpoint -q -- "$path"; then
+            sudo -n rm -rf --one-file-system -- "$path"
+          fi
+        done
+        sudo -n df -B1 -- "$docker_root"
+
+        mkdir -p "$RUNNER_TEMP/bare-official"
+        cd "$RUNNER_TEMP/bare-official"
+        git init -q
+        git fetch --no-tags --depth=1 https://github.com/BareBrowser/bare-browser.git "$BARE_REV"
+        git checkout --detach FETCH_HEAD
+        [[ $(git rev-parse HEAD) == "$BARE_REV" ]]
+        shopt -s nullglob
+        patches=(patches/*.patch)
+        [[ ${#patches[@]} == 296 ]]
+        cp -R patches exchange/
+        crx=third_party/ublock_origin/uBlockOrigin-1.75.0.crx
+        printf '%s  %s\n' d688ed3f0262ec4f8bdcd4c8f65987c5444c560aeb387a9e02aca1facdfa7046 "$crx" | sha256sum --check --strict
+        cp "$crx" exchange/ublock_origin.crx
+        awk '/^```gn$/ { gn = 1; next } gn && /^```$/ { exit } gn { print }' docs/build-from-source.md > exchange/args.gn
+        printf '%s  %s\n' 6fb681205a50bf9b20d6c1f18a4dd5708bcd99cfc258e577069442a8be2114ab exchange/args.gn | sha256sum --check --strict
+        [[ $(python3 tools/version.py gn arm64) == "$(grep '^android_override_version_' exchange/args.gn)" ]]
+
+        if [[ $PROBE_MODE == checkpoint-* ]]; then
+          cp "$RUNNER_TEMP/bare-ci/"*.py "$RUNNER_TEMP/bare-ci/"*.yml exchange/
           mkdir -p exchange/checkpoint
           chmod 777 exchange/checkpoint
-
-      - name: Compile and pack the small checkpoint
-        id: pack-checkpoint
-        if: ${{ inputs.probe == 'checkpoint-seed' }}
-        timeout-minutes: 35
-        run: |
-          cd "$RUNNER_TEMP/bare-official"
-          docker compose exec -T -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 \
-            chromium-builder timeout --kill-after=2m 30m bash -seu <<'CONTAINER'
-          set -o pipefail
-          cd /work/chromium/src
+        fi
+        base_image="$REQUESTED_BASE"
+        if [[ -z $base_image ]]; then
+          docker pull --platform linux/amd64 ubuntu:22.04
+          base_image=$(docker image inspect ubuntu:22.04 --format '{{json .RepoDigests}}' | python3 -c 'import json,sys; print(next(value for value in json.load(sys.stdin) if value.startswith("ubuntu@sha256:")))')
+        else
+          [[ $base_image =~ ^ubuntu@sha256:[0-9a-f]{64}$ ]]
+          docker pull --platform linux/amd64 "$base_image"
+        fi
+        [[ $base_image =~ ^ubuntu@sha256:[0-9a-f]{64}$ ]]
+        export BARE_BASE_IMAGE="$base_image"
+        python3 - <<'PYTHON'
+        import os
+        from pathlib import Path
+        path = Path('docker/Dockerfile')
+        text = path.read_text()
+        expected = 'FROM --platform=linux/amd64 ubuntu:22.04'
+        if text.splitlines()[0] != expected or text.count(expected) != 1:
+            raise SystemExit('Unexpected pinned Bare base image instruction.')
+        path.write_text(text.replace(expected, 'FROM --platform=linux/amd64 ' + os.environ['BARE_BASE_IMAGE'], 1))
+        PYTHON
+        echo "BARE_BASE_IMAGE=$base_image" >> "$GITHUB_ENV"
+        echo "base_image=$base_image" >> "$GITHUB_OUTPUT"
+        bash builder.sh build
+        bash builder.sh start
+        docker compose exec -T chromium-builder bash -seu <<'CONTAINER'
+        id
+        test -w /work
+        df -B1 /work
+        free_bytes=$(df -B1 --output=avail /work | awk 'NR == 2 { print $1 }')
+        if (( free_bytes < 100000000000 )); then
+          echo 'Stopping before checkout: the build volume has less than 100 GB free.' >&2
+          exit 1
+        fi
+        CONTAINER
+      id: prepare
+      env:
+        REQUESTED_BASE: ${{ inputs.expected_base_image }}
+    - name: Fetch only the pinned Chromium revision and Android dependencies
+      timeout-minutes: 45
+      run: |
+        cd "$RUNNER_TEMP/bare-official"
+        docker compose exec -T -e "DEPOT_REV=$DEPOT_REV" -e "CHROMIUM_REV=$CHROMIUM_REV" -e GIT_TERMINAL_PROMPT=0 chromium-builder \
+          timeout --kill-after=2m 40m bash -seu <<'CONTAINER'
+        set -o pipefail
+        export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
+        git init -q "$HOME/depot_tools"
+        git -C "$HOME/depot_tools" fetch --no-tags --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_REV"
+        git -C "$HOME/depot_tools" checkout --detach FETCH_HEAD
+        [[ $(git -C "$HOME/depot_tools" rev-parse HEAD) == "$DEPOT_REV" ]]
+        "$HOME/depot_tools/ensure_bootstrap"
+        mkdir /work/chromium
+        cd /work/chromium
+        cat > .gclient <<'GCLIENT'
+        solutions = [{
+            'name': 'src',
+            'url': 'https://chromium.googlesource.com/chromium/src.git',
+            'deps_file': 'DEPS',
+            'managed': False,
+            'custom_deps': {},
+            'custom_vars': {},
+        }]
+        target_os = ['linux', 'android']
+        cache_dir = None
+        GCLIENT
+        gclient sync --no-history --nohooks --revision "src@$CHROMIUM_REV" --jobs 4
+        [[ $(git -C src rev-parse HEAD) == "$CHROMIUM_REV" ]]
+        df -B1 /work
+        CONTAINER
+    - name: Install build tools, apply Bare patches, and generate ARM64 build rules
+      timeout-minutes: 35
+      env:
+        PROBE_MODE: ${{ inputs.probe }}
+      run: |
+        cd "$RUNNER_TEMP/bare-official"
+        docker compose exec -T -e GIT_TERMINAL_PROMPT=0 -e "PROBE_MODE=$PROBE_MODE" chromium-builder \
+          timeout --kill-after=2m 30m bash -seu <<'CONTAINER'
+        set -o pipefail
+        export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
+        cd /work/chromium/src
+        echo 'Installing Chromium build dependencies'
+        ./build/install-build-deps.sh --android --no-prompt
+        echo 'Running Chromium checkout hooks'
+        gclient runhooks
+        if [[ $PROBE_MODE == checkpoint-* ]]; then
+          echo 'Fetching and validating the V8 builtin PGO profiles for the pinned revision'
+          (
+            cd /work/chromium
+            python3 src/v8/tools/builtins-pgo/download_profiles.py download \
+              --depot-tools src/third_party/depot_tools --check-v8-revision --quiet
+            test -s src/v8/tools/builtins-pgo/profiles/x64.profile
+          )
+        fi
+        df -B1 /work
+        echo 'Applying the official Bare patch series'
+        git apply --index /exchange/patches/*.patch
+        mkdir -p chrome/browser/resources/bare out/Bare
+        cp /exchange/ublock_origin.crx chrome/browser/resources/bare/ublock_origin.crx
+        cp /exchange/args.gn out/Bare/args.gn
+        echo 'Generating ARM64 build rules'
+        gn gen out/Bare
+        df -B1 /work
+        CONTAINER
+    - name: Verify restored inputs and both completed targets
+      if: ${{ inputs.probe == 'checkpoint-restore' }}
+      timeout-minutes: 23
+      env:
+        EXPECTED_IDENTITY: ${{ inputs.expected_checkpoint_identity }}
+      run: |
+        cd "$RUNNER_TEMP/bare-official"
+        docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CI_REVISION=$GITHUB_SHA" -e "BASE_IMAGE=$BARE_BASE_IMAGE" \
+          -e "EXPECTED_IDENTITY=$EXPECTED_IDENTITY" -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 chromium-builder \
+          timeout --kill-after=2m 20m bash -seu <<'CONTAINER'
+        set -o pipefail
+        cd /work/chromium/src
+        python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint.tar.gz
+        rm -rf --one-file-system -- out/Bare
+        tar -xzf /exchange/checkpoint/checkpoint.tar.gz
+        python3 /exchange/checkpoint.py verify-provenance out/Bare/checkpoint-provenance.json \
+          --ci-revision "$CI_REVISION" --base-image "$BASE_IMAGE"
+        python3 - <<'PYTHON'
+        import json, os
+        data = json.load(open('out/Bare/checkpoint-provenance.json'))
+        if data['identity_sha256'] != os.environ['EXPECTED_IDENTITY']:
+            raise SystemExit('Producer input identity differs.')
+        PYTHON
+        python3 /exchange/checkpoint.py restore-inputs out/Bare/checkpoint-inputs.jsonl.gz
+        object=out/Bare/obj/base/third_party/cityhash/cityhash/city.o
+        python3 /exchange/checkpoint.py verify-object "$object" out/Bare/checkpoint-object.json
+        python3 /exchange/checkpoint.py verify-evidence out/Bare/checkpoint-evidence.json
+        autoninja -C out/Bare -j 2 -v base/third_party/cityhash:cityhash | tee /exchange/checkpoint/cityhash-noop.log
+        grep -F 'ninja: no work to do.' /exchange/checkpoint/cityhash-noop.log
+        python3 /exchange/checkpoint.py evidence-targets out/Bare/checkpoint-evidence.json > /exchange/checkpoint/evidence-targets.txt
+        mapfile -t targets < /exchange/checkpoint/evidence-targets.txt
+        (( ${#targets[@]} > 0 ))
+        autoninja -C out/Bare -j 2 -v "${targets[@]}" | tee /exchange/checkpoint/apk-objects-noop.log
+        grep -F 'ninja: no work to do.' /exchange/checkpoint/apk-objects-noop.log
+        python3 /exchange/checkpoint.py verify-object "$object" out/Bare/checkpoint-object.json
+        python3 /exchange/checkpoint.py verify-evidence out/Bare/checkpoint-evidence.json
+        touch /exchange/checkpoint/reuse-verified
+        CONTAINER
+    - name: Run the real APK target briefly and record the stop reason
+      id: trial
+      if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
+      timeout-minutes: 12
+      run: |
+        cd "$RUNNER_TEMP/bare-official"
+        # The clock starts before preparation and restore, not at compiler startup.
+        elapsed=$(( $(date +%s) - $(cat "$RUNNER_TEMP/bare-probe-start") ))
+        if (( elapsed > 55 * 60 )); then
+          echo 'Not enough time reserved for stop, hashing, packing, upload and diagnostics.' >&2
+          exit 1
+        fi
+        phase=seed
+        [[ $PROBE_MODE != checkpoint-restore ]] || phase=restore
+        echo "phase=$phase" >> "$GITHUB_OUTPUT"
+        docker compose exec -T -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 \
+          -e "TRIAL_PHASE=$phase" chromium-builder timeout --kill-after=2m 9m bash -seu <<'CONTAINER'
+        set -o pipefail
+        cd /work/chromium/src
+        if [[ $TRIAL_PHASE == seed ]]; then
           autoninja -C out/Bare -j 2 -v base/third_party/cityhash:cityhash
           object=out/Bare/obj/base/third_party/cityhash/cityhash/city.o
           test -s "$object"
           python3 /exchange/checkpoint.py object-info "$object" out/Bare/checkpoint-object.json
-          python3 /exchange/checkpoint.py record-inputs out/Bare/checkpoint-inputs.jsonl.gz
-          du -sx -B1 out/Bare
-          tar --format=posix --pax-option=delete=atime,delete=ctime \
-            -I 'gzip -1' -cf /exchange/checkpoint/checkpoint.tar.gz out/Bare
-          CONTAINER
-          archive=exchange/checkpoint/checkpoint.tar.gz
-          size=$(stat -c %s "$archive")
-          echo "Compressed checkpoint bytes: $size"
-          if (( size > 1073741824 )); then
-            echo 'Checkpoint exceeds the 1 GiB limit of this small transfer test.' >&2
-            exit 1
+        fi
+        args=()
+        if [[ $TRIAL_PHASE == restore ]]; then
+          args+=(--previous-result out/Bare/checkpoint-trial-seed.json)
+        fi
+        python3 /exchange/build_trial.py --phase "$TRIAL_PHASE" \
+          --result "/exchange/checkpoint/trial-$TRIAL_PHASE.json" \
+          --log "/exchange/checkpoint/trial-$TRIAL_PHASE.log" \
+          --seconds 180 --max-output-bytes 734003200 --min-free-bytes 10000000000 "${args[@]}"
+        CONTAINER
+    - name: Stop every build writer before making the archive
+      id: quiesce
+      if: ${{ always() && startsWith(inputs.probe, 'checkpoint-') && steps.trial.outputs.phase != '' }}
+      timeout-minutes: 3
+      run: |
+        cd "$RUNNER_TEMP/bare-official"
+        container=chromium-android-builder
+        volume=$(docker inspect "$container" --format '{{range .Mounts}}{{if eq .Destination "/work"}}{{.Name}}{{end}}{{end}}')
+        [[ -n $volume ]]
+        mapfile -t users < <(docker ps --filter "volume=$volume" --format '{{.Names}}')
+        [[ ${#users[@]} == 1 && ${users[0]} == "$container" ]]
+        docker stop --time 20 "$container"
+        [[ $(docker inspect "$container" --format '{{.State.Running}}') == false ]]
+        # This pinned container starts an idle bash, never the build command.
+        docker start "$container"
+        docker compose exec -T chromium-builder true
+        echo 'quiescent=true' >> "$GITHUB_OUTPUT"
+    - name: Pack the complete output, including any finished APK
+      id: pack-checkpoint
+      if: ${{ always() && steps.quiesce.outputs.quiescent == 'true' }}
+      timeout-minutes: 28
+      env:
+        TRIAL_PHASE: ${{ steps.trial.outputs.phase }}
+        CHECKPOINT_KEY: ${{ steps.identity.outputs.key }}
+      run: |
+        cd "$RUNNER_TEMP/bare-official"
+        phase="$TRIAL_PHASE"
+        [[ $phase == seed || $phase == restore ]]
+        docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CI_REVISION=$GITHUB_SHA" -e "BASE_IMAGE=$BARE_BASE_IMAGE" \
+          -e "TRIAL_PHASE=$phase" chromium-builder timeout --kill-after=2m 25m bash -seu <<'CONTAINER'
+        set -o pipefail
+        cd /work/chromium/src
+        if [[ ! -s /exchange/checkpoint/trial-$TRIAL_PHASE.json ]]; then
+          # A controller crash must not erase a quiescent recovery candidate.
+          python3 - <<'PYTHON'
+        import json, os
+        from pathlib import Path
+        phase = os.environ['TRIAL_PHASE']
+        report = {'format':'bare-apk-trial','version':1,'phase':phase,
+                  'target':'chrome_public_apk','build_dir':'out/Bare',
+                  'reason':'controller-result-missing','ready_for_restore_test':False,
+                  'completed_outputs':[],'new_completed_outputs':[]}
+        Path('/exchange/checkpoint/trial-' + phase + '.json').write_text(json.dumps(report) + '\n')
+        PYTHON
+        fi
+        python3 - <<'PYTHON'
+        import json, os
+        from pathlib import Path
+        phase = os.environ['TRIAL_PHASE']
+        path = Path('/exchange/checkpoint/trial-' + phase + '.json')
+        report = json.loads(path.read_text())
+        report['container_quiescence_verified'] = True
+        report['quiescence_check_source'] = 'Host stopped the dedicated container, observed Running=false, then restarted only idle bash.'
+        path.write_text(json.dumps(report, sort_keys=True) + '\n')
+        PYTHON
+        cp "/exchange/checkpoint/trial-$TRIAL_PHASE.json" "out/Bare/checkpoint-trial-$TRIAL_PHASE.json"
+        proof=true
+        if ! python3 /exchange/checkpoint.py verify-object \
+          out/Bare/obj/base/third_party/cityhash/cityhash/city.o out/Bare/checkpoint-object.json; then
+          proof=false
+        fi
+        if [[ $TRIAL_PHASE == seed ]]; then
+          if ! python3 /exchange/checkpoint.py collect-evidence /exchange/checkpoint/trial-seed.json out/Bare/checkpoint-evidence.json; then
+            proof=false
           fi
-          sha=$(sha256sum "$archive" | cut -d ' ' -f 1)
-          echo "Checkpoint SHA-256: $sha"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-
-      - name: Save the bounded public upstream checkpoint
-        if: ${{ inputs.probe == 'checkpoint-seed' }}
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
-          key: bare-transfer-v1-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Restore the exact checkpoint from the first job
-        id: restore-checkpoint
-        if: ${{ inputs.probe == 'checkpoint-restore' }}
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
-          key: bare-transfer-v1-${{ github.run_id }}-${{ github.run_attempt }}
-          fail-on-cache-miss: true
-
-      - name: Verify reuse and compile a new target in the second job
-        if: ${{ inputs.probe == 'checkpoint-restore' }}
-        timeout-minutes: 35
-        env:
-          EXPECTED_SHA: ${{ inputs.expected_checkpoint_sha }}
-          CACHE_HIT: ${{ steps.restore-checkpoint.outputs.cache-hit }}
-          CACHE_MATCHED_KEY: ${{ steps.restore-checkpoint.outputs.cache-matched-key }}
-        run: |
-          [[ $CACHE_HIT == true && $EXPECTED_SHA =~ ^[0-9a-f]{64}$ ]]
-          [[ $CACHE_MATCHED_KEY == "bare-transfer-v1-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
+        else
+          if ! python3 /exchange/checkpoint.py verify-evidence out/Bare/checkpoint-evidence.json; then
+            proof=false
+          fi
+        fi
+        printf '{"evidence_valid":%s}\n' "$proof" > /exchange/checkpoint/proof.json
+        python3 /exchange/checkpoint.py canonicalize-logs
+        python3 /exchange/checkpoint.py record-provenance out/Bare/checkpoint-provenance.json \
+          --ci-revision "$CI_REVISION" --base-image "$BASE_IMAGE"
+        python3 /exchange/checkpoint.py record-inputs out/Bare/checkpoint-inputs.jsonl.gz
+        du -sx -B1 out/Bare
+        tar --format=posix --pax-option=delete=atime,delete=ctime \
+          -I 'gzip -1' -cf /exchange/checkpoint/checkpoint.tar.gz out/Bare
+        python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint.tar.gz
+        cp out/Bare/checkpoint-provenance.json /exchange/checkpoint/provenance.json
+        CONTAINER
+        archive=exchange/checkpoint/checkpoint.tar.gz
+        size=$(stat -c %s "$archive")
+        (( size <= 1073741824 ))
+        sha=$(sha256sum "$archive" | cut -d ' ' -f 1)
+        identity=$(python3 -c 'import json; print(json.load(open("exchange/checkpoint/provenance.json"))["identity_sha256"])')
+        echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        echo "identity=$identity" >> "$GITHUB_OUTPUT"
+        echo "bytes=$size" >> "$GITHUB_OUTPUT"
+        {
+          echo '### Saved-output candidate'
+          echo "- Key: $CHECKPOINT_KEY"
+          echo "- Bytes: $size"
+          echo "- SHA-256: $sha"
+          echo "- Input identity: $identity"
+          echo "- Source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          cat "exchange/checkpoint/trial-$phase.json"
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Save a new bounded generation without replacing the producer
+      id: save-checkpoint
+      if: ${{ always() && steps.pack-checkpoint.outcome == 'success' }}
+      timeout-minutes: 10
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+      with:
+        path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+        key: ${{ steps.identity.outputs.key }}
+    - name: Confirm the exact saved key exists before reporting success
+      id: saved-receipt
+      if: ${{ always() && steps.save-checkpoint.outcome == 'success' }}
+      timeout-minutes: 3
+      env:
+        CHECKPOINT_KEY: ${{ steps.identity.outputs.key }}
+      run: |
+        python3 - <<'PYTHON'
+        import json, os, time, urllib.parse, urllib.request
+        key = os.environ['CHECKPOINT_KEY']
+        query = urllib.parse.urlencode({'key': key, 'ref': 'refs/heads/main', 'per_page': 100})
+        url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/actions/caches?' + query
+        for attempt in range(5):
+            try:
+                request = urllib.request.Request(url, headers={'Accept':'application/vnd.github+json','User-Agent':'bare-bounded-checkpoint'})
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    data = json.load(response)
+                exact = [item for item in data['actions_caches'] if item['key'] == key and item['ref'] == 'refs/heads/main' and item['size_in_bytes'] > 0]
+                if len(exact) == 1:
+                    print(json.dumps({'saved_key': key, 'cache_id': exact[0]['id'], 'cache_bytes': exact[0]['size_in_bytes']}))
+                    break
+            except (OSError, ValueError, KeyError):
+                if attempt == 4:
+                    raise
+            if attempt == 4:
+                raise SystemExit('Save did not create the exact checkpoint. Keep the producer; do not claim success.')
+            time.sleep(3)
+        PYTHON
+    - name: Separate candidate preservation from a passing reuse test
+      if: ${{ always() && steps.saved-receipt.outcome == 'success' }}
+      timeout-minutes: 2
+      env:
+        TRIAL_PHASE: ${{ steps.trial.outputs.phase }}
+      run: |
+        cd "$RUNNER_TEMP/bare-official"
+        python3 - <<'PYTHON'
+        import json, os
+        from pathlib import Path
+        phase = os.environ['TRIAL_PHASE']
+        root = Path('exchange/checkpoint')
+        result = json.loads((root / f'trial-{phase}.json').read_text())
+        proof = json.loads((root / 'proof.json').read_text())
+        if result.get('ready_for_restore_test') is not True or proof.get('evidence_valid') is not True:
+            raise SystemExit('Output candidate saved; the clean stop/evidence requirements did not pass. Inspect the recorded reason.')
+        if phase == 'restore' and not (root / 'reuse-verified').is_file():
+            raise SystemExit('Both completed-target reuse checks are required.')
+        print('Bounded APK checkpoint phase passed:', phase)
+        PYTHON
+    - name: Compile a Chromium C++ target for Android ARM64
+      if: ${{ inputs.probe == 'smoke' }}
+      timeout-minutes: 18
+      run: |
+        cd "$RUNNER_TEMP/bare-official"
+        docker compose exec -T -e GIT_TERMINAL_PROMPT=0 chromium-builder \
+          timeout --kill-after=2m 15m bash -seu <<'CONTAINER'
+        set -o pipefail
+        export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
+        cd /work/chromium/src
+        autoninja -C out/Bare -j 1 -v base/third_party/cityhash:cityhash
+        object=$(find out/Bare/obj/base/third_party/cityhash -type f -name city.o -print -quit)
+        [[ -n $object && -s $object ]]
+        format=$(file -b "$object")
+        printf 'Compiled %s: %s\n' "$object" "$format"
+        if [[ $format == *LLVM*bitcode* ]]; then
+          # ThinLTO can emit bitcode. Infer the architecture from this one object.
+          relocatable=out/Bare/city-probe.elf
+          third_party/llvm-build/Release+Asserts/bin/ld.lld -r --threads=1 -o "$relocatable" "$object"
+          object=$relocatable
+        fi
+        header=$(LC_ALL=C readelf -h "$object")
+        printf '%s\n' "$header"
+        grep -Eq 'Machine:[[:space:]]+AArch64' <<< "$header"
+        echo 'ARM64 compile probe passed.'
+        CONTAINER
+    - name: Record final disk and memory diagnostics
+      if: ${{ always() }}
+      timeout-minutes: 3
+      run: |
+        awk '/^(MemTotal|MemAvailable|SwapTotal):/' /proc/meminfo
+        df -B1 /
+        if [[ -f $RUNNER_TEMP/bare-official/docker-compose.yml ]]; then
           cd "$RUNNER_TEMP/bare-official"
-          printf '%s  %s\n' "$EXPECTED_SHA" exchange/checkpoint/checkpoint.tar.gz | sha256sum --check --strict
-          docker compose exec -T -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 \
-            chromium-builder timeout --kill-after=2m 30m bash -seu <<'CONTAINER'
-          set -o pipefail
-          cd /work/chromium/src
-          python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint.tar.gz
-          rm -rf --one-file-system -- out/Bare
-          tar -xzf /exchange/checkpoint/checkpoint.tar.gz
-          python3 /exchange/checkpoint.py restore-inputs out/Bare/checkpoint-inputs.jsonl.gz
-          object=out/Bare/obj/base/third_party/cityhash/cityhash/city.o
-          python3 /exchange/checkpoint.py verify-object "$object" out/Bare/checkpoint-object.json
-          autoninja -C out/Bare -j 2 -v base/third_party/cityhash:cityhash | tee /exchange/checkpoint/noop.log
-          grep -F 'ninja: no work to do.' /exchange/checkpoint/noop.log
-          python3 /exchange/checkpoint.py verify-object "$object" out/Bare/checkpoint-object.json
-          new_object=out/Bare/obj/base/third_party/double_conversion/double_conversion/bignum.o
-          test ! -e "$new_object"
-          autoninja -C out/Bare -j 2 -v base/third_party/double_conversion:double_conversion
-          test -s "$new_object"
-          file "$new_object"
-          third_party/llvm-build/Release+Asserts/bin/ld.lld -r --threads=1 -o out/Bare/checkpoint-new.elf "$new_object"
-          LC_ALL=C readelf -h out/Bare/checkpoint-new.elf | tee /exchange/checkpoint/new-object-header.log
-          grep -Eq 'Machine:[[:space:]]+AArch64' /exchange/checkpoint/new-object-header.log
-          echo 'Checkpoint transfer passed: the previous target was reused and a new target was compiled.'
-          CONTAINER
-
-      - name: Compile a Chromium C++ target for Android ARM64
-        if: ${{ inputs.probe == 'smoke' }}
-        timeout-minutes: 18
-        run: |
-          cd "$RUNNER_TEMP/bare-official"
-          docker compose exec -T -e GIT_TERMINAL_PROMPT=0 chromium-builder \
-            timeout --kill-after=2m 15m bash -seu <<'CONTAINER'
-          set -o pipefail
-          export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
-          cd /work/chromium/src
-          autoninja -C out/Bare -j 1 -v base/third_party/cityhash:cityhash
-          object=$(find out/Bare/obj/base/third_party/cityhash -type f -name city.o -print -quit)
-          [[ -n $object && -s $object ]]
-          format=$(file -b "$object")
-          printf 'Compiled %s: %s\n' "$object" "$format"
-          if [[ $format == *LLVM*bitcode* ]]; then
-            # ThinLTO can emit bitcode. Infer the architecture from this one object.
-            relocatable=out/Bare/city-probe.elf
-            third_party/llvm-build/Release+Asserts/bin/ld.lld -r --threads=1 -o "$relocatable" "$object"
-            object=$relocatable
-          fi
-          header=$(LC_ALL=C readelf -h "$object")
-          printf '%s\n' "$header"
-          grep -Eq 'Machine:[[:space:]]+AArch64' <<< "$header"
-          echo 'ARM64 compile probe passed.'
-          CONTAINER
-
-      - name: Build and verify the official ARM64 APK within runner limits
-        if: ${{ inputs.probe == 'apk' }}
-        timeout-minutes: 330
-        run: |
-          cd "$RUNNER_TEMP/bare-official"
-          remaining=$(( 325 * 60 - ($(date +%s) - $(cat "$RUNNER_TEMP/bare-probe-start")) ))
-          if (( remaining <= 0 )); then
-            echo 'No time left for the APK target in the probe budget.' >&2
-            exit 124
-          fi
-          docker compose exec -T -w /work/chromium/src -e "BARE_BUILD_SECONDS=$remaining" \
-            -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 -e GIT_TERMINAL_PROMPT=0 \
-            chromium-builder python3 -u - <<'PYTHON'
-          import contextlib
-          import os
-          from pathlib import Path
-          import shutil
-          import signal
-          import subprocess
-          import time
-          from zipfile import ZipFile
-
-          cgroup = Path('/sys/fs/cgroup')
-          disk_floor = 10_000_000_000
-          sample_interval = 120
-          start = time.monotonic()
-          budget = int(os.environ['BARE_BUILD_SECONDS'])
-
-          def fields(path, keys):
-              try:
-                  with path.open() as stream:
-                      return {name.rstrip(':'): value for name, value, *_ in
-                              (line.split() for line in stream) if name.rstrip(':') in keys}
-              except OSError:
-                  return {}
-
-          def sample():
-              free = shutil.disk_usage('/work').free
-              host = fields(Path('/proc/meminfo'), {'MemAvailable', 'SwapFree'})
-              memory = fields(cgroup / 'memory.stat', {'anon', 'file'})
-              events = fields(cgroup / 'memory.events', {'oom', 'oom_kill'})
-              print(f'sample elapsed_s={int(time.monotonic() - start)} work_free_bytes={free} '
-                    f'host_kib={host} container_bytes={memory} memory_events={events}')
-              return free, events.get('oom_kill')
-
-          def stop(build):
-              with contextlib.suppress(ProcessLookupError):
-                  os.killpg(build.pid, signal.SIGINT)
-              try:
-                  build.wait(timeout=120)
-              except subprocess.TimeoutExpired:
-                  print('Build did not stop after SIGINT; sending SIGKILL to its process group.')
-                  with contextlib.suppress(ProcessLookupError):
-                      os.killpg(build.pid, signal.SIGKILL)
-                  build.wait()
-
-          print(f'Building chrome_public_apk with -j 2, budget={budget}s, disk floor={disk_floor} bytes.')
-          free, oom_before = sample()
-          if free < disk_floor:
-              print('Probe stopped before compilation: free disk below guard threshold.')
-              raise SystemExit(75)
-
-          build = subprocess.Popen(['autoninja', '-C', 'out/Bare', '-j', '2', 'chrome_public_apk'],
-                                   stdin=subprocess.DEVNULL, start_new_session=True)
-          stop_code = 0
-          try:
-              while build.poll() is None:
-                  remaining = budget - (time.monotonic() - start)
-                  if remaining <= 0:
-                      print('Probe stopping at the planned wall-time limit.')
-                      stop_code = 124
-                      break
-                  try:
-                      build.wait(timeout=min(sample_interval, remaining))
-                  except subprocess.TimeoutExpired:
-                      free, _ = sample()
-                      if free < disk_floor:
-                          print('Probe stopping at the free-disk guard threshold.')
-                          stop_code = 75
-                          break
-          finally:
-              if build.poll() is None:
-                  stop(build)
-              _, oom_after = sample()
-
-          if oom_before is not None and oom_after is not None:
-              print(f'Build-stage container oom_kill delta: {int(oom_after) - int(oom_before)}')
-          print(f'Build process exit status: {build.returncode}')
-          subprocess.run(['timeout', '60s', 'du', '-sx', '-B1', 'out/Bare'], check=False)
-          if stop_code:
-              raise SystemExit(stop_code)
-          if build.returncode:
-              raise SystemExit(build.returncode if build.returncode > 0 else 128 - build.returncode)
-
-          apk = Path('out/Bare/apks/ChromePublic.apk')
-          with ZipFile(apk) as archive:
-              invalid = archive.testzip()
-              if invalid is not None:
-                  raise SystemExit(f'APK ZIP integrity check failed: {invalid}')
-              for name in archive.namelist():
-                  if name.startswith('lib/arm64-v8a/') and name.endswith('.so'):
-                      with archive.open(name) as member:
-                          header = member.read(20)
-                      if header[:6] == b'\x7fELF\x02\x01' and header[18:20] == b'\xb7\x00':
-                          print(f'APK contains AArch64 ELF: {name}')
-                          break
-              else:
-                  raise SystemExit('APK contains no verified AArch64 ELF library.')
-          print(f'APK built and verified: {apk} ({apk.stat().st_size} bytes)')
-          subprocess.run(['sha256sum', str(apk)], check=True)
-          PYTHON
-
-      - name: Record final disk and memory diagnostics
-        if: ${{ always() }}
-        timeout-minutes: 3
-        run: |
-          awk '/^(MemTotal|MemAvailable|SwapTotal):/' /proc/meminfo
-          df -B1 /
-          if [[ -f $RUNNER_TEMP/bare-official/docker-compose.yml ]]; then
-            cd "$RUNNER_TEMP/bare-official"
-            docker inspect --format 'Container status={{.State.Status}} OOMKilled={{.State.OOMKilled}}' chromium-android-builder || true
-            docker compose exec -T chromium-builder bash -c '
-              df -B1 /work
-              for file in memory.max memory.peak memory.swap.max memory.events; do
-                path=/sys/fs/cgroup/$file
-                if test -r "$path"; then
-                  printf "%s:\n" "$file"
-                  cat "$path"
-                fi
-              done
-            ' || true
-          fi
+          docker inspect --format 'Container status={{.State.Status}} OOMKilled={{.State.OOMKilled}}' chromium-android-builder || true
+          docker compose exec -T chromium-builder bash -c '
+            df -B1 /work
+            for file in memory.max memory.peak memory.swap.max memory.events; do
+              path=/sys/fs/cgroup/$file
+              if test -r "$path"; then
+                printf "%s:\n" "$file"
+                cat "$path"
+              fi
+            done
+          ' || true
+        fi

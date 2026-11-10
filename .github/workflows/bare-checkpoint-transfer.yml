@@ -1,10 +1,10 @@
 name: Bare checkpoint transfer probe
-
-on:
-  workflow_dispatch:
-
+'on':
+  workflow_dispatch: null
 permissions: {}
-
+concurrency:
+  group: bare-checkpoint-transfer-workflow
+  cancel-in-progress: false
 jobs:
   seed:
     uses: ./.github/workflows/bare-arm64-probe.yml
@@ -15,4 +15,7 @@ jobs:
     uses: ./.github/workflows/bare-arm64-probe.yml
     with:
       probe: checkpoint-restore
+      expected_checkpoint_key: ${{ needs.seed.outputs.checkpoint_key }}
       expected_checkpoint_sha: ${{ needs.seed.outputs.checkpoint_sha }}
+      expected_checkpoint_identity: ${{ needs.seed.outputs.checkpoint_identity }}
+      expected_base_image: ${{ needs.seed.outputs.base_image }}
