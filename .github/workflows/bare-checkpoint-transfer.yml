@@ -1,0 +1,18 @@
+name: Bare checkpoint transfer probe
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  seed:
+    uses: ./.github/workflows/bare-arm64-probe.yml
+    with:
+      probe: checkpoint-seed
+  restore:
+    needs: seed
+    uses: ./.github/workflows/bare-arm64-probe.yml
+    with:
+      probe: checkpoint-restore
+      expected_checkpoint_sha: ${{ needs.seed.outputs.checkpoint_sha }}

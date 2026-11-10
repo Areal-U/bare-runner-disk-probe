@@ -1,6 +1,17 @@
 name: Bare ARM64 compile probe
 
 on:
+  workflow_call:
+    inputs:
+      probe:
+        type: string
+        default: smoke
+      expected_checkpoint_sha:
+        type: string
+        default: ''
+    outputs:
+      checkpoint_sha:
+        value: ${{ jobs.compile-probe.outputs.checkpoint_sha }}
   workflow_dispatch:
     inputs:
       probe:
@@ -21,6 +32,8 @@ jobs:
     concurrency:
       group: bare-arm64-compile-probe
       cancel-in-progress: false
+    outputs:
+      checkpoint_sha: ${{ steps.pack-checkpoint.outputs.sha }}
     env:
       BARE_REV: e776f77629bb915e0f3df63449f1f993cc1b0648
       CHROMIUM_REV: 2f9a11097447f226133bc1a31c787291a5eeab98
@@ -157,6 +170,99 @@ jobs:
           echo 'Generating ARM64 build rules'
           gn gen out/Bare
           df -B1 /work
+          CONTAINER
+
+      - name: Prepare the checkpoint helper
+        if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
+        timeout-minutes: 3
+        run: |
+          cd "$RUNNER_TEMP/bare-official"
+          curl --fail --location --retry 2 --max-time 60 \
+            "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/checkpoint.py" \
+            --output exchange/checkpoint.py
+          mkdir -p exchange/checkpoint
+          chmod 777 exchange/checkpoint
+
+      - name: Compile and pack the small checkpoint
+        id: pack-checkpoint
+        if: ${{ inputs.probe == 'checkpoint-seed' }}
+        timeout-minutes: 35
+        run: |
+          cd "$RUNNER_TEMP/bare-official"
+          docker compose exec -T -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 \
+            chromium-builder timeout --kill-after=2m 30m bash -seu <<'CONTAINER'
+          set -o pipefail
+          cd /work/chromium/src
+          autoninja -C out/Bare -j 2 -v base/third_party/cityhash:cityhash
+          object=out/Bare/obj/base/third_party/cityhash/cityhash/city.o
+          test -s "$object"
+          python3 /exchange/checkpoint.py object-info "$object" out/Bare/checkpoint-object.json
+          python3 /exchange/checkpoint.py record-inputs out/Bare/checkpoint-inputs.jsonl.gz
+          du -sx -B1 out/Bare
+          tar --format=posix --pax-option=delete=atime,delete=ctime \
+            -I 'gzip -1' -cf /exchange/checkpoint/checkpoint.tar.gz out/Bare
+          CONTAINER
+          archive=exchange/checkpoint/checkpoint.tar.gz
+          size=$(stat -c %s "$archive")
+          echo "Compressed checkpoint bytes: $size"
+          if (( size > 1073741824 )); then
+            echo 'Checkpoint exceeds the 1 GiB limit of this small transfer test.' >&2
+            exit 1
+          fi
+          sha=$(sha256sum "$archive" | cut -d ' ' -f 1)
+          echo "Checkpoint SHA-256: $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Save the bounded public upstream checkpoint
+        if: ${{ inputs.probe == 'checkpoint-seed' }}
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+          key: bare-transfer-v1-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Restore the exact checkpoint from the first job
+        id: restore-checkpoint
+        if: ${{ inputs.probe == 'checkpoint-restore' }}
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+          key: bare-transfer-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+
+      - name: Verify reuse and compile a new target in the second job
+        if: ${{ inputs.probe == 'checkpoint-restore' }}
+        timeout-minutes: 35
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_checkpoint_sha }}
+          CACHE_HIT: ${{ steps.restore-checkpoint.outputs.cache-hit }}
+          CACHE_MATCHED_KEY: ${{ steps.restore-checkpoint.outputs.cache-matched-key }}
+        run: |
+          [[ $CACHE_HIT == true && $EXPECTED_SHA =~ ^[0-9a-f]{64}$ ]]
+          [[ $CACHE_MATCHED_KEY == "bare-transfer-v1-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
+          cd "$RUNNER_TEMP/bare-official"
+          printf '%s  %s\n' "$EXPECTED_SHA" exchange/checkpoint/checkpoint.tar.gz | sha256sum --check --strict
+          docker compose exec -T -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 \
+            chromium-builder timeout --kill-after=2m 30m bash -seu <<'CONTAINER'
+          set -o pipefail
+          cd /work/chromium/src
+          python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint.tar.gz
+          rm -rf --one-file-system -- out/Bare
+          tar -xzf /exchange/checkpoint/checkpoint.tar.gz
+          python3 /exchange/checkpoint.py restore-inputs out/Bare/checkpoint-inputs.jsonl.gz
+          object=out/Bare/obj/base/third_party/cityhash/cityhash/city.o
+          python3 /exchange/checkpoint.py verify-object "$object" out/Bare/checkpoint-object.json
+          autoninja -C out/Bare -j 2 -v base/third_party/cityhash:cityhash | tee /exchange/checkpoint/noop.log
+          grep -F 'ninja: no work to do.' /exchange/checkpoint/noop.log
+          python3 /exchange/checkpoint.py verify-object "$object" out/Bare/checkpoint-object.json
+          new_object=out/Bare/obj/base/third_party/double_conversion/double_conversion/bignum.o
+          test ! -e "$new_object"
+          autoninja -C out/Bare -j 2 -v base/third_party/double_conversion:double_conversion
+          test -s "$new_object"
+          file "$new_object"
+          third_party/llvm-build/Release+Asserts/bin/ld.lld -r --threads=1 -o out/Bare/checkpoint-new.elf "$new_object"
+          LC_ALL=C readelf -h out/Bare/checkpoint-new.elf | tee /exchange/checkpoint/new-object-header.log
+          grep -Eq 'Machine:[[:space:]]+AArch64' /exchange/checkpoint/new-object-header.log
+          echo 'Checkpoint transfer passed: the previous target was reused and a new target was compiled.'
           CONTAINER
 
       - name: Compile a Chromium C++ target for Android ARM64
