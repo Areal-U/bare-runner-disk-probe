@@ -476,11 +476,21 @@ jobs:
         PYTHON
             if [[ $pass == before ]]; then
               mapfile -t scale_targets < /exchange/checkpoint/scale-targets.txt
-              autoninja -C out/Bare -j 2 -v "${scale_targets[@]}" | tee /exchange/checkpoint/scale-objects-noop.log
+              autoninja -C out/Bare -j 2 -v "${scale_targets[@]}" 2>&1 | tee /exchange/checkpoint/scale-objects-noop.log
               tr '\r' '\n' < /exchange/checkpoint/scale-objects-noop.log > /exchange/checkpoint/scale-objects-noop.txt
-              grep -Fx 'ninja: no work to do.' /exchange/checkpoint/scale-objects-noop.txt
-              grep -F 'Build Succeeded:' /exchange/checkpoint/scale-objects-noop.txt | tail -n 1 \
-                | grep -E 'Build Succeeded: 0 steps -'
+              if ! grep -Fx 'ninja: no work to do.' /exchange/checkpoint/scale-objects-noop.txt; then
+                echo 'The expected Ninja no-op marker was missing.' >&2
+                exit 1
+              fi
+              summary=$(grep -F 'Build Succeeded:' /exchange/checkpoint/scale-objects-noop.txt | tail -n 1) || {
+                echo 'The final Siso step count was missing.' >&2
+                exit 1
+              }
+              if [[ $summary != *'Build Succeeded: 0 steps -'* ]]; then
+                printf 'Expected a zero-step Siso run; observed: %s\n' "$summary" >&2
+                exit 1
+              fi
+              printf 'Verified Siso summary: %s\n' "$summary"
             fi
           done
         fi
