@@ -41,7 +41,26 @@ SCALE_TIME_LIMIT = 3600
 SCALE_OUTPUT_LIMIT = 5 * 1024 ** 3 // 2
 SCALE_OUTPUT_ENTRY_LIMIT = 140_000
 SCALE_MIN_FREE_BYTES = 20 * 1024 ** 3
+LARGE_TIME_LIMIT = 5400
+LARGE_OUTPUT_LIMIT = 6 * 1024 ** 3
+LARGE_OUTPUT_ENTRY_LIMIT = 300_000
+LARGE_MIN_FREE_BYTES = 20 * 1024 ** 3
+LARGE_SAMPLE_SECONDS = 5
+LARGE_CONSOLE_PREFIX_BYTES = 2 * 1024 ** 2
+LARGE_CONSOLE_TAIL_BYTES = 32 * 1024
+LARGE_CONSOLE_PROGRESS_SECONDS = 60
+# Two evidence arrays leave 16 MiB for diagnostics and the workflow's final
+# metadata within the checkpoint verifier's 128 MiB large-report limit.
+LARGE_EVIDENCE_ARRAY_BYTES = 56 * 1024 ** 2
 SOURCE_ROOT = Path("/work/chromium/src")
+
+
+def trial_limits(scale, large):
+    if large:
+        return LARGE_TIME_LIMIT, LARGE_OUTPUT_LIMIT, LARGE_OUTPUT_ENTRY_LIMIT, LARGE_MIN_FREE_BYTES
+    if scale:
+        return SCALE_TIME_LIMIT, SCALE_OUTPUT_LIMIT, SCALE_OUTPUT_ENTRY_LIMIT, SCALE_MIN_FREE_BYTES
+    return 600, OUTPUT_LIMIT, OUTPUT_ENTRY_LIMIT, SMALL_MIN_FREE_BYTES
 
 
 def atomic_json(path, value):
@@ -71,7 +90,7 @@ def output_path(value, source_root):
     return path.as_posix()
 
 
-def tree_snapshot(directory):
+def tree_snapshot(directory, *, include_paths=True):
     """Return existing files and a conservative archive-input size estimate."""
     files = set()
     logical = allocated = entries = 0
@@ -88,12 +107,41 @@ def tree_snapshot(directory):
             allocated += info.st_blocks * 512
             if stat.S_ISREG(info.st_mode):
                 logical += info.st_size
-                files.add(path.relative_to(directory).as_posix())
+                if include_paths:
+                    files.add(path.relative_to(directory).as_posix())
     # PAX/tar metadata and directory entries also need space. Count both logical
     # and allocated bytes so sparse files cannot evade the small trial's guard.
     estimate = max(logical, allocated) + entries * 2048
     return {"paths": files, "logical_bytes": logical, "allocated_bytes": allocated,
             "entries": entries, "archive_input_estimate_bytes": estimate}
+
+
+def record_sample(measurements, sample, free_bytes):
+    measurements["sample_count"] += 1
+    prior_free = measurements["min_free_bytes"]
+    measurements["min_free_bytes"] = free_bytes if prior_free is None else min(prior_free, free_bytes)
+    peak = measurements["peak_output"]
+    for name in ("logical_bytes", "allocated_bytes", "entries", "archive_input_estimate_bytes"):
+        peak[name] = max(peak.get(name, 0), sample[name])
+
+
+def bounded_output_evidence(outputs, max_bytes):
+    """Keep complete evidence records within one JSON array's byte budget."""
+    def priority(item):
+        path = item["path"]
+        object_file = path.endswith(".o")
+        return (not (object_file and path.startswith("obj/")), not object_file, path)
+
+    used = 2  # The array brackets.
+    selected = []
+    for item in sorted(outputs, key=priority):
+        # atomic_json uses ASCII escaping and default separators. Allow a
+        # separator even for the first item to keep this estimate conservative.
+        size = len(json.dumps(item, sort_keys=True)) + 2
+        if used + size <= max_bytes:
+            selected.append(item)
+            used += size
+    return selected
 
 
 def log_snapshot(path):
@@ -111,8 +159,11 @@ def log_snapshot(path):
         return None
 
 
-def current_log_bytes(path, before):
-    """Read only this invocation after append, truncation, or log rotation."""
+def current_log_markers(path, before):
+    """Scan this invocation after append, truncation, or log rotation."""
+    phrases = ("Saved fs state in ", "Failed to save fs state", "close journal",
+               "Failed to remove stale fs state", "not save state", "close hashfs:")
+    encoded = tuple(phrase.encode("ascii") for phrase in phrases)
     with path.open("rb") as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode):
@@ -126,8 +177,12 @@ def current_log_bytes(path, before):
                 if head == before["head"] and tail == before["tail"]:
                     offset = before["size"]
         stream.seek(offset)
-        return stream.read(), {"path": str(path), "offset": offset,
-                               "bytes": info.st_size - offset}
+        markers = []
+        for line in stream:
+            if any(phrase in line for phrase in encoded):
+                markers.extend(part for part in line.decode("utf-8", errors="replace").splitlines()
+                               if any(phrase in part for phrase in phrases))
+        return markers, {"path": str(path), "offset": offset, "bytes": info.st_size - offset}
 
 
 def regular_file_identity(path):
@@ -153,14 +208,10 @@ def regular_file_identity(path):
 
 def close_evidence(path, before, output, journal_before):
     try:
-        data, source = current_log_bytes(path, before)
+        markers, source = current_log_markers(path, before)
     except (OSError, ValueError) as error:
         return {"saved": False, "journal_closed": False, "journal_ready": False,
                 "notes": [], "errors": [str(error)], "source_files": [], "markers": []}
-    text = data.decode("utf-8", errors="replace")
-    markers = [line for line in text.splitlines() if any(phrase in line for phrase in (
-        "Saved fs state in ", "Failed to save fs state", "close journal",
-        "Failed to remove stale fs state", "not save state", "close hashfs:"))]
     errors = [line for line in markers if any(phrase in line for phrase in (
         "Failed to save fs state", "Failed to close journal",
         "Failed to remove stale fs state", "close hashfs:"))]
@@ -314,13 +365,15 @@ def apk_metadata(path):
 def run_trial(source_root, phase, result_path, log_path, seconds=180,
               max_output_bytes=OUTPUT_LIMIT, min_free_bytes=SMALL_MIN_FREE_BYTES,
               previous_result=None, command=None, stop_grace_seconds=120,
-              sample_seconds=2, output_stream=None, max_output_entries=OUTPUT_ENTRY_LIMIT,
-              *, scale=False):
+              sample_seconds=None, output_stream=None, max_output_entries=OUTPUT_ENTRY_LIMIT,
+              *, scale=False, large=False):
     """Run a bounded trial. Only local callers can substitute the build command."""
     source_root = source_root.absolute()
     output = source_root / BUILD_DIR
     metrics_path = log_path.with_name(f"siso-metrics-{phase}.json")
     info_path = output / "siso.INFO"
+    if sample_seconds is None:
+        sample_seconds = LARGE_SAMPLE_SECONDS if large else 2
     result = {"format": FORMAT, "version": VERSION, "phase": phase,
               "target": TARGET, "build_dir": str(BUILD_DIR), "reason": "controller-error",
               "returncode": None, "forced_kill": False, "interrupt_sent": False,
@@ -331,23 +384,33 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
         result["scale_limits"] = {"seconds": seconds, "max_output_bytes": max_output_bytes,
                                   "max_output_entries": max_output_entries,
                                   "min_free_bytes": min_free_bytes}
+    if large:
+        result["large_limits"] = {"seconds": seconds, "max_output_bytes": max_output_bytes,
+                                  "max_output_entries": max_output_entries,
+                                  "min_free_bytes": min_free_bytes}
+        result["measurements"] = {"sample_interval_seconds": sample_seconds, "sample_count": 0,
+                                  "min_free_bytes": None, "peak_output": {}}
     process = None
     selector = selectors.DefaultSelector()
     old_handlers = {}
     received_signals = []
     started = time.monotonic()
     sink = output_stream if output_stream is not None else sys.stdout.buffer
+    console = {"prefix_bytes": 0, "tail_bytes": 0, "truncated": False}
+    last_console_progress = started
     try:
-        if phase not in {"seed", "restore"} or seconds <= 0:
+        if phase not in {"seed", "restore"} or seconds <= 0 or sample_seconds <= 0:
             raise ValueError("Invalid trial phase or time budget")
-        entry_limit = SCALE_OUTPUT_ENTRY_LIMIT if scale else OUTPUT_ENTRY_LIMIT
+        if scale and large:
+            raise ValueError("Choose only one restore trial mode")
+        time_limit, output_limit, entry_limit, disk_floor = trial_limits(scale, large)
         if type(max_output_entries) is not int or not 1 <= max_output_entries <= entry_limit:
             raise ValueError(f"The output entry guard must be between 1 and {entry_limit}")
-        if scale and (phase != "restore" or seconds > SCALE_TIME_LIMIT
-                      or not 1 <= max_output_bytes <= SCALE_OUTPUT_LIMIT
-                      or min_free_bytes < SCALE_MIN_FREE_BYTES):
-            raise ValueError("Scale requires restore and bounded time, output bytes, and free disk")
-        if phase == "restore" and previous_result is None and not scale:
+        if (scale or large) and (phase != "restore" or seconds > time_limit
+                                 or not 1 <= max_output_bytes <= output_limit
+                                 or min_free_bytes < disk_floor):
+            raise ValueError("Expanded trials require restore and bounded time, output bytes, and free disk")
+        if phase == "restore" and previous_result is None and not (scale or large):
             raise ValueError("Restore requires the saved seed trial result")
         if metrics_path.exists() or metrics_path.is_symlink():
             raise ValueError("Metrics path must be new for this trial")
@@ -359,13 +422,18 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
         result["output_before"] = snapshot
         close_before = log_snapshot(info_path)
         journal_before = regular_file_identity(output / ".siso_fs_state.journal")
+        free_before = shutil.disk_usage(source_root).free if large else None
+        if large:
+            record_sample(result["measurements"], snapshot, free_before)
         if snapshot["archive_input_estimate_bytes"] >= max_output_bytes:
             result["reason"] = "preflight-output-limit"
             return result
         if snapshot["entries"] >= max_output_entries:
             result["reason"] = "preflight-output-entry-limit"
             return result
-        if shutil.disk_usage(source_root).free < min_free_bytes:
+        if free_before is None:
+            free_before = shutil.disk_usage(source_root).free
+        if free_before < min_free_bytes:
             result["reason"] = "preflight-disk-limit"
             return result
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -395,10 +463,19 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                     elif now - started >= seconds:
                         reason = "time-limit"
                     elif now - last_sample >= sample_seconds:
-                        sample = tree_snapshot(output)
+                        sample = tree_snapshot(output, include_paths=False)
                         sample.pop("paths")
                         free = shutil.disk_usage(source_root).free
                         result["last_sample"] = {**sample, "free_bytes": free}
+                        if large:
+                            record_sample(result["measurements"], sample, free)
+                            if console["truncated"] and now - last_console_progress >= LARGE_CONSOLE_PROGRESS_SECONDS:
+                                progress = (f"[APK trial: {now - started:.0f}s, {sample['entries']} entries, "
+                                            f"{sample['archive_input_estimate_bytes']} estimated output bytes, "
+                                            f"{free} free bytes]\n")
+                                sink.write(progress.encode("ascii"))
+                                sink.flush()
+                                last_console_progress = now
                         last_sample = now
                         if sample["archive_input_estimate_bytes"] >= max_output_bytes:
                             reason = "output-limit"
@@ -427,8 +504,21 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                     else:
                         log.write(chunk)
                         log.flush()
-                        sink.write(chunk)
-                        sink.flush()
+                        if large:
+                            remaining = LARGE_CONSOLE_PREFIX_BYTES - console["prefix_bytes"]
+                            shown = chunk[:remaining]
+                            if shown:
+                                sink.write(shown)
+                                sink.flush()
+                                console["prefix_bytes"] += len(shown)
+                            if len(shown) < len(chunk) and not console["truncated"]:
+                                sink.write(b"\n[APK trial console capped; full output continues in the runner log.]\n")
+                                sink.flush()
+                                console["truncated"] = True
+                                last_console_progress = time.monotonic()
+                        else:
+                            sink.write(chunk)
+                            sink.flush()
                 if process.poll() is not None:
                     leader_exited_at = leader_exited_at or time.monotonic()
                     if not selector.get_map() or time.monotonic() - leader_exited_at > 1:
@@ -476,6 +566,29 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             process.stdout.close()
         for name, old in old_handlers.items():
             signal.signal(name, old)
+        if large:
+            if console["truncated"]:
+                # Exclude the already displayed prefix even if the full log
+                # ends less than one tail-length beyond it.
+                with contextlib.suppress(OSError):
+                    with log_path.open("rb") as stream:
+                        size = os.fstat(stream.fileno()).st_size
+                        stream.seek(max(console["prefix_bytes"], size - LARGE_CONSOLE_TAIL_BYTES))
+                        tail = stream.read(LARGE_CONSOLE_TAIL_BYTES)
+                    if tail:
+                        sink.write(b"\n[Final APK trial output]\n")
+                        sink.write(tail)
+                        sink.write(b"\n")
+                        sink.flush()
+                        console["tail_bytes"] = len(tail)
+            result["console"] = console
+            result["completed_output_count"] = len(result["completed_outputs"])
+            result["new_completed_output_count"] = len(result["new_completed_outputs"])
+            for name in ("completed_outputs", "new_completed_outputs"):
+                result[name] = bounded_output_evidence(result[name], LARGE_EVIDENCE_ARRAY_BYTES)
+            result["evidence_truncated"] = (
+                len(result["completed_outputs"]) != result["completed_output_count"]
+                or len(result["new_completed_outputs"]) != result["new_completed_output_count"])
         result["elapsed_seconds"] = round(time.monotonic() - started, 3)
         atomic_json(result_path, result)
     return result
@@ -487,7 +600,9 @@ def main():
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--previous-result", type=Path)
-    parser.add_argument("--scale", action="store_true", help="Use the bounded scale restore limits")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--scale", action="store_true", help="Use the bounded scale restore limits")
+    mode.add_argument("--large", action="store_true", help="Use the larger restore trial limits")
     parser.add_argument("--seconds", type=int)
     parser.add_argument("--max-output-bytes", type=int)
     parser.add_argument("--max-output-entries", type=int)
@@ -495,13 +610,11 @@ def main():
     args = parser.parse_args()
     if Path.cwd() != SOURCE_ROOT:
         parser.error("Run only from the fixed /work/chromium/src directory")
-    if args.scale and args.phase != "restore":
-        parser.error("--scale requires --phase restore")
-    time_limit = SCALE_TIME_LIMIT if args.scale else 600
-    output_limit = SCALE_OUTPUT_LIMIT if args.scale else OUTPUT_LIMIT
-    entry_limit = SCALE_OUTPUT_ENTRY_LIMIT if args.scale else OUTPUT_ENTRY_LIMIT
-    disk_floor = SCALE_MIN_FREE_BYTES if args.scale else SMALL_MIN_FREE_BYTES
-    seconds = args.seconds if args.seconds is not None else (SCALE_TIME_LIMIT if args.scale else 180)
+    expanded = args.scale or args.large
+    if expanded and args.phase != "restore":
+        parser.error("--scale and --large require --phase restore")
+    time_limit, output_limit, entry_limit, disk_floor = trial_limits(args.scale, args.large)
+    seconds = args.seconds if args.seconds is not None else (time_limit if expanded else 180)
     max_output_bytes = args.max_output_bytes if args.max_output_bytes is not None else output_limit
     max_output_entries = args.max_output_entries if args.max_output_entries is not None else entry_limit
     min_free_bytes = args.min_free_bytes if args.min_free_bytes is not None else disk_floor
@@ -513,10 +626,11 @@ def main():
         parser.error(f"--max-output-entries must be between 1 and {entry_limit}")
     result = run_trial(SOURCE_ROOT, args.phase, args.result, args.log, seconds,
                        max_output_bytes, min_free_bytes, args.previous_result,
-                       max_output_entries=max_output_entries, scale=args.scale)
+                       max_output_entries=max_output_entries, scale=args.scale, large=args.large)
     summary = {key: result[key] for key in ("phase", "reason", "returncode",
                                            "forced_kill", "ready_for_restore_test", "max_output_entries")}
-    for key in ("scale_limits", "output_before", "last_sample"):
+    for key in ("scale_limits", "large_limits", "output_before", "last_sample", "measurements",
+                "completed_output_count", "new_completed_output_count", "evidence_truncated", "console"):
         if key in result:
             summary[key] = result[key]
     print(json.dumps(summary))
