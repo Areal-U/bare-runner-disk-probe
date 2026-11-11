@@ -3,12 +3,13 @@ name: Bare checkpoint transfer probe
   workflow_dispatch:
     inputs:
       mode:
-        description: Resume the retained seed; paired mode requires no existing experiment checkpoints
+        description: Resume the small seed, run the paired short trial, or measure one continuation from the verified successor
         type: choice
         default: restore-saved
         options:
         - restore-saved
         - paired
+        - measure-scale
 permissions: {}
 concurrency:
   group: bare-checkpoint-transfer-workflow
@@ -44,22 +45,30 @@ jobs:
     needs:
     - restore
     - restore-saved
-    if: ${{ !cancelled() && (needs.restore.result == 'success' || needs['restore-saved'].result == 'success') }}
+    - measure-scale
+    if: ${{ !cancelled() && (needs.restore.result == 'success' || needs['restore-saved'].result == 'success' || (inputs.mode == 'measure-scale'
+      && needs['measure-scale'].outputs.checkpoint_saved == 'true')) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: ${{ inputs.mode == 'measure-scale' && 20 || 10 }}
     defaults:
       run:
         shell: bash
     env:
-      EXPECTED_KEY: ${{ needs.restore.outputs.checkpoint_key || needs['restore-saved'].outputs.checkpoint_key }}
-      EXPECTED_SHA: ${{ needs.restore.outputs.checkpoint_sha || needs['restore-saved'].outputs.checkpoint_sha }}
-      EXPECTED_IDENTITY: ${{ needs.restore.outputs.checkpoint_identity || needs['restore-saved'].outputs.checkpoint_identity }}
+      EXPECTED_KEY: ${{ needs.restore.outputs.checkpoint_key || needs['restore-saved'].outputs.checkpoint_key || needs['measure-scale'].outputs.checkpoint_key
+        }}
+      EXPECTED_SHA: ${{ needs.restore.outputs.checkpoint_sha || needs['restore-saved'].outputs.checkpoint_sha || needs['measure-scale'].outputs.checkpoint_sha
+        }}
+      EXPECTED_IDENTITY: ${{ needs.restore.outputs.checkpoint_identity || needs['restore-saved'].outputs.checkpoint_identity || needs['measure-scale'].outputs.checkpoint_identity
+        }}
+      READBACK_MODE: ${{ inputs.mode }}
     steps:
     - name: Validate the successor identity and load its exact verifier
       timeout-minutes: 4
       run: |
         [[ $GITHUB_EVENT_NAME == workflow_dispatch && $RUNNER_ENVIRONMENT == github-hosted && $RUNNER_ARCH == X64 ]]
-        [[ $EXPECTED_KEY =~ ^bare-transfer-v2-${GITHUB_RUN_ID}-[0-9]+-checkpoint-restore$ ]]
+        suffix=restore
+        [[ $READBACK_MODE != measure-scale ]] || suffix=scale
+        [[ $EXPECTED_KEY =~ ^bare-transfer-v2-${GITHUB_RUN_ID}-[0-9]+-checkpoint-$suffix$ ]]
         [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_IDENTITY =~ ^[0-9a-f]{64}$ ]]
         curl --fail --location --retry 2 --max-time 60 \
           "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/checkpoint.py" \
@@ -72,7 +81,7 @@ jobs:
         key: ${{ env.EXPECTED_KEY }}
         fail-on-cache-miss: true
     - name: Verify the restored successor bytes and newly completed outputs
-      timeout-minutes: 4
+      timeout-minutes: ${{ inputs.mode == 'measure-scale' && 12 || 4 }}
       env:
         CACHE_HIT: ${{ steps.successor.outputs.cache-hit }}
         MATCHED_KEY: ${{ steps.successor.outputs.cache-matched-key }}
@@ -81,7 +90,18 @@ jobs:
         archive="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
         [[ -f $archive && ! -L $archive ]]
         printf '%s  %s\n' "$EXPECTED_SHA" "$archive" | sha256sum --check --strict
-        python3 "$RUNNER_TEMP/checkpoint.py" validate-archive "$archive"
+        limits=()
+        [[ $READBACK_MODE != measure-scale ]] || limits+=(--scale)
+        python3 "$RUNNER_TEMP/checkpoint.py" validate-archive "$archive" "${limits[@]}"
         python3 "$RUNNER_TEMP/checkpoint.py" verify-continuation "$archive" \
-          --expected-identity "$EXPECTED_IDENTITY" --ci-revision "$GITHUB_SHA"
+          --expected-identity "$EXPECTED_IDENTITY" --ci-revision "$GITHUB_SHA" "${limits[@]}"
         printf 'Verified successor cache %s\n' "$EXPECTED_KEY"
+  measure-scale:
+    if: ${{ inputs.mode == 'measure-scale' }}
+    uses: ./.github/workflows/bare-arm64-probe.yml
+    with:
+      probe: checkpoint-scale
+      expected_checkpoint_key: bare-transfer-v2-42950651335-1-checkpoint-restore
+      expected_checkpoint_sha: 0fec6f756b98561191ef3199f86d965b5fe5b58146bcdb64b51f348f0aeab9a3
+      expected_checkpoint_identity: 87c8946d20f1f0f97d494c21291b1bb1865772084f0e1a09577414007c3ae170
+      expected_base_image: ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
