@@ -24,8 +24,13 @@ FORMAT = "bare-input-mtimes"
 VERSION = 1
 CHECKPOINT_VERSION = 2
 EVIDENCE_FORMAT = "bare-completed-objects"
+CONTINUATION_FORMAT = "bare-checkpoint-continuation"
 PROVENANCE_FORMAT = "bare-checkpoint-provenance"
 CITY_OBJECT = "out/Bare/obj/base/third_party/cityhash/cityhash/city.o"
+CONTINUATION_RECORD = "out/Bare/checkpoint-continuation.json"
+CONTINUATION_TRIAL = "out/Bare/checkpoint-trial-restore.json"
+PROVENANCE_RECORD = "out/Bare/checkpoint-provenance.json"
+CONTINUATION_TRIAL_LIMIT = 16 * 1024 ** 2
 CI_FILES = ("checkpoint.py", "build_trial.py", "bare-arm64-probe.yml",
             "bare-checkpoint-transfer.yml")
 TOOL_FILES = (
@@ -555,6 +560,132 @@ def verify_evidence(record_path, source_root=ROOTS["src"]):
     return {"verified": len(records)}
 
 
+def successful_continuation_edges(trial):
+    if (not isinstance(trial, dict) or trial.get("format") != "bare-apk-trial"
+            or trial.get("version") != 1 or trial.get("phase") != "restore"
+            or trial.get("target") != "chrome_public_apk" or trial.get("build_dir") != "out/Bare"
+            or trial.get("ready_for_restore_test") is not True
+            or trial.get("container_quiescence_verified") is not True
+            or not isinstance(trial.get("new_completed_outputs"), list)):
+        raise ValueError("Expected a verified, quiescent APK continuation trial")
+    edges = {}
+    for edge in trial["new_completed_outputs"]:
+        if (not isinstance(edge, dict) or edge.get("success") is not True
+                or edge.get("success_source") != "siso_metrics+ninja_log-v5"
+                or not isinstance(edge.get("step_id"), str) or not edge["step_id"]):
+            raise ValueError("The continuation edge has no successful-completion evidence")
+        relative = safe_relative(edge.get("path"))
+        name = (PurePosixPath("out/Bare") / relative).as_posix()
+        if not relative.parts or name in edges:
+            raise ValueError("Invalid or duplicated continuation output")
+        edges[name] = edge["step_id"]
+    return edges
+
+
+def record_continuation(trial_path, record_path, source_root=ROOTS["src"]):
+    with trial_path.open("rb") as stream:
+        payload = stream.read(CONTINUATION_TRIAL_LIMIT + 1)
+    if len(payload) > CONTINUATION_TRIAL_LIMIT:
+        raise ValueError("Continuation trial JSON exceeds its size limit")
+    edges = successful_continuation_edges(json.loads(payload))
+    outputs = []
+    for name in sorted(edges, key=lambda item: (not item.endswith(".o"), item)):
+        try:
+            path = path_without_symlink_parents(source_root, PurePosixPath(name))
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        # The readback checks regular archive members directly. GNU tar can
+        # represent multiply linked filesystem files as hardlink members.
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not info.st_size:
+            continue
+        metadata = object_metadata(path, source_root)
+        outputs.append({"path": name, "step_id": edges[name], "size": metadata["size"],
+                        "sha256": metadata["sha256"]})
+        if len(outputs) == 3:
+            break
+    if not outputs:
+        raise ValueError("The continuation produced no verifiable new regular output")
+    write_json(record_path, {"format": CONTINUATION_FORMAT, "version": 1,
+                             "trial_sha256": hashlib.sha256(payload).hexdigest(),
+                             "outputs": outputs})
+    return {"recorded": len(outputs), "paths": [item["path"] for item in outputs]}
+
+
+def continuation_archive_records(archive_path):
+    limits = {CONTINUATION_RECORD: 32 * 1024, CONTINUATION_TRIAL: CONTINUATION_TRIAL_LIMIT,
+              PROVENANCE_RECORD: 1024 ** 2}
+    records = {}
+    with tarfile.open(archive_path, mode="r|gz") as archive:
+        for member in archive:
+            name = member.name
+            if name not in limits:
+                continue
+            if name in records or not member.isfile() or not 0 < member.size <= limits[name]:
+                raise ValueError("Invalid continuation archive record: " + name)
+            with archive.extractfile(member) as stream:
+                records[name] = stream.read(member.size)
+            if len(records[name]) != member.size:
+                raise ValueError("Truncated continuation archive record: " + name)
+    if records.keys() != limits.keys():
+        raise ValueError("Missing continuation archive record: " + ", ".join(sorted(limits.keys() - records.keys())))
+    return records
+
+
+def verify_continuation(archive_path, expected_identity, ci_revision):
+    if (not re.fullmatch(r"[0-9a-f]{64}", expected_identity)
+            or not re.fullmatch(r"[0-9a-f]{40}", ci_revision)):
+        raise ValueError("Expected the exact successor identity and CI revision")
+    records = continuation_archive_records(archive_path)
+    provenance = json.loads(records[PROVENANCE_RECORD])
+    if (not isinstance(provenance, dict) or provenance.get("format") != PROVENANCE_FORMAT
+            or provenance.get("version") != CHECKPOINT_VERSION
+            or not isinstance(provenance.get("identity"), dict)
+            or provenance["identity"].get("ci_revision") != ci_revision
+            or provenance.get("identity_sha256") != expected_identity
+            or canonical_hash(provenance["identity"]) != expected_identity):
+        raise ValueError("The archived successor provenance does not match")
+    trial_payload = records[CONTINUATION_TRIAL]
+    edges = successful_continuation_edges(json.loads(trial_payload))
+    record = json.loads(records[CONTINUATION_RECORD])
+    if (not isinstance(record, dict) or record.get("format") != CONTINUATION_FORMAT
+            or record.get("version") != 1
+            or record.get("trial_sha256") != hashlib.sha256(trial_payload).hexdigest()
+            or not isinstance(record.get("outputs"), list) or not 1 <= len(record["outputs"]) <= 3):
+        raise ValueError("Invalid continuation evidence or trial binding")
+    expected = {}
+    for item in record["outputs"]:
+        if not isinstance(item, dict):
+            raise ValueError("Invalid continuation output evidence")
+        name = safe_relative(item.get("path")).as_posix()
+        if (name in expected or name not in edges or item.get("step_id") != edges[name]
+                or type(item.get("size")) is not int or not 0 < item["size"] <= 2 * 1024 ** 3
+                or not isinstance(item.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])):
+            raise ValueError("Invalid continuation output evidence")
+        expected[name] = item
+
+    verified = set()
+    with tarfile.open(archive_path, mode="r|gz") as archive:
+        for member in archive:
+            name = member.name
+            if name not in expected:
+                continue
+            item = expected[name]
+            if name in verified or not member.isfile() or member.size != item["size"]:
+                raise ValueError("Invalid archived continuation output: " + name)
+            digest = hashlib.sha256()
+            with archive.extractfile(member) as stream:
+                for block in iter(lambda: stream.read(4 * 1024 ** 2), b""):
+                    digest.update(block)
+            if digest.hexdigest() != item["sha256"]:
+                raise ValueError("Archived continuation output content differs: " + name)
+            verified.add(name)
+    if verified != expected.keys():
+        raise ValueError("Missing archived continuation output: " + ", ".join(sorted(expected.keys() - verified)))
+    return {"verified": len(verified), "paths": sorted(verified)}
+
+
 def canonicalize_logs(source_root=ROOTS["src"], max_file_bytes=32 * 1024 * 1024,
                       max_total_bytes=128 * 1024 * 1024):
     """Make known Siso diagnostic links portable; never alter incremental state."""
@@ -715,6 +846,13 @@ def main():
     command = commands.add_parser("collect-evidence")
     command.add_argument("trial", type=Path)
     command.add_argument("record", type=Path)
+    command = commands.add_parser("record-continuation")
+    command.add_argument("trial", type=Path)
+    command.add_argument("record", type=Path)
+    command = commands.add_parser("verify-continuation")
+    command.add_argument("archive", type=Path)
+    command.add_argument("--expected-identity", required=True)
+    command.add_argument("--ci-revision", required=True)
     for name in ("verify-evidence", "evidence-targets"):
         command = commands.add_parser(name)
         command.add_argument("record", type=Path)
@@ -737,6 +875,10 @@ def main():
         result = operation(args.record, args.ci_revision, args.base_image, **options)
     elif args.command == "collect-evidence":
         result = collect_evidence(args.trial, args.record)
+    elif args.command == "record-continuation":
+        result = record_continuation(args.trial, args.record)
+    elif args.command == "verify-continuation":
+        result = verify_continuation(args.archive, args.expected_identity, args.ci_revision)
     elif args.command == "verify-evidence":
         result = verify_evidence(args.record)
     elif args.command == "evidence-targets":
