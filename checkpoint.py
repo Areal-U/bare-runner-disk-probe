@@ -43,6 +43,10 @@ PRODUCTION_ARCHIVE_BYTES = 13 * 1024 ** 3 // 4
 PRODUCTION_UNPACKED_BYTES = 13 * 1024 ** 3
 PRODUCTION_ARCHIVE_MEMBERS = 550_000
 ANDROID_PACKAGING_SUFFIXES = {".apk", ".ap_", ".aab", ".apks"}
+GN_PACKAGING_INPUTS = {"apks/Trichrome.ssargs", "apks/Trichrome32.ssargs",
+                       "apks/Trichrome64.ssargs"}
+GN_DEPFILE = "out/Bare/build.ninja.d"
+GN_DEPFILE_LIMIT = 8 * 1024 ** 2
 CI_FILES = ("checkpoint.py", "build_trial.py", "bare-arm64-probe.yml",
             "bare-checkpoint-transfer.yml")
 TOOL_FILES = (
@@ -676,6 +680,42 @@ def is_android_packaging(path):
     return path.parts[:3] == ("out", "Bare", "apks") or path.suffix.lower() in ANDROID_PACKAGING_SUFFIXES
 
 
+def gn_packaging_dependencies(payload):
+    """Find GN regeneration inputs omitted by the production archive policy."""
+    target, separator, dependencies = payload.decode("utf-8").partition(":")
+    if target != "build.ninja.stamp" or not separator or not dependencies.strip():
+        raise ValueError("Unexpected GN regeneration depfile")
+    build_dir = (ROOTS["src"] / "out/Bare").as_posix()
+    required = set()
+    # GN emits make-style paths. Keep escaped spaces within their path.
+    for word in re.findall(r"(?:\\[^\n]|[^\\\s])+", dependencies.replace("\\\n", "")):
+        path = word.replace(r"\ ", " ")
+        relative = posixpath.relpath(posixpath.join(build_dir, path), build_dir)
+        if relative == ".." or relative.startswith("../"):
+            continue
+        if is_android_packaging(PurePosixPath("out/Bare", relative)):
+            required.add(relative)
+    unknown = required - GN_PACKAGING_INPUTS
+    if unknown:
+        raise ValueError("GN needs additional excluded inputs: " + ", ".join(sorted(unknown)))
+    return required
+
+
+def check_gn_packaging_inputs(build_dir):
+    """Verify that pinned GN regenerated every omitted descriptor."""
+    depfile = build_dir / "build.ninja.d"
+    info = depfile.lstat()
+    if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= GN_DEPFILE_LIMIT:
+        raise ValueError("Expected a bounded regular GN regeneration depfile")
+    required = gn_packaging_dependencies(depfile.read_bytes())
+    for name in sorted(required):
+        path = path_without_symlink_parents(build_dir, PurePosixPath(name))
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= 4096:
+            raise ValueError("Expected a small regular GN descriptor: " + name)
+    return {"gn_packaging_dependencies": sorted(required)}
+
+
 def reuse_markers(record):
     if (not isinstance(record, dict) or record.get("format") != CONTINUATION_FORMAT
             or record.get("version") not in (1, 2)):
@@ -948,6 +988,7 @@ def validate_archive(archive_path, max_archive_bytes=1024 ** 3,
     symlinks = {}
     hardlinks = {}
     unpacked_bytes = 0
+    gn_dependencies = None
     with tarfile.open(archive_path, mode="r|gz") as archive:
         for member in archive:
             relative = archive_relative(member.name)
@@ -962,6 +1003,11 @@ def validate_archive(archive_path, max_archive_bytes=1024 ** 3,
                 raise ValueError("Checkpoint archive contains an invalid member size")
             if relative == PurePosixPath("out/Bare") and not member.isdir():
                 raise ValueError("Checkpoint archive root must be a directory")
+            if exclude_android_packaging and name == GN_DEPFILE:
+                if not member.isfile() or not 0 < member.size <= GN_DEPFILE_LIMIT:
+                    raise ValueError("Invalid archived GN regeneration depfile")
+                with archive.extractfile(member) as stream:
+                    gn_dependencies = gn_packaging_dependencies(stream.read(member.size))
             members[name] = member.type
             unpacked_bytes += member.size
             if len(members) > max_members or unpacked_bytes > max_unpacked_bytes:
@@ -980,6 +1026,8 @@ def validate_archive(archive_path, max_archive_bytes=1024 ** 3,
                     raise ValueError("Public checkpoint contains a link to Android packaging output: " + name)
     if "out/Bare" not in members:
         raise ValueError("Checkpoint archive root is missing")
+    if exclude_android_packaging and gn_dependencies is None:
+        raise ValueError("Checkpoint archive has no GN regeneration depfile")
     for name in members:
         if any(parent.as_posix() in symlinks or parent.as_posix() in hardlinks
                for parent in PurePosixPath(name).parents):
@@ -1074,11 +1122,15 @@ def main():
         command.add_argument("record", type=Path)
     command = commands.add_parser("canonicalize-logs")
     command.add_argument("--scale", action="store_true")
+    command = commands.add_parser("check-gn-packaging")
+    command.add_argument("build_dir", type=Path)
     args = parser.parse_args()
     if args.command == "record-inputs":
         result = record_inputs(args.manifest)
     elif args.command == "restore-inputs":
         result = restore_inputs(args.manifest)
+    elif args.command == "check-gn-packaging":
+        result = check_gn_packaging_inputs(args.build_dir)
     elif args.command in {"validate-archive", "inspect-input-paths"}:
         limits = {}
         if args.command == "validate-archive":
