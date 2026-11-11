@@ -45,6 +45,12 @@ LARGE_TIME_LIMIT = 5400
 LARGE_OUTPUT_LIMIT = 6 * 1024 ** 3
 LARGE_OUTPUT_ENTRY_LIMIT = 300_000
 LARGE_MIN_FREE_BYTES = 20 * 1024 ** 3
+PRODUCTION_TIME_LIMIT = 180 * 60
+PRODUCTION_DEFAULT_OUTPUT_LIMIT = 8 * 1024 ** 3
+PRODUCTION_OUTPUT_LIMIT = 9 * 1024 ** 3
+PRODUCTION_OUTPUT_ENTRY_LIMIT = 400_000
+PRODUCTION_MIN_FREE_BYTES = 20 * 1024 ** 3
+PRODUCTION_MIN_FREE_INODES = 20_000
 LARGE_SAMPLE_SECONDS = 5
 LARGE_CONSOLE_PREFIX_BYTES = 2 * 1024 ** 2
 LARGE_CONSOLE_TAIL_BYTES = 32 * 1024
@@ -53,9 +59,14 @@ LARGE_CONSOLE_PROGRESS_SECONDS = 60
 # metadata within the checkpoint verifier's 128 MiB large-report limit.
 LARGE_EVIDENCE_ARRAY_BYTES = 56 * 1024 ** 2
 SOURCE_ROOT = Path("/work/chromium/src")
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+SISO_STATUS = re.compile(rb"(?:^|[\r\n])\[(\d+)/(\d+)\] [^\r\n]{1,64}? ([SF]) ([^\r\n]{1,400})(?=[\r\n]|$)")
 
 
-def trial_limits(scale, large):
+def trial_limits(scale, large, production=False):
+    if production:
+        return (PRODUCTION_TIME_LIMIT, PRODUCTION_OUTPUT_LIMIT,
+                PRODUCTION_OUTPUT_ENTRY_LIMIT, PRODUCTION_MIN_FREE_BYTES)
     if large:
         return LARGE_TIME_LIMIT, LARGE_OUTPUT_LIMIT, LARGE_OUTPUT_ENTRY_LIMIT, LARGE_MIN_FREE_BYTES
     if scale:
@@ -123,6 +134,41 @@ def record_sample(measurements, sample, free_bytes):
     peak = measurements["peak_output"]
     for name in ("logical_bytes", "allocated_bytes", "entries", "archive_input_estimate_bytes"):
         peak[name] = max(peak.get(name, 0), sample[name])
+
+
+def resource_status(source_root):
+    filesystem = os.statvfs(source_root)
+    result = {"free_inodes": filesystem.f_favail}
+    for name in ("memory.current", "memory.peak", "memory.swap.current", "memory.events"):
+        try:
+            value = (CGROUP_ROOT / name).read_text().strip()
+            result[name] = (dict((key, int(count)) for key, count in
+                                 (line.split() for line in value.splitlines()))
+                            if name == "memory.events" else int(value))
+        except (OSError, ValueError):
+            continue
+    return result
+
+
+def update_siso_status(progress, chunk):
+    # Preserve a possible split line between pipe reads. Very long output lines
+    # are diagnostic output and are not needed for the bounded heartbeat.
+    data = progress.pop("partial", b"") + chunk
+    split = max(data.rfind(b"\r"), data.rfind(b"\n"))
+    if split < 0:
+        progress["partial"] = data[-1024:]
+        return
+    progress["partial"] = data[split + 1:][-1024:]
+    for match in SISO_STATUS.finditer(data[:split + 1]):
+        progress["step_counter"] = int(match[1])
+        progress["graph_total"] = int(match[2])
+        description = match[4].decode("utf-8", errors="replace")
+        if match[3] == b"S" and description.startswith(("LINK ", "SOLINK ")):
+            progress["link_action"] = description
+            progress["link_started"] = time.monotonic()
+        elif match[3] == b"F" and description == progress.get("link_action"):
+            progress.pop("link_action", None)
+            progress.pop("link_started", None)
 
 
 def bounded_output_evidence(outputs, max_bytes):
@@ -366,14 +412,16 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
               max_output_bytes=OUTPUT_LIMIT, min_free_bytes=SMALL_MIN_FREE_BYTES,
               previous_result=None, command=None, stop_grace_seconds=120,
               sample_seconds=None, output_stream=None, max_output_entries=OUTPUT_ENTRY_LIMIT,
-              *, scale=False, large=False):
+              *, scale=False, large=False, production=False, jobs=2):
     """Run a bounded trial. Only local callers can substitute the build command."""
     source_root = source_root.absolute()
     output = source_root / BUILD_DIR
     metrics_path = log_path.with_name(f"siso-metrics-{phase}.json")
     info_path = output / "siso.INFO"
+    measured = large or production
+    expanded = scale or measured
     if sample_seconds is None:
-        sample_seconds = LARGE_SAMPLE_SECONDS if large else 2
+        sample_seconds = LARGE_SAMPLE_SECONDS if measured else 2
     result = {"format": FORMAT, "version": VERSION, "phase": phase,
               "target": TARGET, "build_dir": str(BUILD_DIR), "reason": "controller-error",
               "returncode": None, "forced_kill": False, "interrupt_sent": False,
@@ -384,12 +432,16 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
         result["scale_limits"] = {"seconds": seconds, "max_output_bytes": max_output_bytes,
                                   "max_output_entries": max_output_entries,
                                   "min_free_bytes": min_free_bytes}
-    if large:
-        result["large_limits"] = {"seconds": seconds, "max_output_bytes": max_output_bytes,
-                                  "max_output_entries": max_output_entries,
-                                  "min_free_bytes": min_free_bytes}
+    if measured:
+        result["production_limits" if production else "large_limits"] = {
+            "seconds": seconds, "max_output_bytes": max_output_bytes,
+            "max_output_entries": max_output_entries, "min_free_bytes": min_free_bytes}
         result["measurements"] = {"sample_interval_seconds": sample_seconds, "sample_count": 0,
                                   "min_free_bytes": None, "peak_output": {}}
+    if production:
+        result["artifact_ready"] = False
+        result["rebuilt_completed_output_count"] = 0
+        result["resources_before"] = resource_status(source_root)
     process = None
     selector = selectors.DefaultSelector()
     old_handlers = {}
@@ -398,19 +450,22 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
     sink = output_stream if output_stream is not None else sys.stdout.buffer
     console = {"prefix_bytes": 0, "tail_bytes": 0, "truncated": False}
     last_console_progress = started
+    progress = {}
     try:
         if phase not in {"seed", "restore"} or seconds <= 0 or sample_seconds <= 0:
             raise ValueError("Invalid trial phase or time budget")
-        if scale and large:
+        if sum((scale, large, production)) > 1:
             raise ValueError("Choose only one restore trial mode")
-        time_limit, output_limit, entry_limit, disk_floor = trial_limits(scale, large)
+        if type(jobs) is not int or jobs not in (1, 2) or (jobs == 1 and not production):
+            raise ValueError("Use two build jobs, or one in production")
+        time_limit, output_limit, entry_limit, disk_floor = trial_limits(scale, large, production)
         if type(max_output_entries) is not int or not 1 <= max_output_entries <= entry_limit:
             raise ValueError(f"The output entry guard must be between 1 and {entry_limit}")
-        if (scale or large) and (phase != "restore" or seconds > time_limit
+        if expanded and (phase != "restore" or seconds > time_limit
                                  or not 1 <= max_output_bytes <= output_limit
                                  or min_free_bytes < disk_floor):
             raise ValueError("Expanded trials require restore and bounded time, output bytes, and free disk")
-        if phase == "restore" and previous_result is None and not (scale or large):
+        if phase == "restore" and previous_result is None and not expanded:
             raise ValueError("Restore requires the saved seed trial result")
         if metrics_path.exists() or metrics_path.is_symlink():
             raise ValueError("Metrics path must be new for this trial")
@@ -422,8 +477,8 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
         result["output_before"] = snapshot
         close_before = log_snapshot(info_path)
         journal_before = regular_file_identity(output / ".siso_fs_state.journal")
-        free_before = shutil.disk_usage(source_root).free if large else None
-        if large:
+        free_before = shutil.disk_usage(source_root).free if measured else None
+        if measured:
             record_sample(result["measurements"], snapshot, free_before)
         if snapshot["archive_input_estimate_bytes"] >= max_output_bytes:
             result["reason"] = "preflight-output-limit"
@@ -433,12 +488,13 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             return result
         if free_before is None:
             free_before = shutil.disk_usage(source_root).free
-        if free_before < min_free_bytes:
+        if free_before < min_free_bytes or (production and
+                result["resources_before"]["free_inodes"] < PRODUCTION_MIN_FREE_INODES):
             result["reason"] = "preflight-disk-limit"
             return result
         log_path.parent.mkdir(parents=True, exist_ok=True)
         arguments = command if command is not None else [
-            "autoninja", "-C", str(BUILD_DIR), "-j", "2",
+            "autoninja", "-C", str(BUILD_DIR), "-j", str(jobs),
             "-metrics_json", str(metrics_path.absolute()), TARGET]
         result["metrics_path"] = str(metrics_path)
         result["command"] = arguments
@@ -467,13 +523,23 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                         sample.pop("paths")
                         free = shutil.disk_usage(source_root).free
                         result["last_sample"] = {**sample, "free_bytes": free}
-                        if large:
+                        if production:
+                            result["last_sample"]["free_inodes"] = os.statvfs(source_root).f_favail
+                        if measured:
                             record_sample(result["measurements"], sample, free)
-                            if console["truncated"] and now - last_console_progress >= LARGE_CONSOLE_PROGRESS_SECONDS:
-                                progress = (f"[APK trial: {now - started:.0f}s, {sample['entries']} entries, "
-                                            f"{sample['archive_input_estimate_bytes']} estimated output bytes, "
-                                            f"{free} free bytes]\n")
-                                sink.write(progress.encode("ascii"))
+                            if (production or console["truncated"]) and now - last_console_progress >= LARGE_CONSOLE_PROGRESS_SECONDS:
+                                status = (f"[APK trial: {now - started:.0f}s, {sample['entries']} entries, "
+                                          f"{sample['archive_input_estimate_bytes']} estimated output bytes, "
+                                          f"{free} free bytes]")
+                                if production:
+                                    resources = resource_status(source_root)
+                                    counts = {key: progress[key] for key in ("step_counter", "graph_total")
+                                              if key in progress}
+                                    if "link_started" in progress:
+                                        counts["link_action"] = progress["link_action"]
+                                        counts["link_elapsed_seconds"] = round(now - progress["link_started"])
+                                    status += " " + json.dumps({**counts, **resources}, sort_keys=True)
+                                sink.write((status + "\n").encode("ascii"))
                                 sink.flush()
                                 last_console_progress = now
                         last_sample = now
@@ -481,7 +547,8 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                             reason = "output-limit"
                         elif sample["entries"] >= max_output_entries:
                             reason = "output-entry-limit"
-                        elif free < min_free_bytes:
+                        elif free < min_free_bytes or (production and
+                                result["last_sample"]["free_inodes"] < PRODUCTION_MIN_FREE_INODES):
                             reason = "disk-limit"
                     if reason:
                         result["reason"] = reason
@@ -504,7 +571,9 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                     else:
                         log.write(chunk)
                         log.flush()
-                        if large:
+                        if production:
+                            update_siso_status(progress, chunk)
+                        if measured:
                             remaining = LARGE_CONSOLE_PREFIX_BYTES - console["prefix_bytes"]
                             shown = chunk[:remaining]
                             if shown:
@@ -515,7 +584,8 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                                 sink.write(b"\n[APK trial console capped; full output continues in the runner log.]\n")
                                 sink.flush()
                                 console["truncated"] = True
-                                last_console_progress = time.monotonic()
+                                if not production:
+                                    last_console_progress = time.monotonic()
                         else:
                             sink.write(chunk)
                             sink.flush()
@@ -528,11 +598,19 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             if interrupted_at is None:
                 result["reason"] = "completed" if process.returncode == 0 else "compile-error"
         result["close"] = close_evidence(info_path, close_before, output, journal_before)
+        if production:
+            result["resources_after"] = resource_status(source_root)
+            start_oom = result["resources_before"].get("memory.events", {}).get("oom_kill", 0)
+            end_oom = result["resources_after"].get("memory.events", {}).get("oom_kill", 0)
+            if end_oom > start_oom:
+                result["oom_kill_count"] = end_oom - start_oom
+                result["stop_reason"] = result["reason"]
+                result["reason"] = "oom-kill"
         if not result["forced_kill"]:
             metrics, failed = read_step_metrics(metrics_path, source_root)
             result["failed_step_count"] = len(failed)
             result["failed_steps"] = failed[:20]
-            if failed:
+            if failed and result["reason"] != "oom-kill":
                 result["stop_reason"] = result["reason"]
                 result["reason"] = "compile-error"
             result["completed_outputs"] = completed_outputs(metrics_path, output / ".ninja_log", source_root, metrics)
@@ -542,12 +620,15 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             result["apk"] = apk_metadata(output / "apks/ChromePublic.apk")
         no_failure = not result["forced_kill"] and not result["close"]["errors"] and not result["failed_steps"]
         complete = result["reason"] == "completed" and result["returncode"] == 0 and result["apk"] is not None
+        usable_outputs = result["completed_outputs"] if production else result["new_completed_outputs"]
         interrupted = (result["reason"] in {"time-limit", "output-limit", "output-entry-limit", "disk-limit"}
-                       and bool(result["new_completed_outputs"])
+                       and bool(usable_outputs)
                        and (result["close"]["saved"] or result["close"]["journal_ready"]))
         # This only permits the next VM's validation. No state is "verified"
         # until the caller proves reuse and continuation after restoration.
-        result["ready_for_restore_test"] = bool(no_failure and (complete or interrupted))
+        result["ready_for_restore_test"] = bool(no_failure and (interrupted or (complete and not production)))
+        if production:
+            result["artifact_ready"] = bool(no_failure and complete)
     except (OSError, ValueError, subprocess.SubprocessError, BadZipFile) as error:
         result["controller_error"] = str(error)
         result["ready_for_restore_test"] = False
@@ -566,7 +647,7 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             process.stdout.close()
         for name, old in old_handlers.items():
             signal.signal(name, old)
-        if large:
+        if measured:
             if console["truncated"]:
                 # Exclude the already displayed prefix even if the full log
                 # ends less than one tail-length beyond it.
@@ -584,6 +665,11 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             result["console"] = console
             result["completed_output_count"] = len(result["completed_outputs"])
             result["new_completed_output_count"] = len(result["new_completed_outputs"])
+            if production:
+                result["rebuilt_completed_output_count"] = (
+                    result["completed_output_count"] - result["new_completed_output_count"])
+                if "resources_after" not in result:
+                    result["resources_after"] = resource_status(source_root)
             for name in ("completed_outputs", "new_completed_outputs"):
                 result[name] = bounded_output_evidence(result[name], LARGE_EVIDENCE_ARRAY_BYTES)
             result["evidence_truncated"] = (
@@ -603,6 +689,8 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--scale", action="store_true", help="Use the bounded scale restore limits")
     mode.add_argument("--large", action="store_true", help="Use the larger restore trial limits")
+    mode.add_argument("--production", action="store_true", help="Use the APK production restore limits")
+    parser.add_argument("--jobs", type=int, choices=(1, 2), default=2)
     parser.add_argument("--seconds", type=int)
     parser.add_argument("--max-output-bytes", type=int)
     parser.add_argument("--max-output-entries", type=int)
@@ -610,12 +698,15 @@ def main():
     args = parser.parse_args()
     if Path.cwd() != SOURCE_ROOT:
         parser.error("Run only from the fixed /work/chromium/src directory")
-    expanded = args.scale or args.large
+    expanded = args.scale or args.large or args.production
     if expanded and args.phase != "restore":
-        parser.error("--scale and --large require --phase restore")
-    time_limit, output_limit, entry_limit, disk_floor = trial_limits(args.scale, args.large)
+        parser.error("--scale, --large, and --production require --phase restore")
+    if args.jobs == 1 and not args.production:
+        parser.error("--jobs 1 requires --production")
+    time_limit, output_limit, entry_limit, disk_floor = trial_limits(args.scale, args.large, args.production)
     seconds = args.seconds if args.seconds is not None else (time_limit if expanded else 180)
-    max_output_bytes = args.max_output_bytes if args.max_output_bytes is not None else output_limit
+    default_output = PRODUCTION_DEFAULT_OUTPUT_LIMIT if args.production else output_limit
+    max_output_bytes = args.max_output_bytes if args.max_output_bytes is not None else default_output
     max_output_entries = args.max_output_entries if args.max_output_entries is not None else entry_limit
     min_free_bytes = args.min_free_bytes if args.min_free_bytes is not None else disk_floor
     if not 1 <= seconds <= time_limit:
@@ -626,11 +717,14 @@ def main():
         parser.error(f"--max-output-entries must be between 1 and {entry_limit}")
     result = run_trial(SOURCE_ROOT, args.phase, args.result, args.log, seconds,
                        max_output_bytes, min_free_bytes, args.previous_result,
-                       max_output_entries=max_output_entries, scale=args.scale, large=args.large)
+                       max_output_entries=max_output_entries, scale=args.scale, large=args.large,
+                       production=args.production, jobs=args.jobs)
     summary = {key: result[key] for key in ("phase", "reason", "returncode",
                                            "forced_kill", "ready_for_restore_test", "max_output_entries")}
-    for key in ("scale_limits", "large_limits", "output_before", "last_sample", "measurements",
-                "completed_output_count", "new_completed_output_count", "evidence_truncated", "console"):
+    for key in ("scale_limits", "large_limits", "production_limits", "output_before", "last_sample",
+                "measurements", "completed_output_count", "new_completed_output_count",
+                "rebuilt_completed_output_count", "evidence_truncated", "console", "artifact_ready",
+                "resources_before", "resources_after", "oom_kill_count"):
         if key in result:
             summary[key] = result[key]
     print(json.dumps(summary))

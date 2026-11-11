@@ -39,6 +39,10 @@ SCALE_UNPACKED_BYTES = 3 * 1024 ** 3
 SCALE_ARCHIVE_MEMBERS = 150_000
 LARGE_UNPACKED_BYTES = 7 * 1024 ** 3
 LARGE_ARCHIVE_MEMBERS = 320_000
+PRODUCTION_ARCHIVE_BYTES = 13 * 1024 ** 3 // 4
+PRODUCTION_UNPACKED_BYTES = 9 * 1024 ** 3
+PRODUCTION_ARCHIVE_MEMBERS = 420_000
+ANDROID_PACKAGING_SUFFIXES = {".apk", ".ap_", ".aab", ".apks"}
 CI_FILES = ("checkpoint.py", "build_trial.py", "bare-arm64-probe.yml",
             "bare-checkpoint-transfer.yml")
 TOOL_FILES = (
@@ -81,6 +85,16 @@ LARGER_PREDECESSOR = {
         "build_trial.py": "24220044336f7770234b6af7d957b5e8ce08a8deb9b6b87445c335686067fd04",
         "bare-arm64-probe.yml": "c632f5ee7e99a6ebf078b593d32c875dcf0b118e93a0433213314bb27a85df5d",
         "bare-checkpoint-transfer.yml": "8ef66d0965fa6880b60dce6c8eeeab36df3035867768ffae5665607f73c57fc5",
+    },
+}
+PRODUCTION_PREDECESSOR = {
+    "ci_revision": "ee7b3e891fa6bd76d9c0c2d3c02a9bb3622d92b0",
+    "identity_sha256": "c4c736ec4c7f02a1c409f4fbe5919731bc5022d70edf512e17928eb81f2436f9",
+    "ci_files": {
+        "checkpoint.py": "e254bcba732b30eac5c15cd4b84f70200fa92734aa6f1735d86bba9fa0f9adae",
+        "build_trial.py": "9bc23c9a629cadc5972bcf1d14ed1a305713d3b12b3a0999284c8e177f19afc2",
+        "bare-arm64-probe.yml": "dba4db3ae78f6c3f26ce7039a35cbe543567d7eeae487e9345be59084519d6ef",
+        "bare-checkpoint-transfer.yml": "e0475ec8318c2872a88e08552b803f998cd2bf9e222ba96bb96b389da6eb1197",
     },
 }
 
@@ -482,8 +496,10 @@ def record_provenance(path, ci_revision, base_image, **roots):
 
 def verify_provenance(path, ci_revision, base_image,
                       repair_legacy_input_paths=False, allow_scale_predecessor=False,
-                      allow_larger_predecessor=False, **roots):
-    if sum((repair_legacy_input_paths, allow_scale_predecessor, allow_larger_predecessor)) > 1:
+                      allow_larger_predecessor=False, allow_production_predecessor=False,
+                      **roots):
+    if sum((repair_legacy_input_paths, allow_scale_predecessor, allow_larger_predecessor,
+            allow_production_predecessor)) > 1:
         raise ValueError("Select only one checkpoint CI migration")
     record = json.loads(path.read_text(encoding="utf-8"))
     if (not isinstance(record, dict) or record.get("format") != PROVENANCE_FORMAT
@@ -501,6 +517,9 @@ def verify_provenance(path, ci_revision, base_image,
     elif allow_larger_predecessor:
         expected = LARGER_PREDECESSOR
         mismatch = "The larger probe permits only the exact recorded scale predecessor"
+    elif allow_production_predecessor:
+        expected = PRODUCTION_PREDECESSOR
+        mismatch = "The APK build permits migration only from the exact verified larger predecessor"
     if expected is not None:
         if (record["identity_sha256"] != expected["identity_sha256"]
                 or record["identity"].get("ci_revision") != expected["ci_revision"]
@@ -602,7 +621,7 @@ def verify_evidence(record_path, source_root=ROOTS["src"]):
     return {"verified": len(records)}
 
 
-def successful_continuation_edges(trial):
+def successful_continuation_edges(trial, *, production=False):
     if (not isinstance(trial, dict) or trial.get("format") != "bare-apk-trial"
             or trial.get("version") != 1 or trial.get("phase") != "restore"
             or trial.get("target") != "chrome_public_apk" or trial.get("build_dir") != "out/Bare"
@@ -610,8 +629,16 @@ def successful_continuation_edges(trial):
             or trial.get("container_quiescence_verified") is not True
             or not isinstance(trial.get("new_completed_outputs"), list)):
         raise ValueError("Expected a verified, quiescent APK continuation trial")
+    values = trial["new_completed_outputs"]
+    if production:
+        if (trial.get("reason") not in {"time-limit", "output-limit", "output-entry-limit", "disk-limit"}
+                or not isinstance(trial.get("completed_outputs"), list)
+                or not isinstance(trial.get("production_limits"), dict)
+                or trial.get("artifact_ready") is not False):
+            raise ValueError("Expected an interrupted production build")
+        values = trial["completed_outputs"]
     edges = {}
-    for edge in trial["new_completed_outputs"]:
+    for edge in values:
         if (not isinstance(edge, dict) or edge.get("success") is not True
                 or edge.get("success_source") != "siso_metrics+ninja_log-v5"
                 or not isinstance(edge.get("step_id"), str) or not edge["step_id"]):
@@ -624,31 +651,74 @@ def successful_continuation_edges(trial):
     return edges
 
 
-def continuation_trial_limit(scale, large):
-    if scale and large:
+def continuation_trial_limit(scale, large, production=False):
+    if sum((scale, large, production)) > 1:
         raise ValueError("Select only one continuation size profile")
-    if large:
+    if large or production:
         return LARGE_CONTINUATION_TRIAL_LIMIT
     return SCALE_CONTINUATION_TRIAL_LIMIT if scale else CONTINUATION_TRIAL_LIMIT
 
 
+def is_android_packaging(path):
+    return path.parts[:3] == ("out", "Bare", "apks") or path.suffix.lower() in ANDROID_PACKAGING_SUFFIXES
+
+
+def reuse_markers(record):
+    if (not isinstance(record, dict) or record.get("format") != CONTINUATION_FORMAT
+            or record.get("version") not in (1, 2)):
+        raise ValueError("Invalid continuation record for reuse markers")
+    items = record.get("outputs" if record["version"] == 1 else "reuse_markers")
+    if not isinstance(items, list) or len(items) != 3:
+        raise ValueError("Expected three persistent reuse markers")
+    markers = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("Invalid persistent reuse marker")
+        path = safe_relative(item.get("path"))
+        name = path.as_posix()
+        if (path.parts[:2] != ("out", "Bare") or path.suffix != ".o"
+                or any(character.isspace() for character in name) or name in markers
+                or type(item.get("size")) is not int or not 0 < item["size"] <= 2 * 1024 ** 3
+                or not isinstance(item.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])):
+            raise ValueError("Invalid persistent reuse marker")
+        markers[name] = {key: item[key] for key in ("path", "size", "sha256")}
+    return markers
+
+
+def verify_reuse_markers(markers, source_root=ROOTS["src"]):
+    observed = []
+    for path, expected in sorted(markers.items()):
+        metadata = object_metadata(source_root / path, source_root)
+        if any(metadata[key] != expected[key] for key in ("size", "sha256")):
+            raise ValueError("Persistent reuse marker differs: " + path)
+        observed.append(metadata)
+    return observed
+
+
 def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *,
-                        scale=False, large=False):
-    trial_limit = continuation_trial_limit(scale, large)
+                        scale=False, large=False, production=False):
+    trial_limit = continuation_trial_limit(scale, large, production)
     with trial_path.open("rb") as stream:
         payload = stream.read(trial_limit + 1)
     if len(payload) > trial_limit:
         raise ValueError("Continuation trial JSON exceeds its size limit")
-    edges = successful_continuation_edges(json.loads(payload))
+    trial = json.loads(payload)
+    edges = successful_continuation_edges(trial, production=production)
+    new_paths = {"out/Bare/" + item["path"] for item in trial["new_completed_outputs"]}
+
     def output_priority(name):
         is_object = name.endswith(".o")
-        target_object = large and is_object and name.startswith("out/Bare/obj/")
-        return (not target_object, not is_object, name)
+        target_object = (large or production) and is_object and name.startswith("out/Bare/obj/")
+        return (production and name not in new_paths, not target_object, not is_object, name)
 
     outputs = []
     for name in sorted(edges, key=output_priority):
+        relative = PurePosixPath(name)
+        if production and is_android_packaging(relative):
+            continue
         try:
-            path = path_without_symlink_parents(source_root, PurePosixPath(name))
+            path = path_without_symlink_parents(source_root, relative)
             info = path.lstat()
         except FileNotFoundError:
             continue
@@ -656,7 +726,8 @@ def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *,
         # represent multiply linked filesystem files as hardlink members.
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not info.st_size:
             continue
-        if large and info.st_size > 2 * 1024 ** 3:
+        if ((production and info.st_size > PRODUCTION_UNPACKED_BYTES)
+                or (large and info.st_size > 2 * 1024 ** 3)):
             continue
         metadata = object_metadata(path, source_root)
         outputs.append({"path": name, "step_id": edges[name], "size": metadata["size"],
@@ -665,9 +736,13 @@ def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *,
             break
     if not outputs:
         raise ValueError("The continuation produced no verifiable new regular output")
-    write_json(record_path, {"format": CONTINUATION_FORMAT, "version": 1,
-                             "trial_sha256": hashlib.sha256(payload).hexdigest(),
-                             "outputs": outputs})
+    record = {"format": CONTINUATION_FORMAT, "version": 2 if production else 1,
+              "trial_sha256": hashlib.sha256(payload).hexdigest(), "outputs": outputs}
+    if production:
+        markers = reuse_markers(json.loads(record_path.read_text(encoding="utf-8")))
+        verify_reuse_markers(markers, source_root)
+        record["reuse_markers"] = list(markers.values())
+    write_json(record_path, record)
     return {"recorded": len(outputs), "paths": [item["path"] for item in outputs]}
 
 
@@ -691,11 +766,12 @@ def continuation_archive_records(archive_path, trial_limit=CONTINUATION_TRIAL_LI
     return records
 
 
-def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=False, large=False):
+def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=False, large=False,
+                        production=False):
     if (not re.fullmatch(r"[0-9a-f]{64}", expected_identity)
             or not re.fullmatch(r"[0-9a-f]{40}", ci_revision)):
         raise ValueError("Expected the exact successor identity and CI revision")
-    trial_limit = continuation_trial_limit(scale, large)
+    trial_limit = continuation_trial_limit(scale, large, production)
     records = continuation_archive_records(archive_path, trial_limit)
     provenance = json.loads(records[PROVENANCE_RECORD])
     if (not isinstance(provenance, dict) or provenance.get("format") != PROVENANCE_FORMAT
@@ -707,26 +783,35 @@ def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=F
         raise ValueError("The archived successor provenance does not match")
     trial_payload = records[CONTINUATION_TRIAL]
     trial = json.loads(trial_payload)
-    edges = successful_continuation_edges(trial)
+    edges = successful_continuation_edges(trial, production=production)
     record = json.loads(records[CONTINUATION_RECORD])
     if (not isinstance(record, dict) or record.get("format") != CONTINUATION_FORMAT
-            or record.get("version") != 1
+            or record.get("version") != (2 if production else 1)
             or record.get("trial_sha256") != hashlib.sha256(trial_payload).hexdigest()
             or not isinstance(record.get("outputs"), list) or not 1 <= len(record["outputs"]) <= 3):
         raise ValueError("Invalid continuation evidence or trial binding")
     expected = {}
+    max_output_bytes = PRODUCTION_UNPACKED_BYTES if production else 2 * 1024 ** 3
     for item in record["outputs"]:
         if not isinstance(item, dict):
             raise ValueError("Invalid continuation output evidence")
-        name = safe_relative(item.get("path")).as_posix()
+        path = safe_relative(item.get("path"))
+        name = path.as_posix()
         if (name in expected or name not in edges or item.get("step_id") != edges[name]
-                or type(item.get("size")) is not int or not 0 < item["size"] <= 2 * 1024 ** 3
+                or (production and is_android_packaging(path))
+                or type(item.get("size")) is not int or not 0 < item["size"] <= max_output_bytes
                 or not isinstance(item.get("sha256"), str)
                 or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])):
             raise ValueError("Invalid continuation output evidence")
         expected[name] = item
 
     sample_paths = sorted(expected)
+    if production:
+        markers = reuse_markers(record)
+        for name, item in markers.items():
+            if name in expected and any(expected[name][key] != item[key] for key in ("size", "sha256")):
+                raise ValueError("Progress output differs from its persistent reuse marker")
+        expected.update(markers)
     apk = None
     if large and trial.get("reason") == "completed":
         apk = trial.get("apk")
@@ -747,6 +832,8 @@ def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=F
     with tarfile.open(archive_path, mode="r|gz") as archive:
         for member in archive:
             name = member.name
+            if production and is_android_packaging(archive_relative(name)):
+                raise ValueError("Public checkpoint contains Android packaging output: " + name)
             if name not in expected:
                 continue
             item = expected[name]
@@ -762,6 +849,8 @@ def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=F
     if verified != expected.keys():
         raise ValueError("Missing archived continuation output: " + ", ".join(sorted(expected.keys() - verified)))
     result = {"verified": len(sample_paths), "paths": sample_paths}
+    if production:
+        result["reuse_markers"] = sorted(markers)
     if apk is not None:
         result["apk"] = {name: apk[name] for name in ("path", "size", "sha256", "arm64_member")}
     return result
@@ -838,7 +927,8 @@ def archive_relative(name):
 
 
 def validate_archive(archive_path, max_archive_bytes=1024 ** 3,
-                     max_unpacked_bytes=2 * 1024 ** 3, max_members=100_000):
+                     max_unpacked_bytes=2 * 1024 ** 3, max_members=100_000,
+                     exclude_android_packaging=False):
     if archive_path.stat().st_size > max_archive_bytes:
         raise ValueError("Checkpoint archive exceeds the bounded transfer limit")
     members = {}
@@ -849,6 +939,8 @@ def validate_archive(archive_path, max_archive_bytes=1024 ** 3,
         for member in archive:
             relative = archive_relative(member.name)
             name = relative.as_posix()
+            if exclude_android_packaging and is_android_packaging(relative):
+                raise ValueError("Public checkpoint contains Android packaging output: " + name)
             if name in members:
                 raise ValueError("Checkpoint archive contains a duplicate member")
             if not (member.isdir() or member.isfile() or member.issym() or member.islnk()):
@@ -870,7 +962,9 @@ def validate_archive(archive_path, max_archive_bytes=1024 ** 3,
                     symlinks[name] = member.linkname
                 else:
                     hardlinks[name] = posixpath.normpath(target)
-                archive_relative(posixpath.normpath(target))
+                target_path = archive_relative(posixpath.normpath(target))
+                if exclude_android_packaging and is_android_packaging(target_path):
+                    raise ValueError("Public checkpoint contains a link to Android packaging output: " + name)
     if "out/Bare" not in members:
         raise ValueError("Checkpoint archive root is missing")
     for name in members:
@@ -900,6 +994,8 @@ def validate_archive(archive_path, max_archive_bytes=1024 ** 3,
                     raise ValueError("Checkpoint archive contains a symlink loop")
                 resolved.pop()
                 pending = symlinks[current].split("/") + pending
+        if exclude_android_packaging and is_android_packaging(PurePosixPath(*resolved)):
+            raise ValueError("Public checkpoint contains a symlink to Android packaging output: " + name)
     for target in hardlinks.values():
         followed = set()
         while target in hardlinks:
@@ -932,6 +1028,7 @@ def main():
         profile = command.add_mutually_exclusive_group()
         profile.add_argument("--scale", action="store_true")
         profile.add_argument("--large", action="store_true")
+        profile.add_argument("--production", action="store_true")
     for name in ("record-provenance", "verify-provenance"):
         command = commands.add_parser(name)
         command.add_argument("record", type=Path)
@@ -942,6 +1039,7 @@ def main():
             migration.add_argument("--repair-legacy-input-paths", action="store_true")
             migration.add_argument("--allow-scale-predecessor", action="store_true")
             migration.add_argument("--allow-larger-predecessor", action="store_true")
+            migration.add_argument("--allow-production-predecessor", action="store_true")
     command = commands.add_parser("collect-evidence")
     command.add_argument("trial", type=Path)
     command.add_argument("record", type=Path)
@@ -957,7 +1055,8 @@ def main():
         profile = command.add_mutually_exclusive_group()
         profile.add_argument("--scale", action="store_true")
         profile.add_argument("--large", action="store_true")
-    for name in ("verify-evidence", "evidence-targets"):
+        profile.add_argument("--production", action="store_true")
+    for name in ("verify-evidence", "evidence-targets", "reuse-markers", "verify-reuse-markers"):
         command = commands.add_parser(name)
         command.add_argument("record", type=Path)
     command = commands.add_parser("canonicalize-logs")
@@ -983,28 +1082,45 @@ def main():
             limits = {"max_archive_bytes": SCALE_ARCHIVE_BYTES,
                       "max_unpacked_bytes": LARGE_UNPACKED_BYTES if args.large else SCALE_UNPACKED_BYTES,
                       "max_members": LARGE_ARCHIVE_MEMBERS if args.large else SCALE_ARCHIVE_MEMBERS}
+        if args.production:
+            if limits:
+                raise ValueError("The production archive limits are fixed")
+            limits = {"max_archive_bytes": PRODUCTION_ARCHIVE_BYTES,
+                      "max_unpacked_bytes": PRODUCTION_UNPACKED_BYTES,
+                      "max_members": PRODUCTION_ARCHIVE_MEMBERS}
+            if args.command == "validate-archive":
+                limits["exclude_android_packaging"] = True
         operation = validate_archive if args.command == "validate-archive" else inspect_input_paths
         result = operation(args.archive, **limits)
     elif args.command in {"record-provenance", "verify-provenance"}:
         operation = record_provenance if args.command == "record-provenance" else verify_provenance
         options = ({"repair_legacy_input_paths": args.repair_legacy_input_paths,
                     "allow_scale_predecessor": args.allow_scale_predecessor,
-                    "allow_larger_predecessor": args.allow_larger_predecessor}
+                    "allow_larger_predecessor": args.allow_larger_predecessor,
+                    "allow_production_predecessor": args.allow_production_predecessor}
                    if args.command == "verify-provenance" else {})
         result = operation(args.record, args.ci_revision, args.base_image, **options)
     elif args.command == "collect-evidence":
         result = collect_evidence(args.trial, args.record)
     elif args.command == "record-continuation":
-        result = record_continuation(args.trial, args.record, scale=args.scale, large=args.large)
+        result = record_continuation(args.trial, args.record, scale=args.scale, large=args.large,
+                                     production=args.production)
     elif args.command == "verify-continuation":
         result = verify_continuation(args.archive, args.expected_identity, args.ci_revision,
-                                     scale=args.scale, large=args.large)
+                                     scale=args.scale, large=args.large, production=args.production)
     elif args.command == "verify-evidence":
         result = verify_evidence(args.record)
     elif args.command == "evidence-targets":
         for item in list(evidence_records(args.record)):
             print(item["target"])
         return 0
+    elif args.command in {"reuse-markers", "verify-reuse-markers"}:
+        markers = reuse_markers(json.loads(args.record.read_text(encoding="utf-8")))
+        if args.command == "reuse-markers":
+            for path in sorted(markers):
+                print(PurePosixPath(path).relative_to("out/Bare"))
+            return 0
+        result = verify_reuse_markers(markers)
     elif args.command == "canonicalize-logs":
         result = canonicalize_logs(scale=args.scale)
     else:
