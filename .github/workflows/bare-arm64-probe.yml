@@ -472,7 +472,7 @@ jobs:
         [[ $(git -C src rev-parse HEAD) == "$CHROMIUM_REV" ]]
         df -B1 /work
         CONTAINER
-    - name: Install build tools, apply Bare patches, and generate ARM64 build rules
+    - name: Install build tools and apply the pinned Bare patches
       timeout-minutes: 35
       env:
         PROBE_MODE: ${{ inputs.probe }}
@@ -506,8 +506,10 @@ jobs:
         mkdir -p chrome/browser/resources/bare out/Bare
         cp /exchange/ublock_origin.crx chrome/browser/resources/bare/ublock_origin.crx
         cp /exchange/args.gn out/Bare/args.gn
-        echo 'Generating ARM64 build rules'
-        gn gen out/Bare
+        if [[ $PROBE_MODE != checkpoint-production ]]; then
+          echo 'Generating ARM64 build rules'
+          gn gen out/Bare
+        fi
         df -B1 /work
         CONTAINER
     - name: Verify restored inputs and completed targets
@@ -564,6 +566,14 @@ jobs:
             raise SystemExit('Producer input identity differs.')
         PYTHON
         python3 /exchange/checkpoint.py restore-inputs out/Bare/checkpoint-inputs.jsonl.gz
+        if [[ $PROBE_MODE == checkpoint-production ]]; then
+          # The public archive omits apks/, including GN's own text descriptors.
+          # Generate them before Siso takes its snapshot of the restored inputs.
+          echo 'Regenerating the ARM64 manifest and its local packaging descriptors'
+          gn gen out/Bare
+          cmp -- /exchange/args.gn out/Bare/args.gn
+          python3 /exchange/checkpoint.py check-gn-packaging out/Bare
+        fi
         object=out/Bare/obj/base/third_party/cityhash/cityhash/city.o
         python3 /exchange/checkpoint.py verify-object "$object" out/Bare/checkpoint-object.json
         python3 /exchange/checkpoint.py verify-evidence out/Bare/checkpoint-evidence.json
@@ -698,6 +708,9 @@ jobs:
           timeout --kill-after="$kill_after" "$trial_timeout" bash -seu <<'CONTAINER'
         set -o pipefail
         cd /work/chromium/src
+        if [[ $TRIAL_PHASE == restore ]]; then
+          test -f /exchange/checkpoint/reuse-verified
+        fi
         if [[ $TRIAL_PHASE == seed ]]; then
           autoninja -C out/Bare -j 2 -v base/third_party/cityhash:cityhash
           object=out/Bare/obj/base/third_party/cityhash/cityhash/city.o
@@ -1094,6 +1107,7 @@ jobs:
         du -sx -B1 out/Bare
         exclusions=()
         if [[ $PROBE_MODE == checkpoint-production ]]; then
+          python3 /exchange/checkpoint.py check-gn-packaging out/Bare
           df -B1 /work /exchange /tmp
           df -Pi /work /exchange /tmp
           for path in /work /exchange /tmp; do
