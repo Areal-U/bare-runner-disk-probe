@@ -171,9 +171,12 @@ jobs:
       run: |
         [[ $CACHE_HIT == true && $MATCHED_KEY == "$EXPECTED_KEY" ]]
         archive="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
+        incoming="${archive%.tar.gz}-input.tar.gz"
+        [[ -f $archive && ! -L $archive && ! -e $incoming && ! -L $incoming ]]
         printf '%s  %s\n' "$EXPECTED_SHA" "$archive" | sha256sum --check --strict
         python3 "$RUNNER_TEMP/bare-ci/checkpoint.py" validate-archive "$archive"
         python3 "$RUNNER_TEMP/bare-ci/checkpoint.py" inspect-input-paths "$archive"
+        mv -T -- "$archive" "$incoming"
     - name: Reclaim runner space and start the pinned Bare container
       timeout-minutes: 25
       run: |
@@ -264,6 +267,44 @@ jobs:
       id: prepare
       env:
         REQUESTED_BASE: ${{ inputs.expected_base_image }}
+    - name: Test runner and builder archive handoff before fetching Chromium
+      if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
+      timeout-minutes: 3
+      run: |
+        cd "$RUNNER_TEMP/bare-official"
+        root=exchange/checkpoint
+        [[ ! -e $root/checkpoint.tar.gz && ! -L $root/checkpoint.tar.gz ]]
+        fixture=$(mktemp -d "$root/permission-test.XXXXXX")
+        trap 'rm -rf --one-file-system -- "$fixture"' EXIT
+        chmod 0777 "$fixture"
+        mkdir -p "$fixture/source/out/Bare"
+        printf 'permission test\n' > "$fixture/source/out/Bare/probe"
+        tar -czf "$fixture/input.tar.gz" -C "$fixture/source" out/Bare
+        chmod 0644 "$fixture/input.tar.gz"
+        digest=$(sha256sum "$fixture/input.tar.gz")
+        docker compose exec -T -e "FIXTURE=/exchange/checkpoint/${fixture##*/}" \
+          -e "RUNNER_UID=$(id -u)" -e "PROBE_MODE=$PROBE_MODE" chromium-builder bash -seu <<'CONTAINER'
+        set -o pipefail
+        [[ $(id -u) != "$RUNNER_UID" ]]
+        [[ -r $FIXTURE/input.tar.gz && ! -w $FIXTURE/input.tar.gz ]]
+        if [[ $PROBE_MODE == checkpoint-restore ]]; then
+          [[ -f /exchange/checkpoint/checkpoint-input.tar.gz && -r /exchange/checkpoint/checkpoint-input.tar.gz ]]
+        fi
+        tar -tzf "$FIXTURE/input.tar.gz" > /dev/null
+        candidate=$(mktemp "$FIXTURE/checkpoint-next.XXXXXX")
+        tar --format=posix --pax-option=delete=atime,delete=ctime \
+          -I 'gzip -1' -cf "$candidate" -C "$FIXTURE/source" out/Bare
+        python3 /exchange/checkpoint.py validate-archive "$candidate"
+        umask 077
+        printf '{"readable":true}\n' > "$FIXTURE/export.json"
+        chmod 0644 "$candidate" "$FIXTURE/export.json"
+        mv -T -- "$candidate" "$FIXTURE/checkpoint-next.tar.gz"
+        CONTAINER
+        [[ $(sha256sum "$fixture/input.tar.gz") == "$digest" ]]
+        python3 -c 'import json,sys; assert json.load(open(sys.argv[1])) == {"readable": True}' "$fixture/export.json"
+        mv -T -- "$fixture/checkpoint-next.tar.gz" "$fixture/checkpoint.tar.gz"
+        python3 "$RUNNER_TEMP/bare-ci/checkpoint.py" validate-archive "$fixture/checkpoint.tar.gz"
+        echo 'Distinct runner and builder users successfully handed off a verified archive.'
     - name: Fetch only the pinned Chromium revision and Android dependencies
       timeout-minutes: 45
       run: |
@@ -342,9 +383,9 @@ jobs:
           timeout --kill-after=2m 20m bash -seu <<'CONTAINER'
         set -o pipefail
         cd /work/chromium/src
-        python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint.tar.gz
+        python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint-input.tar.gz
         rm -rf --one-file-system -- out/Bare
-        tar -xzf /exchange/checkpoint/checkpoint.tar.gz
+        tar -xzf /exchange/checkpoint/checkpoint-input.tar.gz
         repair=()
         [[ $REPAIR_LEGACY_INPUT_PATHS != true ]] || repair+=(--repair-legacy-input-paths)
         python3 /exchange/checkpoint.py verify-provenance out/Bare/checkpoint-provenance.json \
@@ -475,6 +516,10 @@ jobs:
           if ! python3 /exchange/checkpoint.py verify-evidence out/Bare/checkpoint-evidence.json; then
             proof=false
           fi
+          if ! python3 /exchange/checkpoint.py record-continuation \
+            out/Bare/checkpoint-trial-restore.json out/Bare/checkpoint-continuation.json; then
+            proof=false
+          fi
         fi
         printf '{"evidence_valid":%s}\n' "$proof" > /exchange/checkpoint/proof.json
         if [[ -f /exchange/checkpoint/producer-provenance.json ]]; then
@@ -486,20 +531,28 @@ jobs:
           --ci-revision "$CI_REVISION" --base-image "$BASE_IMAGE"
         python3 /exchange/checkpoint.py record-inputs out/Bare/checkpoint-inputs.jsonl.gz
         du -sx -B1 out/Bare
+        candidate=$(mktemp /exchange/checkpoint/checkpoint-next.XXXXXX)
+        trap 'rm -f -- "$candidate"' EXIT
         tar --format=posix --pax-option=delete=atime,delete=ctime \
-          -I 'gzip -1' -cf /exchange/checkpoint/checkpoint.tar.gz out/Bare
-        python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint.tar.gz
+          -I 'gzip -1' -cf "$candidate" out/Bare
+        python3 /exchange/checkpoint.py validate-archive "$candidate"
         cp out/Bare/checkpoint-provenance.json /exchange/checkpoint/provenance.json
         # Only these non-secret exports cross from builder UID 1000 to the runner.
         chmod 0644 /exchange/checkpoint/provenance.json \
           "/exchange/checkpoint/trial-$TRIAL_PHASE.json" \
-          /exchange/checkpoint/proof.json /exchange/checkpoint/checkpoint.tar.gz
+          /exchange/checkpoint/proof.json "$candidate"
+        [[ ! -e /exchange/checkpoint/checkpoint-next.tar.gz && ! -L /exchange/checkpoint/checkpoint-next.tar.gz ]]
+        mv -T -- "$candidate" /exchange/checkpoint/checkpoint-next.tar.gz
         CONTAINER
+        candidate=exchange/checkpoint/checkpoint-next.tar.gz
         archive=exchange/checkpoint/checkpoint.tar.gz
-        size=$(stat -c %s "$archive")
-        (( size <= 1073741824 ))
-        sha=$(sha256sum "$archive" | cut -d ' ' -f 1)
+        [[ -f $candidate && ! -L $candidate && ! -e $archive && ! -L $archive ]]
+        size=$(stat -c %s "$candidate")
+        (( size > 0 && size <= 1073741824 ))
+        sha=$(sha256sum "$candidate" | cut -d ' ' -f 1)
         identity=$(python3 -c 'import json; print(json.load(open("exchange/checkpoint/provenance.json"))["identity_sha256"])')
+        [[ $sha =~ ^[0-9a-f]{64}$ && $identity =~ ^[0-9a-f]{64}$ ]]
+        mv -T -- "$candidate" "$archive"
         echo "sha=$sha" >> "$GITHUB_OUTPUT"
         echo "identity=$identity" >> "$GITHUB_OUTPUT"
         echo "bytes=$size" >> "$GITHUB_OUTPUT"
