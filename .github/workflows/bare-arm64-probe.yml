@@ -45,7 +45,7 @@ jobs:
     if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' && github.ref == 'refs/heads/main'
       }}
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ inputs.probe == 'checkpoint-scale' && 190 || 120 }}
+    timeout-minutes: ${{ inputs.probe == 'checkpoint-large' && 250 || inputs.probe == 'checkpoint-scale' && 190 || 120 }}
     concurrency:
       group: bare-arm64-compile-probe
       cancel-in-progress: false
@@ -93,6 +93,13 @@ jobs:
             [[ $EXPECTED_IDENTITY == 87c8946d20f1f0f97d494c21291b1bb1865772084f0e1a09577414007c3ae170 ]]
             [[ $EXPECTED_BASE == ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 ]]
             ;;
+          checkpoint-large)
+            [[ $GITHUB_REPOSITORY == Areal-U/bare-runner-disk-probe ]]
+            [[ $EXPECTED_KEY == bare-transfer-v2-42963667278-1-checkpoint-scale ]]
+            [[ $EXPECTED_SHA == 62a4793fcbe6e25509d202ac6f180b2ab85c6f52b06f3acaedb4f0aaaf159b72 ]]
+            [[ $EXPECTED_IDENTITY == 5a1826fb351f149a8a4132fb21d80acba90d937131ce211c8c0b13d79970a966 ]]
+            [[ $EXPECTED_BASE == ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 ]]
+            ;;
           *) echo 'Only smoke and the bounded two-job checkpoint probe are enabled. The old logs-only APK mode is disabled.' >&2; exit 1 ;;
         esac
         if [[ $REPAIR_LEGACY_INPUT_PATHS == true ]]; then
@@ -104,7 +111,7 @@ jobs:
         else
           [[ $REPAIR_LEGACY_INPUT_PATHS == false ]]
         fi
-        if [[ $PROBE_MODE != checkpoint-restore && $PROBE_MODE != checkpoint-scale ]]; then
+        if [[ $PROBE_MODE != checkpoint-restore && $PROBE_MODE != checkpoint-scale && $PROBE_MODE != checkpoint-large ]]; then
           [[ -z $EXPECTED_KEY && -z $EXPECTED_SHA && -z $EXPECTED_IDENTITY && -z $EXPECTED_BASE ]]
         fi
         if [[ $PROBE_MODE == checkpoint-* ]]; then
@@ -152,14 +159,17 @@ jobs:
         checkpoints = [item for item in caches if item['key'].startswith('bare-transfer-v2-')]
         gib = 1024**3
         limit_bytes = 10 * gib
-        if os.environ['PROBE_MODE'] == 'checkpoint-scale':
+        mode = os.environ['PROBE_MODE']
+        if mode in {'checkpoint-scale', 'checkpoint-large'}:
             expected = {
                 (10328651052, 'bare-transfer-v2-42928862523-1-checkpoint-seed', 'refs/heads/main', 293033682),
                 (10334906371, 'bare-transfer-v2-42950651335-1-checkpoint-restore', 'refs/heads/main', 353327569),
             }
+            if mode == 'checkpoint-large':
+                expected.add((10338246659, 'bare-transfer-v2-42963667278-1-checkpoint-scale', 'refs/heads/main', 570920535))
             observed = {(item['id'], item['key'], item['ref'], item['size_in_bytes']) for item in checkpoints}
             if len(checkpoints) != len(expected) or observed != expected:
-                raise SystemExit('The one-continuation scale trial requires both exact retained generations.')
+                raise SystemExit('The one-continuation trial requires its exact retained generations.')
             candidate_bytes = int(os.environ.get('CANDIDATE_BYTES', '2952790016'))
             if not 0 < candidate_bytes <= 2952790016:
                 raise SystemExit('Scale candidate size is outside the measured trial envelope.')
@@ -177,15 +187,15 @@ jobs:
         python3 "$RUNNER_TEMP/bare-ci/check-cache-budget.py"
     - name: Restore the producer key exactly, including on a consumer-only rerun
       id: restore-checkpoint
-      if: ${{ inputs.probe == 'checkpoint-restore' || inputs.probe == 'checkpoint-scale' }}
+      if: ${{ inputs.probe == 'checkpoint-restore' || inputs.probe == 'checkpoint-scale' || inputs.probe == 'checkpoint-large' }}
       uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
       with:
         path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
         key: ${{ inputs.expected_checkpoint_key }}
         fail-on-cache-miss: true
     - name: Validate the received archive before checkout
-      if: ${{ inputs.probe == 'checkpoint-restore' || inputs.probe == 'checkpoint-scale' }}
-      timeout-minutes: ${{ inputs.probe == 'checkpoint-scale' && 7 || 4 }}
+      if: ${{ inputs.probe == 'checkpoint-restore' || inputs.probe == 'checkpoint-scale' || inputs.probe == 'checkpoint-large' }}
+      timeout-minutes: ${{ inputs.probe == 'checkpoint-large' && 10 || inputs.probe == 'checkpoint-scale' && 7 || 4 }}
       env:
         CACHE_HIT: ${{ steps.restore-checkpoint.outputs.cache-hit }}
         MATCHED_KEY: ${{ steps.restore-checkpoint.outputs.cache-matched-key }}
@@ -197,12 +207,17 @@ jobs:
         incoming="${archive%.tar.gz}-input.tar.gz"
         [[ -f $archive && ! -L $archive && ! -e $incoming && ! -L $incoming ]]
         printf '%s  %s\n' "$EXPECTED_SHA" "$archive" | sha256sum --check --strict
-        python3 "$RUNNER_TEMP/bare-ci/checkpoint.py" validate-archive "$archive"
+        incoming_limits=()
+        [[ $PROBE_MODE != checkpoint-large ]] || incoming_limits+=(--scale)
+        python3 "$RUNNER_TEMP/bare-ci/checkpoint.py" validate-archive "$archive" "${incoming_limits[@]}"
         if [[ $PROBE_MODE == checkpoint-scale ]]; then
           python3 "$RUNNER_TEMP/bare-ci/checkpoint.py" verify-continuation "$archive" \
             --expected-identity 87c8946d20f1f0f97d494c21291b1bb1865772084f0e1a09577414007c3ae170 --ci-revision 40b60fcac3b34d96a3e450848d2374d3b921bf5f
+        elif [[ $PROBE_MODE == checkpoint-large ]]; then
+          python3 "$RUNNER_TEMP/bare-ci/checkpoint.py" verify-continuation "$archive" --scale \
+            --expected-identity 5a1826fb351f149a8a4132fb21d80acba90d937131ce211c8c0b13d79970a966 --ci-revision 5d3f7993c975630d4abf3efe2925aee79e51dc39
         fi
-        python3 "$RUNNER_TEMP/bare-ci/checkpoint.py" inspect-input-paths "$archive"
+        python3 "$RUNNER_TEMP/bare-ci/checkpoint.py" inspect-input-paths "$archive" "${incoming_limits[@]}"
         mv -T -- "$archive" "$incoming"
     - name: Reclaim runner space and start the pinned Bare container
       timeout-minutes: 25
@@ -314,7 +329,7 @@ jobs:
         set -o pipefail
         [[ $(id -u) != "$RUNNER_UID" ]]
         [[ -r $FIXTURE/input.tar.gz && ! -w $FIXTURE/input.tar.gz ]]
-        if [[ $PROBE_MODE == checkpoint-restore || $PROBE_MODE == checkpoint-scale ]]; then
+        if [[ $PROBE_MODE == checkpoint-restore || $PROBE_MODE == checkpoint-scale || $PROBE_MODE == checkpoint-large ]]; then
           [[ -f /exchange/checkpoint/checkpoint-input.tar.gz && -r /exchange/checkpoint/checkpoint-input.tar.gz ]]
         fi
         tar -tzf "$FIXTURE/input.tar.gz" > /dev/null
@@ -398,7 +413,7 @@ jobs:
         df -B1 /work
         CONTAINER
     - name: Verify restored inputs and completed targets
-      if: ${{ inputs.probe == 'checkpoint-restore' || inputs.probe == 'checkpoint-scale' }}
+      if: ${{ inputs.probe == 'checkpoint-restore' || inputs.probe == 'checkpoint-scale' || inputs.probe == 'checkpoint-large' }}
       timeout-minutes: 23
       env:
         EXPECTED_IDENTITY: ${{ inputs.expected_checkpoint_identity }}
@@ -411,11 +426,14 @@ jobs:
           timeout --kill-after=2m 20m bash -seu <<'CONTAINER'
         set -o pipefail
         cd /work/chromium/src
-        python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint-input.tar.gz
+        incoming_limits=()
+        [[ $PROBE_MODE != checkpoint-large ]] || incoming_limits+=(--scale)
+        python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint-input.tar.gz "${incoming_limits[@]}"
         rm -rf --one-file-system -- out/Bare
         tar -xzf /exchange/checkpoint/checkpoint-input.tar.gz
         repair=()
         [[ $PROBE_MODE != checkpoint-scale ]] || repair+=(--allow-scale-predecessor)
+        [[ $PROBE_MODE != checkpoint-large ]] || repair+=(--allow-larger-predecessor)
         [[ $REPAIR_LEGACY_INPUT_PATHS != true ]] || repair+=(--repair-legacy-input-paths)
         python3 /exchange/checkpoint.py verify-provenance out/Bare/checkpoint-provenance.json \
           --ci-revision "$CI_REVISION" --base-image "$BASE_IMAGE" "${repair[@]}" \
@@ -440,7 +458,7 @@ jobs:
         grep -F 'ninja: no work to do.' /exchange/checkpoint/apk-objects-noop.log
         python3 /exchange/checkpoint.py verify-object "$object" out/Bare/checkpoint-object.json
         python3 /exchange/checkpoint.py verify-evidence out/Bare/checkpoint-evidence.json
-        if [[ $PROBE_MODE == checkpoint-scale ]]; then
+        if [[ $PROBE_MODE == checkpoint-scale || $PROBE_MODE == checkpoint-large ]]; then
           for pass in before after; do
             python3 - "$pass" <<'PYTHON'
         import json, sys
@@ -499,12 +517,14 @@ jobs:
     - name: Run the real APK target within its time and output budgets
       id: trial
       if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
-      timeout-minutes: ${{ inputs.probe == 'checkpoint-scale' && 65 || 12 }}
+      timeout-minutes: ${{ inputs.probe == 'checkpoint-large' && 95 || inputs.probe == 'checkpoint-scale' && 65 || 12 }}
       run: |
         cd "$RUNNER_TEMP/bare-official"
         # The clock starts before preparation and restore, not at compiler startup.
         elapsed=$(( $(date +%s) - $(cat "$RUNNER_TEMP/bare-probe-start") ))
-        if (( elapsed > 55 * 60 )); then
+        latest_start=55
+        [[ $PROBE_MODE != checkpoint-large ]] || latest_start=60
+        if (( elapsed > latest_start * 60 )); then
           echo 'Not enough time reserved for stop, hashing, packing, upload and diagnostics.' >&2
           exit 1
         fi
@@ -514,6 +534,9 @@ jobs:
         kill_after=2m
         if [[ $PROBE_MODE == checkpoint-scale ]]; then
           trial_timeout=63m
+          kill_after=1m
+        elif [[ $PROBE_MODE == checkpoint-large ]]; then
+          trial_timeout=93m
           kill_after=1m
         fi
         echo "phase=$phase" >> "$GITHUB_OUTPUT"
@@ -531,6 +554,8 @@ jobs:
         args=(--seconds 180 --max-output-bytes 1879048192 --min-free-bytes 10000000000)
         if [[ $PROBE_MODE == checkpoint-scale ]]; then
           args=(--scale --seconds 3600 --max-output-bytes 2684354560 --max-output-entries 140000 --min-free-bytes 21474836480)
+        elif [[ $PROBE_MODE == checkpoint-large ]]; then
+          args=(--large --seconds 5400 --max-output-bytes 6442450944 --max-output-entries 300000 --min-free-bytes 21474836480)
         elif [[ $TRIAL_PHASE == restore ]]; then
           args+=(--previous-result out/Bare/checkpoint-trial-seed.json)
         fi
@@ -550,7 +575,7 @@ jobs:
         [[ -n $volume ]]
         mapfile -t users < <(docker ps --filter "volume=$volume" --format '{{.Names}}')
         [[ ${#users[@]} == 1 && ${users[0]} == "$container" ]]
-        if [[ $PROBE_MODE == checkpoint-scale ]]; then
+        if [[ $PROBE_MODE == checkpoint-scale || $PROBE_MODE == checkpoint-large ]]; then
           timeout --kill-after=2s 10s docker compose exec -T chromium-builder bash -c '
             df -B1 /work /exchange
             df -Pi /work /exchange
@@ -572,7 +597,7 @@ jobs:
     - name: Pack the complete output, including any finished APK
       id: pack-checkpoint
       if: ${{ always() && steps.quiesce.outputs.quiescent == 'true' }}
-      timeout-minutes: ${{ inputs.probe == 'checkpoint-scale' && 35 || 28 }}
+      timeout-minutes: ${{ inputs.probe == 'checkpoint-large' && 45 || inputs.probe == 'checkpoint-scale' && 35 || 28 }}
       env:
         TRIAL_PHASE: ${{ steps.trial.outputs.phase }}
         CHECKPOINT_KEY: ${{ steps.identity.outputs.key }}
@@ -582,6 +607,7 @@ jobs:
         [[ $phase == seed || $phase == restore ]]
         pack_timeout=25m
         [[ $PROBE_MODE != checkpoint-scale ]] || pack_timeout=32m
+        [[ $PROBE_MODE != checkpoint-large ]] || pack_timeout=42m
         docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CI_REVISION=$GITHUB_SHA" -e "BASE_IMAGE=$BARE_BASE_IMAGE" \
           -e "TRIAL_PHASE=$phase" -e "PROBE_MODE=$PROBE_MODE" chromium-builder \
           timeout --kill-after=2m "$pack_timeout" bash -seu <<'CONTAINER'
@@ -606,13 +632,18 @@ jobs:
         phase = os.environ['TRIAL_PHASE']
         path = Path('/exchange/checkpoint/trial-' + phase + '.json')
         report = json.loads(path.read_text())
+        if os.environ['PROBE_MODE'] == 'checkpoint-large' and report.get('reason', '').startswith('preflight-'):
+            raise SystemExit('The larger trial stopped before compilation; retain the original checkpoints.')
         report['container_quiescence_verified'] = True
         report['quiescence_check_source'] = 'Host stopped the dedicated container, observed Running=false, then restarted only idle bash.'
         path.write_text(json.dumps(report, sort_keys=True) + '\n')
         PYTHON
         cp "/exchange/checkpoint/trial-$TRIAL_PHASE.json" "out/Bare/checkpoint-trial-$TRIAL_PHASE.json"
         limits=()
-        [[ $PROBE_MODE != checkpoint-scale ]] || limits+=(--scale)
+        case "$PROBE_MODE" in
+          checkpoint-scale) limits+=(--scale) ;;
+          checkpoint-large) limits+=(--large) ;;
+        esac
         proof=true
         if ! python3 /exchange/checkpoint.py verify-object \
           out/Bare/obj/base/third_party/cityhash/cityhash/city.o out/Bare/checkpoint-object.json; then
@@ -626,7 +657,7 @@ jobs:
           if ! python3 /exchange/checkpoint.py verify-evidence out/Bare/checkpoint-evidence.json; then
             proof=false
           fi
-          if [[ $PROBE_MODE == checkpoint-scale ]]; then
+          if [[ $PROBE_MODE == checkpoint-scale || $PROBE_MODE == checkpoint-large ]]; then
             rm -f -- out/Bare/checkpoint-continuation.json
           fi
           if ! python3 /exchange/checkpoint.py record-continuation \
@@ -639,15 +670,24 @@ jobs:
           cp /exchange/checkpoint/producer-provenance.json out/Bare/checkpoint-producer-provenance.json
           cp /exchange/checkpoint/provenance-check.json out/Bare/checkpoint-source-verification.json
         fi
-        python3 /exchange/checkpoint.py canonicalize-logs "${limits[@]}"
+        log_limits=()
+        [[ ${#limits[@]} == 0 ]] || log_limits+=(--scale)
+        python3 /exchange/checkpoint.py canonicalize-logs "${log_limits[@]}"
         python3 /exchange/checkpoint.py record-provenance out/Bare/checkpoint-provenance.json \
           --ci-revision "$CI_REVISION" --base-image "$BASE_IMAGE"
         time python3 /exchange/checkpoint.py record-inputs out/Bare/checkpoint-inputs.jsonl.gz
         du -sx -B1 out/Bare
         candidate=$(mktemp /exchange/checkpoint/checkpoint-next.XXXXXX)
         trap 'rm -f -- "$candidate"' EXIT
-        time tar --format=posix --pax-option=delete=atime,delete=ctime \
-          -I 'gzip -1' -cf "$candidate" out/Bare
+        for level in 1 6; do
+          time tar --format=posix --pax-option=delete=atime,delete=ctime \
+            -I "gzip -$level" -cf "$candidate" out/Bare
+          bytes=$(stat -c %s "$candidate")
+          printf 'Candidate archive at gzip -%s: %s bytes\n' "$level" "$bytes"
+          if [[ $PROBE_MODE != checkpoint-large ]] || (( bytes <= 2952790016 - 1048576 )); then
+            break
+          fi
+        done
         time python3 /exchange/checkpoint.py validate-archive "$candidate" "${limits[@]}"
         df -B1 /work /exchange
         cp out/Bare/checkpoint-provenance.json /exchange/checkpoint/provenance.json
@@ -663,7 +703,9 @@ jobs:
         [[ -f $candidate && ! -L $candidate && ! -e $archive && ! -L $archive ]]
         size=$(stat -c %s "$candidate")
         limit=1073741824
-        [[ $PROBE_MODE != checkpoint-scale ]] || limit=2952790016
+        if [[ $PROBE_MODE == checkpoint-scale || $PROBE_MODE == checkpoint-large ]]; then
+          limit=2952790016
+        fi
         (( size > 0 && size <= limit ))
         sha=$(sha256sum "$candidate" | cut -d ' ' -f 1)
         identity=$(python3 -c 'import json; print(json.load(open("exchange/checkpoint/provenance.json"))["identity_sha256"])')
@@ -685,8 +727,11 @@ jobs:
         names = ('phase', 'reason', 'returncode', 'forced_kill', 'ready_for_restore_test',
                  'container_quiescence_verified', 'failed_step_count', 'elapsed_seconds')
         summary = {name: data.get(name) for name in names}
-        summary['completed_outputs'] = len(data.get('completed_outputs', []))
-        summary['new_completed_outputs'] = len(data.get('new_completed_outputs', []))
+        summary['completed_outputs'] = data.get('completed_output_count', len(data.get('completed_outputs', [])))
+        summary['new_completed_outputs'] = data.get('new_completed_output_count', len(data.get('new_completed_outputs', [])))
+        for label in ('measurements', 'apk'):
+            if data.get(label) is not None:
+                summary[label] = data[label]
         summary['close'] = {name: data.get('close', {}).get(name) for name in ('saved', 'journal_ready')}
         for label in ('output_before', 'last_sample'):
             summary[label] = {name: data.get(label, {}).get(name) for name in
@@ -703,8 +748,9 @@ jobs:
           fi
         } | tee -a "$GITHUB_STEP_SUMMARY" || echo '::warning::Summary display failed; continue to checkpoint saving.'
     - name: Recheck storage and predecessor keys before the scale upload
-      if: ${{ !cancelled() && inputs.probe == 'checkpoint-scale' && steps.pack-checkpoint.outcome == 'success' }}
-      timeout-minutes: 5
+      if: ${{ !cancelled() && (inputs.probe == 'checkpoint-scale' || inputs.probe == 'checkpoint-large') && steps.pack-checkpoint.outcome
+        == 'success' }}
+      timeout-minutes: ${{ inputs.probe == 'checkpoint-large' && 8 || 5 }}
       run: |
         archive="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
         [[ -f $archive && ! -L $archive && $CANDIDATE_BYTES =~ ^[0-9]+$ ]]
@@ -723,9 +769,9 @@ jobs:
         CANDIDATE_BYTES: ${{ steps.pack-checkpoint.outputs.bytes }}
     - name: Save a new bounded generation without replacing the producer
       id: save-checkpoint
-      if: ${{ !cancelled() && steps.pack-checkpoint.outcome == 'success' && (inputs.probe != 'checkpoint-scale' || steps.scale-save-budget.outcome
-        == 'success') }}
-      timeout-minutes: 10
+      if: ${{ !cancelled() && steps.pack-checkpoint.outcome == 'success' && (!(inputs.probe == 'checkpoint-scale' || inputs.probe ==
+        'checkpoint-large') || steps.scale-save-budget.outcome == 'success') }}
+      timeout-minutes: ${{ inputs.probe == 'checkpoint-large' && 15 || 10 }}
       uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
       with:
         path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
@@ -733,7 +779,7 @@ jobs:
     - name: Confirm the exact saved key exists before reporting success
       id: saved-receipt
       if: ${{ always() && steps.save-checkpoint.outcome == 'success' }}
-      timeout-minutes: 3
+      timeout-minutes: ${{ inputs.probe == 'checkpoint-large' && 4 || 3 }}
       env:
         CHECKPOINT_KEY: ${{ steps.identity.outputs.key }}
       run: |
@@ -749,7 +795,7 @@ jobs:
                     data = json.load(response)
                 exact = [item for item in data['actions_caches'] if item['key'] == key and item['ref'] == 'refs/heads/main' and item['size_in_bytes'] > 0]
                 if len(exact) == 1:
-                    if os.environ.get('PROBE_MODE') == 'checkpoint-scale' and exact[0]['size_in_bytes'] > 2952790016:
+                    if os.environ.get('PROBE_MODE') in {'checkpoint-scale', 'checkpoint-large'} and exact[0]['size_in_bytes'] > 2952790016:
                         raise SystemExit('The stored scale payload exceeds the approved capacity.')
                     print(json.dumps({'saved_key': key, 'cache_id': exact[0]['id'], 'cache_bytes': exact[0]['size_in_bytes']}))
                     break
