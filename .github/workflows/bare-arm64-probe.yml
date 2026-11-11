@@ -379,7 +379,7 @@ jobs:
         python3 /exchange/build_trial.py --phase "$TRIAL_PHASE" \
           --result "/exchange/checkpoint/trial-$TRIAL_PHASE.json" \
           --log "/exchange/checkpoint/trial-$TRIAL_PHASE.log" \
-          --seconds 180 --max-output-bytes 734003200 --min-free-bytes 10000000000 "${args[@]}"
+          --seconds 180 --max-output-bytes 1879048192 --min-free-bytes 10000000000 "${args[@]}"
         CONTAINER
     - name: Stop every build writer before making the archive
       id: quiesce
@@ -461,6 +461,10 @@ jobs:
           -I 'gzip -1' -cf /exchange/checkpoint/checkpoint.tar.gz out/Bare
         python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint.tar.gz
         cp out/Bare/checkpoint-provenance.json /exchange/checkpoint/provenance.json
+        # Only these non-secret exports cross from builder UID 1000 to the runner.
+        chmod 0644 /exchange/checkpoint/provenance.json \
+          "/exchange/checkpoint/trial-$TRIAL_PHASE.json" \
+          /exchange/checkpoint/proof.json /exchange/checkpoint/checkpoint.tar.gz
         CONTAINER
         archive=exchange/checkpoint/checkpoint.tar.gz
         size=$(stat -c %s "$archive")
