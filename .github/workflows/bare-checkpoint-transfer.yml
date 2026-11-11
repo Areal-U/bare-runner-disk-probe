@@ -29,8 +29,8 @@ name: Bare checkpoint transfer probe
       output_gib:
         description: Output estimate limit for this segment
         type: choice
-        default: '8'
-        options: ['8', '9']
+        default: '11'
+        options: ['8', '9', '10', '11', '12']
       jobs:
         description: Concurrent build actions
         type: choice
@@ -166,9 +166,9 @@ jobs:
     uses: ./.github/workflows/bare-arm64-probe.yml
     with:
       probe: checkpoint-production
-      expected_checkpoint_key: ${{ inputs.checkpoint_key || 'bare-transfer-v2-42973841138-1-checkpoint-large' }}
-      expected_checkpoint_sha: ${{ inputs.checkpoint_sha || 'df07eee0870a0d5edc92de47a0a112d56ebb498d3c2bd0cf7229269a048e895b' }}
-      expected_checkpoint_identity: ${{ inputs.checkpoint_identity || 'c4c736ec4c7f02a1c409f4fbe5919731bc5022d70edf512e17928eb81f2436f9' }}
+      expected_checkpoint_key: ${{ inputs.checkpoint_key || 'bare-transfer-v2-42997174308-1-checkpoint-production' }}
+      expected_checkpoint_sha: ${{ inputs.checkpoint_sha || '86d7b940ddde7d343e2924c38f2f52624e1c336f6d7dbef2c0f95961de1b1781' }}
+      expected_checkpoint_identity: ${{ inputs.checkpoint_identity || '3301cb0743cded0e318d57adf22af8956fc3d8e58630c447d68cd912019b4bcc' }}
       expected_base_image: ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
       apk_recipient: ${{ inputs.apk_recipient }}
       apk_output_gib: ${{ fromJSON(inputs.output_gib) }}

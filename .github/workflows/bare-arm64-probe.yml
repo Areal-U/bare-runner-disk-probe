@@ -25,7 +25,7 @@ name: Bare ARM64 compile and checkpoint probe
         default: ''
       apk_output_gib:
         type: number
-        default: 8
+        default: 11
       apk_jobs:
         type: number
         default: 2
@@ -85,6 +85,8 @@ jobs:
       REPAIR_LEGACY_INPUT_PATHS: ${{ inputs.repair_legacy_input_paths && 'true' || 'false' }}
       LEGACY_PRODUCTION_KEY: bare-transfer-v2-42973841138-1-checkpoint-large
       LEGACY_PRODUCTION_REV: ee7b3e891fa6bd76d9c0c2d3c02a9bb3622d92b0
+      EXPANDED_PRODUCTION_KEY: bare-transfer-v2-42997174308-1-checkpoint-production
+      EXPANDED_PRODUCTION_REV: 9ebb823d437f7e4928b54411d3e515849ff8d519
       PRODUCTION_CAP_BYTES: '3489660928'
       EXPECTED_KEY: ${{ inputs.expected_checkpoint_key }}
     defaults:
@@ -132,11 +134,14 @@ jobs:
             [[ $GITHUB_REPOSITORY == Areal-U/bare-runner-disk-probe ]]
             [[ $EXPECTED_BASE == ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 ]]
             [[ $APK_RECIPIENT =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$ ]]
-            [[ $APK_OUTPUT_GIB == 8 || $APK_OUTPUT_GIB == 9 ]]
+            [[ $APK_OUTPUT_GIB =~ ^(8|9|10|11|12)$ ]]
             [[ $APK_JOBS == 1 || $APK_JOBS == 2 ]]
             if [[ $EXPECTED_KEY == "$LEGACY_PRODUCTION_KEY" ]]; then
               [[ $EXPECTED_SHA == df07eee0870a0d5edc92de47a0a112d56ebb498d3c2bd0cf7229269a048e895b ]]
               [[ $EXPECTED_IDENTITY == c4c736ec4c7f02a1c409f4fbe5919731bc5022d70edf512e17928eb81f2436f9 ]]
+            elif [[ $EXPECTED_KEY == "$EXPANDED_PRODUCTION_KEY" ]]; then
+              [[ $EXPECTED_SHA == 86d7b940ddde7d343e2924c38f2f52624e1c336f6d7dbef2c0f95961de1b1781 ]]
+              [[ $EXPECTED_IDENTITY == 3301cb0743cded0e318d57adf22af8956fc3d8e58630c447d68cd912019b4bcc ]]
             else
               [[ $EXPECTED_KEY =~ ^bare-transfer-v2-[0-9]+-[0-9]+-checkpoint-production$ ]]
               [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_IDENTITY =~ ^[0-9a-f]{64}$ ]]
@@ -226,6 +231,9 @@ jobs:
             if parent_key == os.environ['LEGACY_PRODUCTION_KEY']:
                 if (parents[0]['id'], parents[0]['size_in_bytes']) != (10344233799, 1231546287):
                     raise SystemExit('The initial checkpoint receipt differs.')
+            if parent_key == os.environ['EXPANDED_PRODUCTION_KEY']:
+                if (parents[0]['id'], parents[0]['size_in_bytes']) != (10356203698, 2008166401):
+                    raise SystemExit('The expanded production predecessor receipt differs.')
             candidate_bytes = int(os.environ.get('CANDIDATE_BYTES', str(cap)))
             if not 0 < candidate_bytes <= cap:
                 raise SystemExit('Candidate size is outside the production envelope.')
@@ -287,6 +295,9 @@ jobs:
             producer_revision=$LEGACY_PRODUCTION_REV
           else
             incoming_limits+=(--production)
+            if [[ $EXPECTED_KEY == "$EXPANDED_PRODUCTION_KEY" ]]; then
+              producer_revision=$EXPANDED_PRODUCTION_REV
+            fi
           fi
         fi
         python3 "$RUNNER_TEMP/bare-ci/checkpoint.py" validate-archive "$archive" "${incoming_limits[@]}"
@@ -509,6 +520,7 @@ jobs:
         docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CI_REVISION=$GITHUB_SHA" -e "BASE_IMAGE=$BARE_BASE_IMAGE" \
           -e "EXPECTED_IDENTITY=$EXPECTED_IDENTITY" -e "REPAIR_LEGACY_INPUT_PATHS=$REPAIR_LEGACY_INPUT_PATHS" \
           -e "PROBE_MODE=$PROBE_MODE" -e "EXPECTED_KEY=$EXPECTED_KEY" -e "LEGACY_PRODUCTION_KEY=$LEGACY_PRODUCTION_KEY" \
+          -e "EXPANDED_PRODUCTION_KEY=$EXPANDED_PRODUCTION_KEY" \
           -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 chromium-builder \
           timeout --kill-after=2m "${{ inputs.probe == 'checkpoint-production' && '26m' || '20m' }}" bash -seu <<'CONTAINER'
         set -o pipefail
@@ -529,14 +541,15 @@ jobs:
           free=$(df -B1 --output=avail /work | awk 'NR == 2 { print $1 }')
           inodes=$(df -Pi /work | awk 'NR == 2 { print $4 }')
           [[ $free =~ ^[0-9]+$ && $inodes =~ ^[0-9]+$ ]]
-          (( free >= 30 * 1024**3 && inodes >= 430000 ))
+          (( free >= 36 * 1024**3 && inodes >= 570000 ))
         fi
         rm -rf --one-file-system -- out/Bare
         tar -xzf /exchange/checkpoint/checkpoint-input.tar.gz
         repair=()
         [[ $PROBE_MODE != checkpoint-scale ]] || repair+=(--allow-scale-predecessor)
         [[ $PROBE_MODE != checkpoint-large ]] || repair+=(--allow-larger-predecessor)
-        if [[ $PROBE_MODE == checkpoint-production && $EXPECTED_KEY == "$LEGACY_PRODUCTION_KEY" ]]; then
+        if [[ $PROBE_MODE == checkpoint-production &&
+            ( $EXPECTED_KEY == "$LEGACY_PRODUCTION_KEY" || $EXPECTED_KEY == "$EXPANDED_PRODUCTION_KEY" ) ]]; then
           repair+=(--allow-production-predecessor)
         fi
         [[ $REPAIR_LEGACY_INPUT_PATHS != true ]] || repair+=(--repair-legacy-input-paths)
@@ -697,7 +710,7 @@ jobs:
         elif [[ $PROBE_MODE == checkpoint-large ]]; then
           args=(--large --seconds 5400 --max-output-bytes 6442450944 --max-output-entries 300000 --min-free-bytes 21474836480)
         elif [[ $PROBE_MODE == checkpoint-production ]]; then
-          args=(--production --seconds "$COMPILE_SECONDS" --jobs "$APK_JOBS" --max-output-bytes "$((APK_OUTPUT_GIB * 1024**3))" --max-output-entries 400000 --min-free-bytes 21474836480)
+          args=(--production --seconds "$COMPILE_SECONDS" --jobs "$APK_JOBS" --max-output-bytes "$((APK_OUTPUT_GIB * 1024**3))" --max-output-entries 525000 --min-free-bytes 21474836480)
         elif [[ $TRIAL_PHASE == restore ]]; then
           args+=(--previous-result out/Bare/checkpoint-trial-seed.json)
         fi

@@ -40,8 +40,8 @@ SCALE_ARCHIVE_MEMBERS = 150_000
 LARGE_UNPACKED_BYTES = 7 * 1024 ** 3
 LARGE_ARCHIVE_MEMBERS = 320_000
 PRODUCTION_ARCHIVE_BYTES = 13 * 1024 ** 3 // 4
-PRODUCTION_UNPACKED_BYTES = 9 * 1024 ** 3
-PRODUCTION_ARCHIVE_MEMBERS = 420_000
+PRODUCTION_UNPACKED_BYTES = 13 * 1024 ** 3
+PRODUCTION_ARCHIVE_MEMBERS = 550_000
 ANDROID_PACKAGING_SUFFIXES = {".apk", ".ap_", ".aab", ".apks"}
 CI_FILES = ("checkpoint.py", "build_trial.py", "bare-arm64-probe.yml",
             "bare-checkpoint-transfer.yml")
@@ -96,6 +96,17 @@ PRODUCTION_PREDECESSOR = {
         "bare-arm64-probe.yml": "dba4db3ae78f6c3f26ce7039a35cbe543567d7eeae487e9345be59084519d6ef",
         "bare-checkpoint-transfer.yml": "e0475ec8318c2872a88e08552b803f998cd2bf9e222ba96bb96b389da6eb1197",
     },
+}
+
+EXPANDED_PRODUCTION_PREDECESSOR = {
+    "ci_revision": "9ebb823d437f7e4928b54411d3e515849ff8d519",
+    "identity_sha256": "3301cb0743cded0e318d57adf22af8956fc3d8e58630c447d68cd912019b4bcc",
+    "ci_files": {
+        "checkpoint.py": "6bcaf669810a68cc40cea5cc3de856b9d0d6d20848258083b37493f7a4a42e5d",
+        "build_trial.py": "b11c36036d83e367c75c0a378352f8215cb2f81e713ffef0e092f9e3c98ab492",
+        "bare-arm64-probe.yml": "ce7e77850105133bb1670475e63c4264586e769de4bfaff8869ab25d90ef1a40",
+        "bare-checkpoint-transfer.yml": "f706328d7872b4748d5b7dc058dd38fb4b7e2145f2b4a301cac4d2724375f671"
+    }
 }
 
 
@@ -519,7 +530,9 @@ def verify_provenance(path, ci_revision, base_image,
         mismatch = "The larger probe permits only the exact recorded scale predecessor"
     elif allow_production_predecessor:
         expected = PRODUCTION_PREDECESSOR
-        mismatch = "The APK build permits migration only from the exact verified larger predecessor"
+        if record["identity"].get("ci_revision") == EXPANDED_PRODUCTION_PREDECESSOR["ci_revision"]:
+            expected = EXPANDED_PRODUCTION_PREDECESSOR
+        mismatch = "The APK build permits migration only from an exact verified predecessor"
     if expected is not None:
         if (record["identity_sha256"] != expected["identity_sha256"]
                 or record["identity"].get("ci_revision") != expected["ci_revision"]
