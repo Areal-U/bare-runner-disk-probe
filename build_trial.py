@@ -33,6 +33,9 @@ SUCCESS_SOURCE = "siso_metrics+ninja_log-v5"
 # This is an uncompressed working-set guard, not the 1 GiB upload limit.
 # Leave 256 MiB below the separate 2 GiB archive extraction limit.
 OUTPUT_LIMIT = 1792 * 1024 * 1024
+# Keep room below the archive validator's 100,000-member limit for metadata
+# and outputs created between samples. The final archive check is still required.
+OUTPUT_ENTRY_LIMIT = 98_000
 SOURCE_ROOT = Path("/work/chromium/src")
 
 
@@ -306,7 +309,7 @@ def apk_metadata(path):
 def run_trial(source_root, phase, result_path, log_path, seconds=180,
               max_output_bytes=OUTPUT_LIMIT, min_free_bytes=10_000_000_000,
               previous_result=None, command=None, stop_grace_seconds=120,
-              sample_seconds=2, output_stream=None):
+              sample_seconds=2, output_stream=None, max_output_entries=OUTPUT_ENTRY_LIMIT):
     """Run a short trial. command injection is exposed to local tests, not CLI."""
     source_root = source_root.absolute()
     output = source_root / BUILD_DIR
@@ -317,7 +320,7 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
               "returncode": None, "forced_kill": False, "interrupt_sent": False,
               "ready_for_restore_test": False, "completed_outputs": [],
               "new_completed_outputs": [], "failed_steps": [], "apk": None,
-              "container_quiescence_verified": False}
+              "container_quiescence_verified": False, "max_output_entries": max_output_entries}
     process = None
     selector = selectors.DefaultSelector()
     old_handlers = {}
@@ -327,6 +330,8 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
     try:
         if phase not in {"seed", "restore"} or seconds <= 0:
             raise ValueError("Invalid trial phase or time budget")
+        if type(max_output_entries) is not int or not 1 <= max_output_entries <= OUTPUT_ENTRY_LIMIT:
+            raise ValueError("The output entry guard must be between 1 and 98000")
         if phase == "restore" and previous_result is None:
             raise ValueError("Restore requires the saved seed trial result")
         if metrics_path.exists() or metrics_path.is_symlink():
@@ -339,6 +344,9 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
         journal_before = regular_file_identity(output / ".siso_fs_state.journal")
         if snapshot["archive_input_estimate_bytes"] >= max_output_bytes:
             result["reason"] = "preflight-output-limit"
+            return result
+        if snapshot["entries"] >= max_output_entries:
+            result["reason"] = "preflight-output-entry-limit"
             return result
         if shutil.disk_usage(source_root).free < min_free_bytes:
             result["reason"] = "preflight-disk-limit"
@@ -377,6 +385,8 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                         last_sample = now
                         if sample["archive_input_estimate_bytes"] >= max_output_bytes:
                             reason = "output-limit"
+                        elif sample["entries"] >= max_output_entries:
+                            reason = "output-entry-limit"
                         elif free < min_free_bytes:
                             reason = "disk-limit"
                     if reason:
@@ -425,7 +435,7 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             result["apk"] = apk_metadata(output / "apks/ChromePublic.apk")
         no_failure = not result["forced_kill"] and not result["close"]["errors"] and not result["failed_steps"]
         complete = result["reason"] == "completed" and result["returncode"] == 0 and result["apk"] is not None
-        interrupted = (result["reason"] in {"time-limit", "output-limit", "disk-limit"}
+        interrupted = (result["reason"] in {"time-limit", "output-limit", "output-entry-limit", "disk-limit"}
                        and bool(result["new_completed_outputs"])
                        and (result["close"]["saved"] or result["close"]["journal_ready"]))
         # This only permits the next VM's validation. No state is "verified"
@@ -462,6 +472,7 @@ def main():
     parser.add_argument("--previous-result", type=Path)
     parser.add_argument("--seconds", type=int, default=180)
     parser.add_argument("--max-output-bytes", type=int, default=OUTPUT_LIMIT)
+    parser.add_argument("--max-output-entries", type=int, default=OUTPUT_ENTRY_LIMIT)
     parser.add_argument("--min-free-bytes", type=int, default=10_000_000_000)
     args = parser.parse_args()
     if Path.cwd() != SOURCE_ROOT:
@@ -470,10 +481,13 @@ def main():
         parser.error("This is a short probe: --seconds must be between 1 and 600")
     if not 1 <= args.max_output_bytes <= OUTPUT_LIMIT or args.min_free_bytes < 10_000_000_000:
         parser.error("The small-trial output and free-disk guards cannot be relaxed")
+    if not 1 <= args.max_output_entries <= OUTPUT_ENTRY_LIMIT:
+        parser.error("The small-trial entry guard must be between 1 and 98000")
     result = run_trial(SOURCE_ROOT, args.phase, args.result, args.log, args.seconds,
-                       args.max_output_bytes, args.min_free_bytes, args.previous_result)
+                       args.max_output_bytes, args.min_free_bytes, args.previous_result,
+                       max_output_entries=args.max_output_entries)
     summary = {key: result[key] for key in ("phase", "reason", "returncode",
-                                           "forced_kill", "ready_for_restore_test")}
+                                           "forced_kill", "ready_for_restore_test", "max_output_entries")}
     for key in ("output_before", "last_sample"):
         if key in result:
             summary[key] = result[key]

@@ -40,6 +40,16 @@ TOOL_FILES = (
 )
 SYSTEM_PACKAGES = ("libc6", "libc6-dev", "libstdc++6", "libgcc-s1",
                    "python3", "python3-minimal", "binutils")
+LEGACY_INPUT_PATH_REPAIR = {
+    "ci_revision": "e1c837e3456e9ee5d9957eebefb6309f44b90670",
+    "identity_sha256": "fc3b4584696b8239bfc3b04db9490e3c0b722b62b81c54c772b96f27543a8896",
+    "ci_files": {
+        "checkpoint.py": "294daf9bb7af482ee46b0775012b479cc2724f9ae18b179bfbcda75ba0df0cb7",
+        "build_trial.py": "fea6686cee8017b319b2874ee0eec8051b09ea9cf1c6a9ba06178f5403e32d34",
+        "bare-arm64-probe.yml": "c2e0026278400d5399e29390eafdbc7790c19a155a27a106dc569cc5e1fe128e",
+        "bare-checkpoint-transfer.yml": "d56a0ade1158469032f839b185c4dbb69fbd124fde10aa0980ba147e31056ec9",
+    },
+}
 
 
 def kind(info):
@@ -155,10 +165,26 @@ def safe_relative(value):
     return relative
 
 
+def input_relative(value):
+    """A canonical POSIX source name, never a shell target or archive member.
+
+    Linux input trees may contain literal backslashes and control characters.
+    They are ordinary filename characters here; only '/' separates components.
+    Keep the stricter safe_relative policy for command targets and archives.
+    """
+    diagnostic = repr(value)[:160]
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError("Invalid checkpoint input path: " + diagnostic)
+    relative = PurePosixPath(value)
+    if relative.is_absolute() or ".." in relative.parts or relative.as_posix() != value:
+        raise ValueError("Unsafe checkpoint input path: " + diagnostic)
+    return relative
+
+
 def validate_entry(entry, roots):
     if not isinstance(entry, dict) or entry.get("root") not in roots:
         raise ValueError("Unknown checkpoint input root")
-    relative = safe_relative(entry.get("path"))
+    relative = input_relative(entry.get("path"))
     if any(part in {".git", "__pycache__"} for part in relative.parts):
         raise ValueError("Excluded directory in checkpoint input")
     if relative.parts and ((entry["root"] == "src" and relative.parts[0] == "out")
@@ -197,6 +223,69 @@ def read_entries(manifest, roots):
             yield entry
 
 
+def inspect_input_paths(archive_path, max_records=2_000_000,
+                        max_line_bytes=64 * 1024, max_decompressed_bytes=1024 ** 3):
+    """Read bounded input-path diagnostics without extracting or changing files.
+
+    The workflow separately validates the complete archive first. This command
+    also bounds its own outer scan and the nested compressed JSONL manifest.
+    """
+    if min(max_records, max_line_bytes, max_decompressed_bytes) <= 0:
+        raise ValueError("Input inspection limits must be positive")
+    if archive_path.stat().st_size > 1024 ** 3:
+        raise ValueError("Checkpoint archive exceeds the bounded transfer limit")
+    expected_header = {"format": FORMAT, "version": VERSION,
+                       "roots": {name: str(path) for name, path in ROOTS.items()}}
+    expected_name = "out/Bare/checkpoint-inputs.jsonl.gz"
+    result = None
+    members = 0
+    unpacked_bytes = 0
+    with tarfile.open(archive_path, mode="r|gz") as archive:
+        for member in archive:
+            members += 1
+            unpacked_bytes += member.size
+            if members > 100_000 or member.size < 0 or unpacked_bytes > 2 * 1024 ** 3:
+                raise ValueError("Checkpoint archive exceeds the bounded extraction limit")
+            if archive_relative(member.name).as_posix() != expected_name:
+                continue
+            if result is not None or not member.isfile():
+                raise ValueError("Expected one regular checkpoint input manifest")
+            count = 0
+            unusual = 0
+            total = 0
+            examples = []
+            with archive.extractfile(member) as compressed, gzip.GzipFile(fileobj=compressed) as stream:
+                while True:
+                    line = stream.readline(max_line_bytes + 1)
+                    if not line:
+                        break
+                    total += len(line)
+                    if len(line) > max_line_bytes or total > max_decompressed_bytes:
+                        raise ValueError("Checkpoint input manifest exceeds the bounded inspection limit")
+                    entry = json.loads(line)
+                    if count == 0:
+                        if entry != expected_header:
+                            raise ValueError("Checkpoint format or input roots differ")
+                    else:
+                        if count > max_records:
+                            raise ValueError("Checkpoint input manifest has too many records")
+                        validate_entry(entry, ROOTS)
+                        try:
+                            safe_relative(entry["path"])
+                        except ValueError:
+                            unusual += 1
+                            if len(examples) < 10:
+                                examples.append({"root": entry["root"], "path": entry["path"]})
+                    count += 1
+            if count == 0:
+                raise ValueError("Checkpoint input manifest is empty")
+            result = {"records": count - 1, "manifest_uncompressed_bytes": total,
+                      "paths_rejected_by_strict_validator": unusual, "examples": examples}
+    if result is None:
+        raise ValueError("Checkpoint input manifest is missing")
+    return result
+
+
 def path_without_symlink_parents(root, relative):
     path = root
     for part in relative.parts[:-1]:
@@ -217,7 +306,7 @@ def restore_inputs(manifest, roots=ROOTS):
     directories = []
     blocked = set()
     for entry in read_entries(manifest, roots):
-        relative = safe_relative(entry["path"])
+        relative = input_relative(entry["path"])
         if entry["type"] == "directory":
             directories.append(entry)
             continue
@@ -238,7 +327,7 @@ def restore_inputs(manifest, roots=ROOTS):
             blocked.update((entry["root"], parent.as_posix()) for parent in relative.parents)
     # Set directory times last so restoring a child cannot change them again.
     for entry in sorted(directories, key=lambda item: len(PurePosixPath(item["path"]).parts), reverse=True):
-        relative = safe_relative(entry["path"])
+        relative = input_relative(entry["path"])
         try:
             if (entry["root"], relative.as_posix()) in blocked:
                 raise ValueError("A directory contains an unmatched checkpoint input")
@@ -355,14 +444,40 @@ def record_provenance(path, ci_revision, base_image, **roots):
     return {"identity_sha256": record["identity_sha256"], "version": CHECKPOINT_VERSION}
 
 
-def verify_provenance(path, ci_revision, base_image, **roots):
+def verify_provenance(path, ci_revision, base_image,
+                      repair_legacy_input_paths=False, **roots):
     record = json.loads(path.read_text(encoding="utf-8"))
     if (not isinstance(record, dict) or record.get("format") != PROVENANCE_FORMAT
             or record.get("version") != CHECKPOINT_VERSION
             or not isinstance(record.get("identity"), dict)
             or record.get("identity_sha256") != canonical_hash(record["identity"])):
         raise ValueError("The checkpoint identity record is invalid or incompatible")
+    if repair_legacy_input_paths:
+        expected = LEGACY_INPUT_PATH_REPAIR
+        if (record["identity_sha256"] != expected["identity_sha256"]
+                or record["identity"].get("ci_revision") != expected["ci_revision"]
+                or record["identity"].get("ci_files") != expected["ci_files"]):
+            raise ValueError("The input-path repair permits only the exact recorded legacy producer")
     current = provenance_identity(ci_revision, base_image, **roots)
+    if repair_legacy_input_paths:
+        # This one recorded seed predates the POSIX input-path repair. Retain
+        # every build-input comparison; only identify the changed CI machinery
+        # separately, rather than pretending its full identity is unchanged.
+        excluded = {"ci_revision", "ci_files"}
+        producer_inputs = {key: value for key, value in record["identity"].items()
+                           if key not in excluded}
+        current_inputs = {key: value for key, value in current.items()
+                          if key not in excluded}
+        if producer_inputs != current_inputs:
+            differences = sorted(name for name in set(current_inputs) | set(producer_inputs)
+                                 if current_inputs.get(name) != producer_inputs.get(name))
+            raise ValueError("Checkpoint build inputs differ: " + ", ".join(differences))
+        return {"matched": False, "matched_build_inputs": True,
+                "explicit_ci_migration": True,
+                "producer_ci_revision": record["identity"]["ci_revision"],
+                "validator_ci_revision": current["ci_revision"],
+                "producer_identity_sha256": record["identity_sha256"],
+                "validator_identity_sha256": canonical_hash(current)}
     if record["identity"] != current:
         differences = sorted(name for name in set(current) | set(record["identity"])
                              if current.get(name) != record["identity"].get(name))
@@ -588,11 +703,15 @@ def main():
     command.add_argument("archive", type=Path)
     command.add_argument("--max-archive-bytes", type=int, default=1024 ** 3)
     command.add_argument("--max-unpacked-bytes", type=int, default=2 * 1024 ** 3)
+    command = commands.add_parser("inspect-input-paths")
+    command.add_argument("archive", type=Path)
     for name in ("record-provenance", "verify-provenance"):
         command = commands.add_parser(name)
         command.add_argument("record", type=Path)
         command.add_argument("--ci-revision", required=True)
         command.add_argument("--base-image", required=True)
+        if name == "verify-provenance":
+            command.add_argument("--repair-legacy-input-paths", action="store_true")
     command = commands.add_parser("collect-evidence")
     command.add_argument("trial", type=Path)
     command.add_argument("record", type=Path)
@@ -609,9 +728,13 @@ def main():
         if args.max_archive_bytes <= 0 or args.max_unpacked_bytes <= 0:
             raise ValueError("Archive size limits must be positive")
         result = validate_archive(args.archive, args.max_archive_bytes, args.max_unpacked_bytes)
+    elif args.command == "inspect-input-paths":
+        result = inspect_input_paths(args.archive)
     elif args.command in {"record-provenance", "verify-provenance"}:
         operation = record_provenance if args.command == "record-provenance" else verify_provenance
-        result = operation(args.record, args.ci_revision, args.base_image)
+        options = ({"repair_legacy_input_paths": args.repair_legacy_input_paths}
+                   if args.command == "verify-provenance" else {})
+        result = operation(args.record, args.ci_revision, args.base_image, **options)
     elif args.command == "collect-evidence":
         result = collect_evidence(args.trial, args.record)
     elif args.command == "verify-evidence":
@@ -636,7 +759,7 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (OSError, ValueError, TypeError, KeyError, StopIteration, tarfile.TarError,
+    except (OSError, ValueError, TypeError, KeyError, StopIteration, EOFError, tarfile.TarError,
             subprocess.SubprocessError) as error:
         print(f"Checkpoint validation failed: {error}", file=sys.stderr)
         sys.exit(2)
