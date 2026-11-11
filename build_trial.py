@@ -29,7 +29,10 @@ VERSION = 1
 BUILD_DIR = PurePosixPath("out/Bare")
 TARGET = "chrome_public_apk"
 SUCCESS_SOURCE = "siso_metrics+ninja_log-v5"
-OUTPUT_LIMIT = 700 * 1024 * 1024
+# GN's initial output already occupies about 1.3 GB on this pinned build.
+# This is an uncompressed working-set guard, not the 1 GiB upload limit.
+# Leave 256 MiB below the separate 2 GiB archive extraction limit.
+OUTPUT_LIMIT = 1792 * 1024 * 1024
 SOURCE_ROOT = Path("/work/chromium/src")
 
 
@@ -469,8 +472,12 @@ def main():
         parser.error("The small-trial output and free-disk guards cannot be relaxed")
     result = run_trial(SOURCE_ROOT, args.phase, args.result, args.log, args.seconds,
                        args.max_output_bytes, args.min_free_bytes, args.previous_result)
-    print(json.dumps({key: result[key] for key in ("phase", "reason", "returncode",
-                                                  "forced_kill", "ready_for_restore_test")}))
+    summary = {key: result[key] for key in ("phase", "reason", "returncode",
+                                           "forced_kill", "ready_for_restore_test")}
+    for key in ("output_before", "last_sample"):
+        if key in result:
+            summary[key] = result[key]
+    print(json.dumps(summary))
     # The workflow must inspect the result after its unconditional stop/save.
     # A planned stop or a failed build must not skip preservation steps.
     return 0
