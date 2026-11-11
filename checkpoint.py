@@ -30,11 +30,15 @@ CITY_OBJECT = "out/Bare/obj/base/third_party/cityhash/cityhash/city.o"
 CONTINUATION_RECORD = "out/Bare/checkpoint-continuation.json"
 CONTINUATION_TRIAL = "out/Bare/checkpoint-trial-restore.json"
 PROVENANCE_RECORD = "out/Bare/checkpoint-provenance.json"
+APK_PATH = "out/Bare/apks/ChromePublic.apk"
 CONTINUATION_TRIAL_LIMIT = 16 * 1024 ** 2
 SCALE_CONTINUATION_TRIAL_LIMIT = 64 * 1024 ** 2
+LARGE_CONTINUATION_TRIAL_LIMIT = 128 * 1024 ** 2
 SCALE_ARCHIVE_BYTES = 11 * 1024 ** 3 // 4
 SCALE_UNPACKED_BYTES = 3 * 1024 ** 3
 SCALE_ARCHIVE_MEMBERS = 150_000
+LARGE_UNPACKED_BYTES = 7 * 1024 ** 3
+LARGE_ARCHIVE_MEMBERS = 320_000
 CI_FILES = ("checkpoint.py", "build_trial.py", "bare-arm64-probe.yml",
             "bare-checkpoint-transfer.yml")
 TOOL_FILES = (
@@ -67,6 +71,16 @@ SCALE_PREDECESSOR = {
         "build_trial.py": "aea2624bcb392f52241e4c9afb179f87268fa3f4e064a519f9f64fe08813f2fc",
         "bare-arm64-probe.yml": "7bccd928b2730cd9de020ff41424b8c488b40f0ea9388c07068b6c8ba28f9dd4",
         "bare-checkpoint-transfer.yml": "a1c5de31084e0f420ea02cbbb85a03e9ac832f0a0e05e2cf375e27e3c93f25f2",
+    },
+}
+LARGER_PREDECESSOR = {
+    "ci_revision": "5d3f7993c975630d4abf3efe2925aee79e51dc39",
+    "identity_sha256": "5a1826fb351f149a8a4132fb21d80acba90d937131ce211c8c0b13d79970a966",
+    "ci_files": {
+        "checkpoint.py": "fd46f6a6ca05625e24ea4d6d8e4477a98c92e98e0c37ba28417a2e14907dfeb1",
+        "build_trial.py": "24220044336f7770234b6af7d957b5e8ce08a8deb9b6b87445c335686067fd04",
+        "bare-arm64-probe.yml": "c632f5ee7e99a6ebf078b593d32c875dcf0b118e93a0433213314bb27a85df5d",
+        "bare-checkpoint-transfer.yml": "8ef66d0965fa6880b60dce6c8eeeab36df3035867768ffae5665607f73c57fc5",
     },
 }
 
@@ -243,15 +257,18 @@ def read_entries(manifest, roots):
 
 
 def inspect_input_paths(archive_path, max_records=2_000_000,
-                        max_line_bytes=64 * 1024, max_decompressed_bytes=1024 ** 3):
+                        max_line_bytes=64 * 1024, max_decompressed_bytes=1024 ** 3,
+                        *, max_archive_bytes=1024 ** 3,
+                        max_unpacked_bytes=2 * 1024 ** 3, max_members=100_000):
     """Read bounded input-path diagnostics without extracting or changing files.
 
     The workflow separately validates the complete archive first. This command
     also bounds its own outer scan and the nested compressed JSONL manifest.
     """
-    if min(max_records, max_line_bytes, max_decompressed_bytes) <= 0:
+    if min(max_records, max_line_bytes, max_decompressed_bytes,
+           max_archive_bytes, max_unpacked_bytes, max_members) <= 0:
         raise ValueError("Input inspection limits must be positive")
-    if archive_path.stat().st_size > 1024 ** 3:
+    if archive_path.stat().st_size > max_archive_bytes:
         raise ValueError("Checkpoint archive exceeds the bounded transfer limit")
     expected_header = {"format": FORMAT, "version": VERSION,
                        "roots": {name: str(path) for name, path in ROOTS.items()}}
@@ -263,7 +280,7 @@ def inspect_input_paths(archive_path, max_records=2_000_000,
         for member in archive:
             members += 1
             unpacked_bytes += member.size
-            if members > 100_000 or member.size < 0 or unpacked_bytes > 2 * 1024 ** 3:
+            if members > max_members or member.size < 0 or unpacked_bytes > max_unpacked_bytes:
                 raise ValueError("Checkpoint archive exceeds the bounded extraction limit")
             if archive_relative(member.name).as_posix() != expected_name:
                 continue
@@ -464,8 +481,9 @@ def record_provenance(path, ci_revision, base_image, **roots):
 
 
 def verify_provenance(path, ci_revision, base_image,
-                      repair_legacy_input_paths=False, allow_scale_predecessor=False, **roots):
-    if repair_legacy_input_paths and allow_scale_predecessor:
+                      repair_legacy_input_paths=False, allow_scale_predecessor=False,
+                      allow_larger_predecessor=False, **roots):
+    if sum((repair_legacy_input_paths, allow_scale_predecessor, allow_larger_predecessor)) > 1:
         raise ValueError("Select only one checkpoint CI migration")
     record = json.loads(path.read_text(encoding="utf-8"))
     if (not isinstance(record, dict) or record.get("format") != PROVENANCE_FORMAT
@@ -480,6 +498,9 @@ def verify_provenance(path, ci_revision, base_image,
     elif allow_scale_predecessor:
         expected = SCALE_PREDECESSOR
         mismatch = "The scale probe permits only the exact recorded successor as predecessor"
+    elif allow_larger_predecessor:
+        expected = LARGER_PREDECESSOR
+        mismatch = "The larger probe permits only the exact recorded scale predecessor"
     if expected is not None:
         if (record["identity_sha256"] != expected["identity_sha256"]
                 or record["identity"].get("ci_revision") != expected["ci_revision"]
@@ -603,15 +624,29 @@ def successful_continuation_edges(trial):
     return edges
 
 
-def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *, scale=False):
-    trial_limit = SCALE_CONTINUATION_TRIAL_LIMIT if scale else CONTINUATION_TRIAL_LIMIT
+def continuation_trial_limit(scale, large):
+    if scale and large:
+        raise ValueError("Select only one continuation size profile")
+    if large:
+        return LARGE_CONTINUATION_TRIAL_LIMIT
+    return SCALE_CONTINUATION_TRIAL_LIMIT if scale else CONTINUATION_TRIAL_LIMIT
+
+
+def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *,
+                        scale=False, large=False):
+    trial_limit = continuation_trial_limit(scale, large)
     with trial_path.open("rb") as stream:
         payload = stream.read(trial_limit + 1)
     if len(payload) > trial_limit:
         raise ValueError("Continuation trial JSON exceeds its size limit")
     edges = successful_continuation_edges(json.loads(payload))
+    def output_priority(name):
+        is_object = name.endswith(".o")
+        target_object = large and is_object and name.startswith("out/Bare/obj/")
+        return (not target_object, not is_object, name)
+
     outputs = []
-    for name in sorted(edges, key=lambda item: (not item.endswith(".o"), item)):
+    for name in sorted(edges, key=output_priority):
         try:
             path = path_without_symlink_parents(source_root, PurePosixPath(name))
             info = path.lstat()
@@ -620,6 +655,8 @@ def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *, sc
         # The readback checks regular archive members directly. GNU tar can
         # represent multiply linked filesystem files as hardlink members.
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not info.st_size:
+            continue
+        if large and info.st_size > 2 * 1024 ** 3:
             continue
         metadata = object_metadata(path, source_root)
         outputs.append({"path": name, "step_id": edges[name], "size": metadata["size"],
@@ -654,11 +691,11 @@ def continuation_archive_records(archive_path, trial_limit=CONTINUATION_TRIAL_LI
     return records
 
 
-def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=False):
+def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=False, large=False):
     if (not re.fullmatch(r"[0-9a-f]{64}", expected_identity)
             or not re.fullmatch(r"[0-9a-f]{40}", ci_revision)):
         raise ValueError("Expected the exact successor identity and CI revision")
-    trial_limit = SCALE_CONTINUATION_TRIAL_LIMIT if scale else CONTINUATION_TRIAL_LIMIT
+    trial_limit = continuation_trial_limit(scale, large)
     records = continuation_archive_records(archive_path, trial_limit)
     provenance = json.loads(records[PROVENANCE_RECORD])
     if (not isinstance(provenance, dict) or provenance.get("format") != PROVENANCE_FORMAT
@@ -669,7 +706,8 @@ def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=F
             or canonical_hash(provenance["identity"]) != expected_identity):
         raise ValueError("The archived successor provenance does not match")
     trial_payload = records[CONTINUATION_TRIAL]
-    edges = successful_continuation_edges(json.loads(trial_payload))
+    trial = json.loads(trial_payload)
+    edges = successful_continuation_edges(trial)
     record = json.loads(records[CONTINUATION_RECORD])
     if (not isinstance(record, dict) or record.get("format") != CONTINUATION_FORMAT
             or record.get("version") != 1
@@ -687,6 +725,23 @@ def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=F
                 or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])):
             raise ValueError("Invalid continuation output evidence")
         expected[name] = item
+
+    sample_paths = sorted(expected)
+    apk = None
+    if large and trial.get("reason") == "completed":
+        apk = trial.get("apk")
+        if (not isinstance(apk, dict) or apk.get("path") != APK_PATH
+                or type(apk.get("size")) is not int or not 0 < apk["size"] <= LARGE_UNPACKED_BYTES
+                or not isinstance(apk.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", apk["sha256"])):
+            raise ValueError("The completed trial has no valid APK metadata")
+        member = safe_relative(apk.get("arm64_member"))
+        if member.parts[:2] != ("lib", "arm64-v8a") or member.suffix != ".so":
+            raise ValueError("The completed trial has no verified ARM64 library")
+        if APK_PATH in expected and any(expected[APK_PATH][field] != apk[field]
+                                        for field in ("size", "sha256")):
+            raise ValueError("Completed APK and continuation sample metadata differ")
+        expected[APK_PATH] = apk
 
     verified = set()
     with tarfile.open(archive_path, mode="r|gz") as archive:
@@ -706,7 +761,10 @@ def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=F
             verified.add(name)
     if verified != expected.keys():
         raise ValueError("Missing archived continuation output: " + ", ".join(sorted(expected.keys() - verified)))
-    return {"verified": len(verified), "paths": sorted(verified)}
+    result = {"verified": len(sample_paths), "paths": sample_paths}
+    if apk is not None:
+        result["apk"] = {name: apk[name] for name in ("path", "size", "sha256", "arm64_member")}
+    return result
 
 
 def canonicalize_logs(source_root=ROOTS["src"], max_file_bytes=32 * 1024 * 1024,
@@ -865,13 +923,15 @@ def main():
         command = commands.add_parser(name)
         command.add_argument("object", type=Path)
         command.add_argument("record", type=Path)
-    command = commands.add_parser("validate-archive")
-    command.add_argument("archive", type=Path)
-    command.add_argument("--max-archive-bytes", type=int)
-    command.add_argument("--max-unpacked-bytes", type=int)
-    command.add_argument("--scale", action="store_true")
-    command = commands.add_parser("inspect-input-paths")
-    command.add_argument("archive", type=Path)
+    for name in ("validate-archive", "inspect-input-paths"):
+        command = commands.add_parser(name)
+        command.add_argument("archive", type=Path)
+        if name == "validate-archive":
+            command.add_argument("--max-archive-bytes", type=int)
+            command.add_argument("--max-unpacked-bytes", type=int)
+        profile = command.add_mutually_exclusive_group()
+        profile.add_argument("--scale", action="store_true")
+        profile.add_argument("--large", action="store_true")
     for name in ("record-provenance", "verify-provenance"):
         command = commands.add_parser(name)
         command.add_argument("record", type=Path)
@@ -881,18 +941,22 @@ def main():
             migration = command.add_mutually_exclusive_group()
             migration.add_argument("--repair-legacy-input-paths", action="store_true")
             migration.add_argument("--allow-scale-predecessor", action="store_true")
+            migration.add_argument("--allow-larger-predecessor", action="store_true")
     command = commands.add_parser("collect-evidence")
     command.add_argument("trial", type=Path)
     command.add_argument("record", type=Path)
-    command = commands.add_parser("record-continuation")
-    command.add_argument("trial", type=Path)
-    command.add_argument("record", type=Path)
-    command.add_argument("--scale", action="store_true")
-    command = commands.add_parser("verify-continuation")
-    command.add_argument("archive", type=Path)
-    command.add_argument("--expected-identity", required=True)
-    command.add_argument("--ci-revision", required=True)
-    command.add_argument("--scale", action="store_true")
+    for name in ("record-continuation", "verify-continuation"):
+        command = commands.add_parser(name)
+        if name == "record-continuation":
+            command.add_argument("trial", type=Path)
+            command.add_argument("record", type=Path)
+        else:
+            command.add_argument("archive", type=Path)
+            command.add_argument("--expected-identity", required=True)
+            command.add_argument("--ci-revision", required=True)
+        profile = command.add_mutually_exclusive_group()
+        profile.add_argument("--scale", action="store_true")
+        profile.add_argument("--large", action="store_true")
     for name in ("verify-evidence", "evidence-targets"):
         command = commands.add_parser(name)
         command.add_argument("record", type=Path)
@@ -903,36 +967,38 @@ def main():
         result = record_inputs(args.manifest)
     elif args.command == "restore-inputs":
         result = restore_inputs(args.manifest)
-    elif args.command == "validate-archive":
-        if args.scale:
-            if args.max_archive_bytes is not None or args.max_unpacked_bytes is not None:
-                raise ValueError("The scale archive limits are fixed")
-            result = validate_archive(args.archive, SCALE_ARCHIVE_BYTES,
-                                      SCALE_UNPACKED_BYTES, SCALE_ARCHIVE_MEMBERS)
-        else:
-            limits = {}
+    elif args.command in {"validate-archive", "inspect-input-paths"}:
+        limits = {}
+        if args.command == "validate-archive":
             for name in ("max_archive_bytes", "max_unpacked_bytes"):
                 value = getattr(args, name)
                 if value is not None:
                     if value <= 0:
                         raise ValueError("Archive size limits must be positive")
                     limits[name] = value
-            result = validate_archive(args.archive, **limits)
-    elif args.command == "inspect-input-paths":
-        result = inspect_input_paths(args.archive)
+        if args.scale or args.large:
+            if limits:
+                profile = "large" if args.large else "scale"
+                raise ValueError(f"The {profile} archive limits are fixed")
+            limits = {"max_archive_bytes": SCALE_ARCHIVE_BYTES,
+                      "max_unpacked_bytes": LARGE_UNPACKED_BYTES if args.large else SCALE_UNPACKED_BYTES,
+                      "max_members": LARGE_ARCHIVE_MEMBERS if args.large else SCALE_ARCHIVE_MEMBERS}
+        operation = validate_archive if args.command == "validate-archive" else inspect_input_paths
+        result = operation(args.archive, **limits)
     elif args.command in {"record-provenance", "verify-provenance"}:
         operation = record_provenance if args.command == "record-provenance" else verify_provenance
         options = ({"repair_legacy_input_paths": args.repair_legacy_input_paths,
-                    "allow_scale_predecessor": args.allow_scale_predecessor}
+                    "allow_scale_predecessor": args.allow_scale_predecessor,
+                    "allow_larger_predecessor": args.allow_larger_predecessor}
                    if args.command == "verify-provenance" else {})
         result = operation(args.record, args.ci_revision, args.base_image, **options)
     elif args.command == "collect-evidence":
         result = collect_evidence(args.trial, args.record)
     elif args.command == "record-continuation":
-        result = record_continuation(args.trial, args.record, scale=args.scale)
+        result = record_continuation(args.trial, args.record, scale=args.scale, large=args.large)
     elif args.command == "verify-continuation":
         result = verify_continuation(args.archive, args.expected_identity, args.ci_revision,
-                                     scale=args.scale)
+                                     scale=args.scale, large=args.large)
     elif args.command == "verify-evidence":
         result = verify_evidence(args.record)
     elif args.command == "evidence-targets":
