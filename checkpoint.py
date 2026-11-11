@@ -31,6 +31,10 @@ CONTINUATION_RECORD = "out/Bare/checkpoint-continuation.json"
 CONTINUATION_TRIAL = "out/Bare/checkpoint-trial-restore.json"
 PROVENANCE_RECORD = "out/Bare/checkpoint-provenance.json"
 CONTINUATION_TRIAL_LIMIT = 16 * 1024 ** 2
+SCALE_CONTINUATION_TRIAL_LIMIT = 64 * 1024 ** 2
+SCALE_ARCHIVE_BYTES = 11 * 1024 ** 3 // 4
+SCALE_UNPACKED_BYTES = 3 * 1024 ** 3
+SCALE_ARCHIVE_MEMBERS = 150_000
 CI_FILES = ("checkpoint.py", "build_trial.py", "bare-arm64-probe.yml",
             "bare-checkpoint-transfer.yml")
 TOOL_FILES = (
@@ -53,6 +57,16 @@ LEGACY_INPUT_PATH_REPAIR = {
         "build_trial.py": "fea6686cee8017b319b2874ee0eec8051b09ea9cf1c6a9ba06178f5403e32d34",
         "bare-arm64-probe.yml": "c2e0026278400d5399e29390eafdbc7790c19a155a27a106dc569cc5e1fe128e",
         "bare-checkpoint-transfer.yml": "d56a0ade1158469032f839b185c4dbb69fbd124fde10aa0980ba147e31056ec9",
+    },
+}
+SCALE_PREDECESSOR = {
+    "ci_revision": "40b60fcac3b34d96a3e450848d2374d3b921bf5f",
+    "identity_sha256": "87c8946d20f1f0f97d494c21291b1bb1865772084f0e1a09577414007c3ae170",
+    "ci_files": {
+        "checkpoint.py": "caf87200558fc833cc80f6372524f2881d74ee0a0a9309a710e9fd06ef780687",
+        "build_trial.py": "aea2624bcb392f52241e4c9afb179f87268fa3f4e064a519f9f64fe08813f2fc",
+        "bare-arm64-probe.yml": "7bccd928b2730cd9de020ff41424b8c488b40f0ea9388c07068b6c8ba28f9dd4",
+        "bare-checkpoint-transfer.yml": "a1c5de31084e0f420ea02cbbb85a03e9ac832f0a0e05e2cf375e27e3c93f25f2",
     },
 }
 
@@ -450,24 +464,31 @@ def record_provenance(path, ci_revision, base_image, **roots):
 
 
 def verify_provenance(path, ci_revision, base_image,
-                      repair_legacy_input_paths=False, **roots):
+                      repair_legacy_input_paths=False, allow_scale_predecessor=False, **roots):
+    if repair_legacy_input_paths and allow_scale_predecessor:
+        raise ValueError("Select only one checkpoint CI migration")
     record = json.loads(path.read_text(encoding="utf-8"))
     if (not isinstance(record, dict) or record.get("format") != PROVENANCE_FORMAT
             or record.get("version") != CHECKPOINT_VERSION
             or not isinstance(record.get("identity"), dict)
             or record.get("identity_sha256") != canonical_hash(record["identity"])):
         raise ValueError("The checkpoint identity record is invalid or incompatible")
+    expected = None
     if repair_legacy_input_paths:
         expected = LEGACY_INPUT_PATH_REPAIR
+        mismatch = "The input-path repair permits only the exact recorded legacy producer"
+    elif allow_scale_predecessor:
+        expected = SCALE_PREDECESSOR
+        mismatch = "The scale probe permits only the exact recorded successor as predecessor"
+    if expected is not None:
         if (record["identity_sha256"] != expected["identity_sha256"]
                 or record["identity"].get("ci_revision") != expected["ci_revision"]
                 or record["identity"].get("ci_files") != expected["ci_files"]):
-            raise ValueError("The input-path repair permits only the exact recorded legacy producer")
+            raise ValueError(mismatch)
     current = provenance_identity(ci_revision, base_image, **roots)
-    if repair_legacy_input_paths:
-        # This one recorded seed predates the POSIX input-path repair. Retain
-        # every build-input comparison; only identify the changed CI machinery
-        # separately, rather than pretending its full identity is unchanged.
+    if expected is not None:
+        # A pinned predecessor may use an earlier CI implementation. Every
+        # build input other than that implementation must still match.
         excluded = {"ci_revision", "ci_files"}
         producer_inputs = {key: value for key, value in record["identity"].items()
                            if key not in excluded}
@@ -582,10 +603,11 @@ def successful_continuation_edges(trial):
     return edges
 
 
-def record_continuation(trial_path, record_path, source_root=ROOTS["src"]):
+def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *, scale=False):
+    trial_limit = SCALE_CONTINUATION_TRIAL_LIMIT if scale else CONTINUATION_TRIAL_LIMIT
     with trial_path.open("rb") as stream:
-        payload = stream.read(CONTINUATION_TRIAL_LIMIT + 1)
-    if len(payload) > CONTINUATION_TRIAL_LIMIT:
+        payload = stream.read(trial_limit + 1)
+    if len(payload) > trial_limit:
         raise ValueError("Continuation trial JSON exceeds its size limit")
     edges = successful_continuation_edges(json.loads(payload))
     outputs = []
@@ -612,8 +634,8 @@ def record_continuation(trial_path, record_path, source_root=ROOTS["src"]):
     return {"recorded": len(outputs), "paths": [item["path"] for item in outputs]}
 
 
-def continuation_archive_records(archive_path):
-    limits = {CONTINUATION_RECORD: 32 * 1024, CONTINUATION_TRIAL: CONTINUATION_TRIAL_LIMIT,
+def continuation_archive_records(archive_path, trial_limit=CONTINUATION_TRIAL_LIMIT):
+    limits = {CONTINUATION_RECORD: 32 * 1024, CONTINUATION_TRIAL: trial_limit,
               PROVENANCE_RECORD: 1024 ** 2}
     records = {}
     with tarfile.open(archive_path, mode="r|gz") as archive:
@@ -632,11 +654,12 @@ def continuation_archive_records(archive_path):
     return records
 
 
-def verify_continuation(archive_path, expected_identity, ci_revision):
+def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=False):
     if (not re.fullmatch(r"[0-9a-f]{64}", expected_identity)
             or not re.fullmatch(r"[0-9a-f]{40}", ci_revision)):
         raise ValueError("Expected the exact successor identity and CI revision")
-    records = continuation_archive_records(archive_path)
+    trial_limit = SCALE_CONTINUATION_TRIAL_LIMIT if scale else CONTINUATION_TRIAL_LIMIT
+    records = continuation_archive_records(archive_path, trial_limit)
     provenance = json.loads(records[PROVENANCE_RECORD])
     if (not isinstance(provenance, dict) or provenance.get("format") != PROVENANCE_FORMAT
             or provenance.get("version") != CHECKPOINT_VERSION
@@ -687,19 +710,29 @@ def verify_continuation(archive_path, expected_identity, ci_revision):
 
 
 def canonicalize_logs(source_root=ROOTS["src"], max_file_bytes=32 * 1024 * 1024,
-                      max_total_bytes=128 * 1024 * 1024):
-    """Make known Siso diagnostic links portable; never alter incremental state."""
+                      max_total_bytes=128 * 1024 * 1024, *, scale=False):
+    """After Siso stops, copy short-probe diagnostics or omit scale log links."""
     output = source_root / "out/Bare"
+    pattern = (r"siso(?:\.[0-9]+)?\.(INFO|WARNING|ERROR)" if scale
+               else r"siso(?:\.[0-9])?\.(INFO|WARNING|ERROR)")
     converted = []
+    omitted = []
     total = 0
     for link in sorted(output.iterdir()):
-        match = re.fullmatch(r"siso(?:\.[0-9])?\.(INFO|WARNING|ERROR)", link.name)
+        match = re.fullmatch(pattern, link.name)
         if not match or not link.is_symlink():
             continue
         target = link.resolve(strict=True)
         level = match.group(1)
         if not target.name.startswith("siso.") or f".log.{level}." not in target.name:
             raise ValueError("Unexpected Siso diagnostic link target")
+        if scale:
+            info = target.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise ValueError("Siso diagnostic link must target an owned regular log")
+            link.unlink()
+            omitted.append(link.name)
+            continue
         descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         temporary = None
         try:
@@ -732,6 +765,8 @@ def canonicalize_logs(source_root=ROOTS["src"], max_file_bytes=32 * 1024 * 1024,
         finally:
             if temporary and os.path.exists(temporary):
                 os.unlink(temporary)
+    if scale:
+        return {"omitted_logs": omitted}
     return {"converted_logs": converted, "converted_bytes": total}
 
 
@@ -832,8 +867,9 @@ def main():
         command.add_argument("record", type=Path)
     command = commands.add_parser("validate-archive")
     command.add_argument("archive", type=Path)
-    command.add_argument("--max-archive-bytes", type=int, default=1024 ** 3)
-    command.add_argument("--max-unpacked-bytes", type=int, default=2 * 1024 ** 3)
+    command.add_argument("--max-archive-bytes", type=int)
+    command.add_argument("--max-unpacked-bytes", type=int)
+    command.add_argument("--scale", action="store_true")
     command = commands.add_parser("inspect-input-paths")
     command.add_argument("archive", type=Path)
     for name in ("record-provenance", "verify-provenance"):
@@ -842,43 +878,61 @@ def main():
         command.add_argument("--ci-revision", required=True)
         command.add_argument("--base-image", required=True)
         if name == "verify-provenance":
-            command.add_argument("--repair-legacy-input-paths", action="store_true")
+            migration = command.add_mutually_exclusive_group()
+            migration.add_argument("--repair-legacy-input-paths", action="store_true")
+            migration.add_argument("--allow-scale-predecessor", action="store_true")
     command = commands.add_parser("collect-evidence")
     command.add_argument("trial", type=Path)
     command.add_argument("record", type=Path)
     command = commands.add_parser("record-continuation")
     command.add_argument("trial", type=Path)
     command.add_argument("record", type=Path)
+    command.add_argument("--scale", action="store_true")
     command = commands.add_parser("verify-continuation")
     command.add_argument("archive", type=Path)
     command.add_argument("--expected-identity", required=True)
     command.add_argument("--ci-revision", required=True)
+    command.add_argument("--scale", action="store_true")
     for name in ("verify-evidence", "evidence-targets"):
         command = commands.add_parser(name)
         command.add_argument("record", type=Path)
-    commands.add_parser("canonicalize-logs")
+    command = commands.add_parser("canonicalize-logs")
+    command.add_argument("--scale", action="store_true")
     args = parser.parse_args()
     if args.command == "record-inputs":
         result = record_inputs(args.manifest)
     elif args.command == "restore-inputs":
         result = restore_inputs(args.manifest)
     elif args.command == "validate-archive":
-        if args.max_archive_bytes <= 0 or args.max_unpacked_bytes <= 0:
-            raise ValueError("Archive size limits must be positive")
-        result = validate_archive(args.archive, args.max_archive_bytes, args.max_unpacked_bytes)
+        if args.scale:
+            if args.max_archive_bytes is not None or args.max_unpacked_bytes is not None:
+                raise ValueError("The scale archive limits are fixed")
+            result = validate_archive(args.archive, SCALE_ARCHIVE_BYTES,
+                                      SCALE_UNPACKED_BYTES, SCALE_ARCHIVE_MEMBERS)
+        else:
+            limits = {}
+            for name in ("max_archive_bytes", "max_unpacked_bytes"):
+                value = getattr(args, name)
+                if value is not None:
+                    if value <= 0:
+                        raise ValueError("Archive size limits must be positive")
+                    limits[name] = value
+            result = validate_archive(args.archive, **limits)
     elif args.command == "inspect-input-paths":
         result = inspect_input_paths(args.archive)
     elif args.command in {"record-provenance", "verify-provenance"}:
         operation = record_provenance if args.command == "record-provenance" else verify_provenance
-        options = ({"repair_legacy_input_paths": args.repair_legacy_input_paths}
+        options = ({"repair_legacy_input_paths": args.repair_legacy_input_paths,
+                    "allow_scale_predecessor": args.allow_scale_predecessor}
                    if args.command == "verify-provenance" else {})
         result = operation(args.record, args.ci_revision, args.base_image, **options)
     elif args.command == "collect-evidence":
         result = collect_evidence(args.trial, args.record)
     elif args.command == "record-continuation":
-        result = record_continuation(args.trial, args.record)
+        result = record_continuation(args.trial, args.record, scale=args.scale)
     elif args.command == "verify-continuation":
-        result = verify_continuation(args.archive, args.expected_identity, args.ci_revision)
+        result = verify_continuation(args.archive, args.expected_identity, args.ci_revision,
+                                     scale=args.scale)
     elif args.command == "verify-evidence":
         result = verify_evidence(args.record)
     elif args.command == "evidence-targets":
@@ -886,7 +940,7 @@ def main():
             print(item["target"])
         return 0
     elif args.command == "canonicalize-logs":
-        result = canonicalize_logs()
+        result = canonicalize_logs(scale=args.scale)
     else:
         path = args.object.absolute()
         result = object_metadata(path, ROOTS["src"])

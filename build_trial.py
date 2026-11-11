@@ -36,6 +36,11 @@ OUTPUT_LIMIT = 1792 * 1024 * 1024
 # Keep room below the archive validator's 100,000-member limit for metadata
 # and outputs created between samples. The final archive check is still required.
 OUTPUT_ENTRY_LIMIT = 98_000
+SMALL_MIN_FREE_BYTES = 10_000_000_000
+SCALE_TIME_LIMIT = 3600
+SCALE_OUTPUT_LIMIT = 5 * 1024 ** 3 // 2
+SCALE_OUTPUT_ENTRY_LIMIT = 140_000
+SCALE_MIN_FREE_BYTES = 20 * 1024 ** 3
 SOURCE_ROOT = Path("/work/chromium/src")
 
 
@@ -307,10 +312,11 @@ def apk_metadata(path):
 
 
 def run_trial(source_root, phase, result_path, log_path, seconds=180,
-              max_output_bytes=OUTPUT_LIMIT, min_free_bytes=10_000_000_000,
+              max_output_bytes=OUTPUT_LIMIT, min_free_bytes=SMALL_MIN_FREE_BYTES,
               previous_result=None, command=None, stop_grace_seconds=120,
-              sample_seconds=2, output_stream=None, max_output_entries=OUTPUT_ENTRY_LIMIT):
-    """Run a short trial. command injection is exposed to local tests, not CLI."""
+              sample_seconds=2, output_stream=None, max_output_entries=OUTPUT_ENTRY_LIMIT,
+              *, scale=False):
+    """Run a bounded trial. Only local callers can substitute the build command."""
     source_root = source_root.absolute()
     output = source_root / BUILD_DIR
     metrics_path = log_path.with_name(f"siso-metrics-{phase}.json")
@@ -321,6 +327,10 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
               "ready_for_restore_test": False, "completed_outputs": [],
               "new_completed_outputs": [], "failed_steps": [], "apk": None,
               "container_quiescence_verified": False, "max_output_entries": max_output_entries}
+    if scale:
+        result["scale_limits"] = {"seconds": seconds, "max_output_bytes": max_output_bytes,
+                                  "max_output_entries": max_output_entries,
+                                  "min_free_bytes": min_free_bytes}
     process = None
     selector = selectors.DefaultSelector()
     old_handlers = {}
@@ -330,14 +340,21 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
     try:
         if phase not in {"seed", "restore"} or seconds <= 0:
             raise ValueError("Invalid trial phase or time budget")
-        if type(max_output_entries) is not int or not 1 <= max_output_entries <= OUTPUT_ENTRY_LIMIT:
-            raise ValueError("The output entry guard must be between 1 and 98000")
-        if phase == "restore" and previous_result is None:
+        entry_limit = SCALE_OUTPUT_ENTRY_LIMIT if scale else OUTPUT_ENTRY_LIMIT
+        if type(max_output_entries) is not int or not 1 <= max_output_entries <= entry_limit:
+            raise ValueError(f"The output entry guard must be between 1 and {entry_limit}")
+        if scale and (phase != "restore" or seconds > SCALE_TIME_LIMIT
+                      or not 1 <= max_output_bytes <= SCALE_OUTPUT_LIMIT
+                      or min_free_bytes < SCALE_MIN_FREE_BYTES):
+            raise ValueError("Scale requires restore and bounded time, output bytes, and free disk")
+        if phase == "restore" and previous_result is None and not scale:
             raise ValueError("Restore requires the saved seed trial result")
         if metrics_path.exists() or metrics_path.is_symlink():
             raise ValueError("Metrics path must be new for this trial")
         baseline = previous_paths(previous_result)
         snapshot = tree_snapshot(output)
+        # A restored tree contains outputs from earlier generations. Even
+        # without a seed result, their paths cannot count as new work.
         baseline.update(snapshot.pop("paths"))
         result["output_before"] = snapshot
         close_before = log_snapshot(info_path)
@@ -470,25 +487,36 @@ def main():
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--previous-result", type=Path)
-    parser.add_argument("--seconds", type=int, default=180)
-    parser.add_argument("--max-output-bytes", type=int, default=OUTPUT_LIMIT)
-    parser.add_argument("--max-output-entries", type=int, default=OUTPUT_ENTRY_LIMIT)
-    parser.add_argument("--min-free-bytes", type=int, default=10_000_000_000)
+    parser.add_argument("--scale", action="store_true", help="Use the bounded scale restore limits")
+    parser.add_argument("--seconds", type=int)
+    parser.add_argument("--max-output-bytes", type=int)
+    parser.add_argument("--max-output-entries", type=int)
+    parser.add_argument("--min-free-bytes", type=int)
     args = parser.parse_args()
     if Path.cwd() != SOURCE_ROOT:
         parser.error("Run only from the fixed /work/chromium/src directory")
-    if not 1 <= args.seconds <= 600:
-        parser.error("This is a short probe: --seconds must be between 1 and 600")
-    if not 1 <= args.max_output_bytes <= OUTPUT_LIMIT or args.min_free_bytes < 10_000_000_000:
-        parser.error("The small-trial output and free-disk guards cannot be relaxed")
-    if not 1 <= args.max_output_entries <= OUTPUT_ENTRY_LIMIT:
-        parser.error("The small-trial entry guard must be between 1 and 98000")
-    result = run_trial(SOURCE_ROOT, args.phase, args.result, args.log, args.seconds,
-                       args.max_output_bytes, args.min_free_bytes, args.previous_result,
-                       max_output_entries=args.max_output_entries)
+    if args.scale and args.phase != "restore":
+        parser.error("--scale requires --phase restore")
+    time_limit = SCALE_TIME_LIMIT if args.scale else 600
+    output_limit = SCALE_OUTPUT_LIMIT if args.scale else OUTPUT_LIMIT
+    entry_limit = SCALE_OUTPUT_ENTRY_LIMIT if args.scale else OUTPUT_ENTRY_LIMIT
+    disk_floor = SCALE_MIN_FREE_BYTES if args.scale else SMALL_MIN_FREE_BYTES
+    seconds = args.seconds if args.seconds is not None else (SCALE_TIME_LIMIT if args.scale else 180)
+    max_output_bytes = args.max_output_bytes if args.max_output_bytes is not None else output_limit
+    max_output_entries = args.max_output_entries if args.max_output_entries is not None else entry_limit
+    min_free_bytes = args.min_free_bytes if args.min_free_bytes is not None else disk_floor
+    if not 1 <= seconds <= time_limit:
+        parser.error(f"--seconds must be between 1 and {time_limit}")
+    if not 1 <= max_output_bytes <= output_limit or min_free_bytes < disk_floor:
+        parser.error(f"Expected output bytes at most {output_limit} and free bytes at least {disk_floor}")
+    if not 1 <= max_output_entries <= entry_limit:
+        parser.error(f"--max-output-entries must be between 1 and {entry_limit}")
+    result = run_trial(SOURCE_ROOT, args.phase, args.result, args.log, seconds,
+                       max_output_bytes, min_free_bytes, args.previous_result,
+                       max_output_entries=max_output_entries, scale=args.scale)
     summary = {key: result[key] for key in ("phase", "reason", "returncode",
                                            "forced_kill", "ready_for_restore_test", "max_output_entries")}
-    for key in ("output_before", "last_sample"):
+    for key in ("scale_limits", "output_before", "last_sample"):
         if key in result:
             summary[key] = result[key]
     print(json.dumps(summary))
