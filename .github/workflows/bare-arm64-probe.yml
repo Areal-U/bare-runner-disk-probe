@@ -17,6 +17,9 @@ name: Bare ARM64 compile and checkpoint probe
       expected_base_image:
         type: string
         default: ''
+      repair_legacy_input_paths:
+        type: boolean
+        default: false
     outputs:
       checkpoint_key:
         value: ${{ jobs.compile-probe.outputs.checkpoint_key }}
@@ -55,6 +58,7 @@ jobs:
       DEPOT_REV: 96a7c1418eedaa6bea333a8941e8a0078681b4d0
       GIT_TERMINAL_PROMPT: '0'
       PROBE_MODE: ${{ inputs.probe }}
+      REPAIR_LEGACY_INPUT_PATHS: ${{ inputs.repair_legacy_input_paths && 'true' || 'false' }}
     defaults:
       run:
         shell: bash
@@ -81,6 +85,15 @@ jobs:
             ;;
           *) echo 'Only smoke and the bounded two-job checkpoint probe are enabled. The old logs-only APK mode is disabled.' >&2; exit 1 ;;
         esac
+        if [[ $REPAIR_LEGACY_INPUT_PATHS == true ]]; then
+          [[ $PROBE_MODE == checkpoint-restore ]]
+          [[ $EXPECTED_KEY == bare-transfer-v2-42928862523-1-checkpoint-seed ]]
+          [[ $EXPECTED_SHA == d03e5ce8221691eec57a5610050931af5d117fe8bb61785f0c93ac89a2676d37 ]]
+          [[ $EXPECTED_IDENTITY == fc3b4584696b8239bfc3b04db9490e3c0b722b62b81c54c772b96f27543a8896 ]]
+          [[ $EXPECTED_BASE == ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 ]]
+        else
+          [[ $REPAIR_LEGACY_INPUT_PATHS == false ]]
+        fi
         if [[ $PROBE_MODE != checkpoint-restore ]]; then
           [[ -z $EXPECTED_KEY && -z $EXPECTED_SHA && -z $EXPECTED_IDENTITY && -z $EXPECTED_BASE ]]
         fi
@@ -126,6 +139,12 @@ jobs:
                 break
         else:
             raise SystemExit('Cannot bound cache inventory; stopping before compilation.')
+        checkpoints = [item for item in caches if item['key'].startswith('bare-transfer-v2-')]
+        # This approved experiment keeps the original generation and at most one successor.
+        # An additional seed would consume the slot reserved for continuation.
+        limit = 0 if os.environ['PROBE_MODE'] == 'checkpoint-seed' else 1
+        if len(checkpoints) > limit:
+            raise SystemExit('The two-generation experiment limit is reached; keep existing checkpoints.')
         used = max(usage['active_caches_size_in_bytes'], sum(item['size_in_bytes'] for item in caches))
         # Two <=1GiB archives plus cache wrapping/other metadata. Never raise the repository limit.
         reserve = 3 * 1024**3
@@ -154,6 +173,7 @@ jobs:
         archive="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
         printf '%s  %s\n' "$EXPECTED_SHA" "$archive" | sha256sum --check --strict
         python3 "$RUNNER_TEMP/bare-ci/checkpoint.py" validate-archive "$archive"
+        python3 "$RUNNER_TEMP/bare-ci/checkpoint.py" inspect-input-paths "$archive"
     - name: Reclaim runner space and start the pinned Bare container
       timeout-minutes: 25
       run: |
@@ -317,15 +337,20 @@ jobs:
       run: |
         cd "$RUNNER_TEMP/bare-official"
         docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CI_REVISION=$GITHUB_SHA" -e "BASE_IMAGE=$BARE_BASE_IMAGE" \
-          -e "EXPECTED_IDENTITY=$EXPECTED_IDENTITY" -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 chromium-builder \
+          -e "EXPECTED_IDENTITY=$EXPECTED_IDENTITY" -e "REPAIR_LEGACY_INPUT_PATHS=$REPAIR_LEGACY_INPUT_PATHS" \
+          -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 chromium-builder \
           timeout --kill-after=2m 20m bash -seu <<'CONTAINER'
         set -o pipefail
         cd /work/chromium/src
         python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint.tar.gz
         rm -rf --one-file-system -- out/Bare
         tar -xzf /exchange/checkpoint/checkpoint.tar.gz
+        repair=()
+        [[ $REPAIR_LEGACY_INPUT_PATHS != true ]] || repair+=(--repair-legacy-input-paths)
         python3 /exchange/checkpoint.py verify-provenance out/Bare/checkpoint-provenance.json \
-          --ci-revision "$CI_REVISION" --base-image "$BASE_IMAGE"
+          --ci-revision "$CI_REVISION" --base-image "$BASE_IMAGE" "${repair[@]}" \
+          | tee /exchange/checkpoint/provenance-check.json
+        cp out/Bare/checkpoint-provenance.json /exchange/checkpoint/producer-provenance.json
         python3 - <<'PYTHON'
         import json, os
         data = json.load(open('out/Bare/checkpoint-provenance.json'))
@@ -452,6 +477,10 @@ jobs:
           fi
         fi
         printf '{"evidence_valid":%s}\n' "$proof" > /exchange/checkpoint/proof.json
+        if [[ -f /exchange/checkpoint/producer-provenance.json ]]; then
+          cp /exchange/checkpoint/producer-provenance.json out/Bare/checkpoint-producer-provenance.json
+          cp /exchange/checkpoint/provenance-check.json out/Bare/checkpoint-source-verification.json
+        fi
         python3 /exchange/checkpoint.py canonicalize-logs
         python3 /exchange/checkpoint.py record-provenance out/Bare/checkpoint-provenance.json \
           --ci-revision "$CI_REVISION" --base-image "$BASE_IMAGE"
@@ -481,8 +510,29 @@ jobs:
           echo "- SHA-256: $sha"
           echo "- Input identity: $identity"
           echo "- Source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          cat "exchange/checkpoint/trial-$phase.json"
-        } >> "$GITHUB_STEP_SUMMARY"
+          if ! python3 - "exchange/checkpoint/trial-$phase.json" <<'PYTHON'
+        import json, sys
+        data = json.load(open(sys.argv[1]))
+        names = ('phase', 'reason', 'returncode', 'forced_kill', 'ready_for_restore_test',
+                 'container_quiescence_verified', 'failed_step_count')
+        summary = {name: data.get(name) for name in names}
+        summary['completed_outputs'] = len(data.get('completed_outputs', []))
+        summary['new_completed_outputs'] = len(data.get('new_completed_outputs', []))
+        summary['close'] = {name: data.get('close', {}).get(name) for name in ('saved', 'journal_ready')}
+        for label in ('output_before', 'last_sample'):
+            summary[label] = {name: data.get(label, {}).get(name) for name in
+                              ('logical_bytes', 'allocated_bytes', 'entries', 'archive_input_estimate_bytes', 'free_bytes')}
+        # A count-based projection prevents the full multi-MiB edge list entering the UI.
+        rendered = json.dumps(summary, ensure_ascii=True, sort_keys=True)
+        if len(rendered.encode('utf-8')) > 4096:
+            raise SystemExit('The bounded checkpoint summary is unexpectedly large.')
+        print(rendered)
+        PYTHON
+          then
+            echo '::warning::Detailed checkpoint summary could not be rendered; the archive remains eligible for saving.'
+            echo '- Summary unavailable; inspect the recorded trial JSON in the checkpoint.'
+          fi
+        } | tee -a "$GITHUB_STEP_SUMMARY" || echo '::warning::Summary display failed; continue to checkpoint saving.'
     - name: Save a new bounded generation without replacing the producer
       id: save-checkpoint
       if: ${{ always() && steps.pack-checkpoint.outcome == 'success' }}

@@ -1,16 +1,26 @@
 name: Bare checkpoint transfer probe
 'on':
-  workflow_dispatch: null
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Resume the retained seed; paired mode requires no existing experiment checkpoints
+        type: choice
+        default: restore-saved
+        options:
+        - restore-saved
+        - paired
 permissions: {}
 concurrency:
   group: bare-checkpoint-transfer-workflow
   cancel-in-progress: false
 jobs:
   seed:
+    if: ${{ inputs.mode == 'paired' }}
     uses: ./.github/workflows/bare-arm64-probe.yml
     with:
       probe: checkpoint-seed
   restore:
+    if: ${{ inputs.mode == 'paired' }}
     needs: seed
     uses: ./.github/workflows/bare-arm64-probe.yml
     with:
@@ -19,3 +29,13 @@ jobs:
       expected_checkpoint_sha: ${{ needs.seed.outputs.checkpoint_sha }}
       expected_checkpoint_identity: ${{ needs.seed.outputs.checkpoint_identity }}
       expected_base_image: ${{ needs.seed.outputs.base_image }}
+  restore-saved:
+    if: ${{ inputs.mode == 'restore-saved' }}
+    uses: ./.github/workflows/bare-arm64-probe.yml
+    with:
+      probe: checkpoint-restore
+      expected_checkpoint_key: bare-transfer-v2-42928862523-1-checkpoint-seed
+      expected_checkpoint_sha: d03e5ce8221691eec57a5610050931af5d117fe8bb61785f0c93ac89a2676d37
+      expected_checkpoint_identity: fc3b4584696b8239bfc3b04db9490e3c0b722b62b81c54c772b96f27543a8896
+      expected_base_image: ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+      repair_legacy_input_paths: true
