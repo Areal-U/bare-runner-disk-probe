@@ -113,6 +113,17 @@ EXPANDED_PRODUCTION_PREDECESSOR = {
     }
 }
 
+PRE_SNAPSHOT_PRODUCTION_PREDECESSOR = {
+    "ci_revision": "dd90eaab51159a716d7e0b6b2234b5f3e6995f56",
+    "identity_sha256": "712454d9e8eb4ae9d798fd0f4a01e817f91f2d38533ab4071dc3ceaeb56af822",
+    "ci_files": {
+        "checkpoint.py": "295ebbb741ad0d80139d2725aa892192e40954f7eca2ca69336470fe0e625c36",
+        "build_trial.py": "44ba516a96871bcbee948c8b002f3e8440ca6e7cf3e03bfba2ac7de31903ee09",
+        "bare-arm64-probe.yml": "865bbd9bfcb9a1c665f45c674ee8d605fbc630c9a5b4b68e76b3c5e921a9955e",
+        "bare-checkpoint-transfer.yml": "b5e32fba220843108d1e081aca105650a95dfa94539c3d97e3a1ab822a9de285",
+    },
+}
+
 
 def kind(info):
     if stat.S_ISREG(info.st_mode):
@@ -536,6 +547,8 @@ def verify_provenance(path, ci_revision, base_image,
         expected = PRODUCTION_PREDECESSOR
         if record["identity"].get("ci_revision") == EXPANDED_PRODUCTION_PREDECESSOR["ci_revision"]:
             expected = EXPANDED_PRODUCTION_PREDECESSOR
+        elif record["identity"].get("ci_revision") == PRE_SNAPSHOT_PRODUCTION_PREDECESSOR["ci_revision"]:
+            expected = PRE_SNAPSHOT_PRODUCTION_PREDECESSOR
         mismatch = "The APK build permits migration only from an exact verified predecessor"
     if expected is not None:
         if (record["identity_sha256"] != expected["identity_sha256"]

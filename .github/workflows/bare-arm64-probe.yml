@@ -87,6 +87,11 @@ jobs:
       LEGACY_PRODUCTION_REV: ee7b3e891fa6bd76d9c0c2d3c02a9bb3622d92b0
       EXPANDED_PRODUCTION_KEY: bare-transfer-v2-42997174308-1-checkpoint-production
       EXPANDED_PRODUCTION_REV: 9ebb823d437f7e4928b54411d3e515849ff8d519
+      PRE_SNAPSHOT_KEY: bare-transfer-v2-43191406312-1-checkpoint-production
+      PRE_SNAPSHOT_BACKUP_KEY: bare-transfer-v2-43143109423-2-checkpoint-production
+      PRE_SNAPSHOT_REV: dd90eaab51159a716d7e0b6b2234b5f3e6995f56
+      UBUNTU_SNAPSHOT_URL: https://snapshot.ubuntu.com/ubuntu/20261112T093000Z
+      UBUNTU_GLIBC_VERSION: 2.35-0ubuntu3.15
       PRODUCTION_CAP_BYTES: '3489660928'
       EXPECTED_KEY: ${{ inputs.expected_checkpoint_key }}
     defaults:
@@ -142,6 +147,13 @@ jobs:
             elif [[ $EXPECTED_KEY == "$EXPANDED_PRODUCTION_KEY" ]]; then
               [[ $EXPECTED_SHA == 86d7b940ddde7d343e2924c38f2f52624e1c336f6d7dbef2c0f95961de1b1781 ]]
               [[ $EXPECTED_IDENTITY == 3301cb0743cded0e318d57adf22af8956fc3d8e58630c447d68cd912019b4bcc ]]
+            elif [[ $EXPECTED_KEY == "$PRE_SNAPSHOT_KEY" || $EXPECTED_KEY == "$PRE_SNAPSHOT_BACKUP_KEY" ]]; then
+              if [[ $EXPECTED_KEY == "$PRE_SNAPSHOT_KEY" ]]; then
+                [[ $EXPECTED_SHA == 1b5c7cdcaf2ab31277826797656d786ff8cd550062d1f7200ce6b3c16a9307c1 ]]
+              else
+                [[ $EXPECTED_SHA == d7322d77cc9fc3edd1473f67a2250c1f41b57151bc7e226095aa04f1e8a4e803 ]]
+              fi
+              [[ $EXPECTED_IDENTITY == 712454d9e8eb4ae9d798fd0f4a01e817f91f2d38533ab4071dc3ceaeb56af822 ]]
             else
               [[ $EXPECTED_KEY =~ ^bare-transfer-v2-[0-9]+-[0-9]+-checkpoint-production$ ]]
               [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_IDENTITY =~ ^[0-9a-f]{64}$ ]]
@@ -234,6 +246,13 @@ jobs:
             if parent_key == os.environ['EXPANDED_PRODUCTION_KEY']:
                 if (parents[0]['id'], parents[0]['size_in_bytes']) != (10356203698, 2008166401):
                     raise SystemExit('The expanded production predecessor receipt differs.')
+            snapshot_predecessors = {
+                os.environ['PRE_SNAPSHOT_KEY']: (10414697600, 2607203602),
+                os.environ['PRE_SNAPSHOT_BACKUP_KEY']: (10396601027, 2443967687),
+            }
+            if parent_key in snapshot_predecessors:
+                if (parents[0]['id'], parents[0]['size_in_bytes']) != snapshot_predecessors[parent_key]:
+                    raise SystemExit('The pre-snapshot production predecessor receipt differs.')
             candidate_bytes = int(os.environ.get('CANDIDATE_BYTES', str(cap)))
             if not 0 < candidate_bytes <= cap:
                 raise SystemExit('Candidate size is outside the production envelope.')
@@ -297,6 +316,8 @@ jobs:
             incoming_limits+=(--production)
             if [[ $EXPECTED_KEY == "$EXPANDED_PRODUCTION_KEY" ]]; then
               producer_revision=$EXPANDED_PRODUCTION_REV
+            elif [[ $EXPECTED_KEY == "$PRE_SNAPSHOT_KEY" || $EXPECTED_KEY == "$PRE_SNAPSHOT_BACKUP_KEY" ]]; then
+              producer_revision=$PRE_SNAPSHOT_REV
             fi
           fi
         fi
@@ -376,6 +397,9 @@ jobs:
         fi
         [[ $base_image =~ ^ubuntu@sha256:[0-9a-f]{64}$ ]]
         export BARE_BASE_IMAGE="$base_image"
+        if [[ $PROBE_MODE == checkpoint-production ]]; then
+          cp /etc/ssl/certs/ca-certificates.crt docker/bare-ci-apt-ca.pem
+        fi
         python3 - <<'PYTHON'
         import os
         from pathlib import Path
@@ -384,12 +408,31 @@ jobs:
         expected = 'FROM --platform=linux/amd64 ubuntu:22.04'
         if text.splitlines()[0] != expected or text.count(expected) != 1:
             raise SystemExit('Unexpected pinned Bare base image instruction.')
-        path.write_text(text.replace(expected, 'FROM --platform=linux/amd64 ' + os.environ['BARE_BASE_IMAGE'], 1))
+        text = text.replace(expected, 'FROM --platform=linux/amd64 ' + os.environ['BARE_BASE_IMAGE'], 1)
+        if os.environ['PROBE_MODE'] == 'checkpoint-production':
+            apt_install = 'RUN apt-get update \\\n    && apt-get install'
+            if text.count(apt_install) != 1:
+                raise SystemExit('Unexpected pinned Bare APT installation instruction.')
+            snapshot_url = os.environ['UBUNTU_SNAPSHOT_URL']
+            bootstrap = fr"""RUN --mount=type=bind,source=bare-ci-apt-ca.pem,target=/tmp/bare-ci-apt-ca.pem \
+            sed -Ei 's@http://(archive|security)\.ubuntu\.com/ubuntu/?@{snapshot_url}/@g' /etc/apt/sources.list \
+            && grep -qF 'deb {snapshot_url}/ jammy-updates ' /etc/apt/sources.list \
+            && grep -qF 'deb {snapshot_url}/ jammy-security ' /etc/apt/sources.list \
+            && apt-get -o Acquire::https::CAInfo=/tmp/bare-ci-apt-ca.pem -o APT::Update::Error-Mode=any update \
+            && apt-get -o Acquire::https::CAInfo=/tmp/bare-ci-apt-ca.pem install"""
+            text = text.replace(apt_install, bootstrap, 1)
+        path.write_text(text)
         PYTHON
         echo "BARE_BASE_IMAGE=$base_image" >> "$GITHUB_ENV"
         echo "base_image=$base_image" >> "$GITHUB_OUTPUT"
         bash builder.sh build
         bash builder.sh start
+        if [[ $PROBE_MODE == checkpoint-production ]]; then
+          for package in libc6:amd64 libc6-dev:amd64; do
+            actual=$(docker compose exec -T chromium-builder dpkg-query -W -f='${Version}' "$package")
+            [[ $actual == "$UBUNTU_GLIBC_VERSION" ]]
+          done
+        fi
         docker compose exec -T chromium-builder bash -seu <<'CONTAINER'
         id
         test -w /work
@@ -523,6 +566,8 @@ jobs:
           -e "EXPECTED_IDENTITY=$EXPECTED_IDENTITY" -e "REPAIR_LEGACY_INPUT_PATHS=$REPAIR_LEGACY_INPUT_PATHS" \
           -e "PROBE_MODE=$PROBE_MODE" -e "EXPECTED_KEY=$EXPECTED_KEY" -e "LEGACY_PRODUCTION_KEY=$LEGACY_PRODUCTION_KEY" \
           -e "EXPANDED_PRODUCTION_KEY=$EXPANDED_PRODUCTION_KEY" \
+          -e "PRE_SNAPSHOT_KEY=$PRE_SNAPSHOT_KEY" -e "PRE_SNAPSHOT_BACKUP_KEY=$PRE_SNAPSHOT_BACKUP_KEY" \
+          -e "UBUNTU_GLIBC_VERSION=$UBUNTU_GLIBC_VERSION" \
           -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 chromium-builder \
           timeout --kill-after=2m "${{ inputs.probe == 'checkpoint-production' && '26m' || '20m' }}" bash -seu <<'CONTAINER'
         set -o pipefail
@@ -538,6 +583,9 @@ jobs:
         fi
         python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint-input.tar.gz "${incoming_limits[@]}"
         if [[ $PROBE_MODE == checkpoint-production ]]; then
+          for package in libc6:amd64 libc6:i386 libc6-dev:amd64; do
+            [[ $(dpkg-query -W -f='${Version}' "$package") == "$UBUNTU_GLIBC_VERSION" ]]
+          done
           df -B1 /work /exchange /tmp
           df -Pi /work /exchange /tmp
           free=$(df -B1 --output=avail /work | awk 'NR == 2 { print $1 }')
@@ -551,7 +599,8 @@ jobs:
         [[ $PROBE_MODE != checkpoint-scale ]] || repair+=(--allow-scale-predecessor)
         [[ $PROBE_MODE != checkpoint-large ]] || repair+=(--allow-larger-predecessor)
         if [[ $PROBE_MODE == checkpoint-production &&
-            ( $EXPECTED_KEY == "$LEGACY_PRODUCTION_KEY" || $EXPECTED_KEY == "$EXPANDED_PRODUCTION_KEY" ) ]]; then
+            ( $EXPECTED_KEY == "$LEGACY_PRODUCTION_KEY" || $EXPECTED_KEY == "$EXPANDED_PRODUCTION_KEY" ||
+              $EXPECTED_KEY == "$PRE_SNAPSHOT_KEY" || $EXPECTED_KEY == "$PRE_SNAPSHOT_BACKUP_KEY" ) ]]; then
           repair+=(--allow-production-predecessor)
         fi
         [[ $REPAIR_LEGACY_INPUT_PATHS != true ]] || repair+=(--repair-legacy-input-paths)
