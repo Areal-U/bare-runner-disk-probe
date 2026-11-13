@@ -30,7 +30,7 @@ name: Bare checkpoint transfer probe
         description: Output estimate limit for this segment
         type: choice
         default: '11'
-        options: ['8', '9', '10', '11', '12']
+        options: ['8', '9', '10', '11', '12', '13', '14']
       jobs:
         description: Concurrent build actions
         type: choice

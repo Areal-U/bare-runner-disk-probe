@@ -90,9 +90,12 @@ jobs:
       PRE_SNAPSHOT_KEY: bare-transfer-v2-43191406312-1-checkpoint-production
       PRE_SNAPSHOT_BACKUP_KEY: bare-transfer-v2-43143109423-2-checkpoint-production
       PRE_SNAPSHOT_REV: dd90eaab51159a716d7e0b6b2234b5f3e6995f56
+      SNAPSHOT_PRODUCTION_KEY: bare-transfer-v2-43360178829-1-checkpoint-production
+      SNAPSHOT_PRODUCTION_BACKUP_KEY: bare-transfer-v2-43323220017-1-checkpoint-production
+      SNAPSHOT_PRODUCTION_REV: 2601b4b4eb11f53204450c4c9909c868a2df04fb
       UBUNTU_SNAPSHOT_URL: https://snapshot.ubuntu.com/ubuntu/20261112T093000Z
       UBUNTU_GLIBC_VERSION: 2.35-0ubuntu3.15
-      PRODUCTION_CAP_BYTES: '3489660928'
+      PRODUCTION_CAP_BYTES: '3758096384'
       EXPECTED_KEY: ${{ inputs.expected_checkpoint_key }}
     defaults:
       run:
@@ -139,7 +142,7 @@ jobs:
             [[ $GITHUB_REPOSITORY == Areal-U/bare-runner-disk-probe ]]
             [[ $EXPECTED_BASE == ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 ]]
             [[ $APK_RECIPIENT =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$ ]]
-            [[ $APK_OUTPUT_GIB =~ ^(8|9|10|11|12)$ ]]
+            [[ $APK_OUTPUT_GIB =~ ^(8|9|10|11|12|13|14)$ ]]
             [[ $APK_JOBS == 1 || $APK_JOBS == 2 ]]
             if [[ $EXPECTED_KEY == "$LEGACY_PRODUCTION_KEY" ]]; then
               [[ $EXPECTED_SHA == df07eee0870a0d5edc92de47a0a112d56ebb498d3c2bd0cf7229269a048e895b ]]
@@ -154,6 +157,13 @@ jobs:
                 [[ $EXPECTED_SHA == d7322d77cc9fc3edd1473f67a2250c1f41b57151bc7e226095aa04f1e8a4e803 ]]
               fi
               [[ $EXPECTED_IDENTITY == 712454d9e8eb4ae9d798fd0f4a01e817f91f2d38533ab4071dc3ceaeb56af822 ]]
+            elif [[ $EXPECTED_KEY == "$SNAPSHOT_PRODUCTION_KEY" || $EXPECTED_KEY == "$SNAPSHOT_PRODUCTION_BACKUP_KEY" ]]; then
+              if [[ $EXPECTED_KEY == "$SNAPSHOT_PRODUCTION_KEY" ]]; then
+                [[ $EXPECTED_SHA == d89b9a78abc6ee92a7ef95374b7238b60bb1d6f92e5615e7b6c56d129b59fd86 ]]
+              else
+                [[ $EXPECTED_SHA == 7b4f6ed453a856f74e2d6dc41faf7be91f9edffd2cbdf70db3485602b71711a2 ]]
+              fi
+              [[ $EXPECTED_IDENTITY == 5529d58104394e1cc51707851cd93d55599323bdff7aecea01c44f320675a8be ]]
             else
               [[ $EXPECTED_KEY =~ ^bare-transfer-v2-[0-9]+-[0-9]+-checkpoint-production$ ]]
               [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_IDENTITY =~ ^[0-9a-f]{64}$ ]]
@@ -249,14 +259,18 @@ jobs:
             snapshot_predecessors = {
                 os.environ['PRE_SNAPSHOT_KEY']: (10414697600, 2607203602),
                 os.environ['PRE_SNAPSHOT_BACKUP_KEY']: (10396601027, 2443967687),
+                os.environ['SNAPSHOT_PRODUCTION_KEY']: (10461022769, 3276023820),
+                os.environ['SNAPSHOT_PRODUCTION_BACKUP_KEY']: (10452675674, 2898187518),
             }
             if parent_key in snapshot_predecessors:
                 if (parents[0]['id'], parents[0]['size_in_bytes']) != snapshot_predecessors[parent_key]:
-                    raise SystemExit('The pre-snapshot production predecessor receipt differs.')
-            candidate_bytes = int(os.environ.get('CANDIDATE_BYTES', str(cap)))
-            if not 0 < candidate_bytes <= cap:
+                    raise SystemExit('The pinned production predecessor receipt differs.')
+            # The pack and upload checks both leave 1 MiB below the hard cap.
+            upload_limit = cap - 1024**2
+            candidate_bytes = int(os.environ.get('CANDIDATE_BYTES', str(upload_limit)))
+            if not 0 < candidate_bytes <= upload_limit:
                 raise SystemExit('Candidate size is outside the production envelope.')
-            reserve = candidate_bytes + gib
+            reserve = candidate_bytes + 768 * 1024**2
         elif mode in {'checkpoint-scale', 'checkpoint-large'}:
             expected = {
                 (10328651052, 'bare-transfer-v2-42928862523-1-checkpoint-seed', 'refs/heads/main', 293033682),
@@ -318,6 +332,8 @@ jobs:
               producer_revision=$EXPANDED_PRODUCTION_REV
             elif [[ $EXPECTED_KEY == "$PRE_SNAPSHOT_KEY" || $EXPECTED_KEY == "$PRE_SNAPSHOT_BACKUP_KEY" ]]; then
               producer_revision=$PRE_SNAPSHOT_REV
+            elif [[ $EXPECTED_KEY == "$SNAPSHOT_PRODUCTION_KEY" || $EXPECTED_KEY == "$SNAPSHOT_PRODUCTION_BACKUP_KEY" ]]; then
+              producer_revision=$SNAPSHOT_PRODUCTION_REV
             fi
           fi
         fi
@@ -567,6 +583,7 @@ jobs:
           -e "PROBE_MODE=$PROBE_MODE" -e "EXPECTED_KEY=$EXPECTED_KEY" -e "LEGACY_PRODUCTION_KEY=$LEGACY_PRODUCTION_KEY" \
           -e "EXPANDED_PRODUCTION_KEY=$EXPANDED_PRODUCTION_KEY" \
           -e "PRE_SNAPSHOT_KEY=$PRE_SNAPSHOT_KEY" -e "PRE_SNAPSHOT_BACKUP_KEY=$PRE_SNAPSHOT_BACKUP_KEY" \
+          -e "SNAPSHOT_PRODUCTION_KEY=$SNAPSHOT_PRODUCTION_KEY" -e "SNAPSHOT_PRODUCTION_BACKUP_KEY=$SNAPSHOT_PRODUCTION_BACKUP_KEY" \
           -e "UBUNTU_GLIBC_VERSION=$UBUNTU_GLIBC_VERSION" \
           -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 chromium-builder \
           timeout --kill-after=2m "${{ inputs.probe == 'checkpoint-production' && '26m' || '20m' }}" bash -seu <<'CONTAINER'
@@ -600,7 +617,8 @@ jobs:
         [[ $PROBE_MODE != checkpoint-large ]] || repair+=(--allow-larger-predecessor)
         if [[ $PROBE_MODE == checkpoint-production &&
             ( $EXPECTED_KEY == "$LEGACY_PRODUCTION_KEY" || $EXPECTED_KEY == "$EXPANDED_PRODUCTION_KEY" ||
-              $EXPECTED_KEY == "$PRE_SNAPSHOT_KEY" || $EXPECTED_KEY == "$PRE_SNAPSHOT_BACKUP_KEY" ) ]]; then
+              $EXPECTED_KEY == "$PRE_SNAPSHOT_KEY" || $EXPECTED_KEY == "$PRE_SNAPSHOT_BACKUP_KEY" ||
+              $EXPECTED_KEY == "$SNAPSHOT_PRODUCTION_KEY" || $EXPECTED_KEY == "$SNAPSHOT_PRODUCTION_BACKUP_KEY" ) ]]; then
           repair+=(--allow-production-predecessor)
         fi
         [[ $REPAIR_LEGACY_INPUT_PATHS != true ]] || repair+=(--repair-legacy-input-paths)
