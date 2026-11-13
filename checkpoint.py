@@ -39,8 +39,8 @@ SCALE_UNPACKED_BYTES = 3 * 1024 ** 3
 SCALE_ARCHIVE_MEMBERS = 150_000
 LARGE_UNPACKED_BYTES = 7 * 1024 ** 3
 LARGE_ARCHIVE_MEMBERS = 320_000
-PRODUCTION_ARCHIVE_BYTES = 13 * 1024 ** 3 // 4
-PRODUCTION_UNPACKED_BYTES = 13 * 1024 ** 3
+PRODUCTION_ARCHIVE_BYTES = 7 * 1024 ** 3 // 2
+PRODUCTION_UNPACKED_BYTES = 15 * 1024 ** 3
 PRODUCTION_ARCHIVE_MEMBERS = 550_000
 ANDROID_PACKAGING_SUFFIXES = {".apk", ".ap_", ".aab", ".apks"}
 GN_PACKAGING_INPUTS = {"apks/Trichrome.ssargs", "apks/Trichrome32.ssargs",
@@ -120,6 +120,17 @@ PRE_SNAPSHOT_PRODUCTION_PREDECESSOR = {
         "checkpoint.py": "295ebbb741ad0d80139d2725aa892192e40954f7eca2ca69336470fe0e625c36",
         "build_trial.py": "44ba516a96871bcbee948c8b002f3e8440ca6e7cf3e03bfba2ac7de31903ee09",
         "bare-arm64-probe.yml": "865bbd9bfcb9a1c665f45c674ee8d605fbc630c9a5b4b68e76b3c5e921a9955e",
+        "bare-checkpoint-transfer.yml": "b5e32fba220843108d1e081aca105650a95dfa94539c3d97e3a1ab822a9de285",
+    },
+}
+
+SNAPSHOT_PRODUCTION_PREDECESSOR = {
+    "ci_revision": "2601b4b4eb11f53204450c4c9909c868a2df04fb",
+    "identity_sha256": "5529d58104394e1cc51707851cd93d55599323bdff7aecea01c44f320675a8be",
+    "ci_files": {
+        "checkpoint.py": "283bd85b45c8e2ae2979879e0e9ef72b6c64597123e73c981afee65c82a08966",
+        "build_trial.py": "44ba516a96871bcbee948c8b002f3e8440ca6e7cf3e03bfba2ac7de31903ee09",
+        "bare-arm64-probe.yml": "7089686f864c092641f8eb77604ca8b274a53a077e0ac0b4df705d6af0465118",
         "bare-checkpoint-transfer.yml": "b5e32fba220843108d1e081aca105650a95dfa94539c3d97e3a1ab822a9de285",
     },
 }
@@ -544,12 +555,14 @@ def verify_provenance(path, ci_revision, base_image,
         expected = LARGER_PREDECESSOR
         mismatch = "The larger probe permits only the exact recorded scale predecessor"
     elif allow_production_predecessor:
-        expected = PRODUCTION_PREDECESSOR
-        if record["identity"].get("ci_revision") == EXPANDED_PRODUCTION_PREDECESSOR["ci_revision"]:
-            expected = EXPANDED_PRODUCTION_PREDECESSOR
-        elif record["identity"].get("ci_revision") == PRE_SNAPSHOT_PRODUCTION_PREDECESSOR["ci_revision"]:
-            expected = PRE_SNAPSHOT_PRODUCTION_PREDECESSOR
         mismatch = "The APK build permits migration only from an exact verified predecessor"
+        revision = record["identity"].get("ci_revision")
+        expected = next((producer for producer in (
+            PRODUCTION_PREDECESSOR, EXPANDED_PRODUCTION_PREDECESSOR,
+            PRE_SNAPSHOT_PRODUCTION_PREDECESSOR, SNAPSHOT_PRODUCTION_PREDECESSOR,
+        ) if producer["ci_revision"] == revision), None)
+        if expected is None:
+            raise ValueError(mismatch)
     if expected is not None:
         if (record["identity_sha256"] != expected["identity_sha256"]
                 or record["identity"].get("ci_revision") != expected["ci_revision"]
