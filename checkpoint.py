@@ -254,7 +254,7 @@ def input_relative(value):
 
     Linux input trees may contain literal backslashes and control characters.
     They are ordinary filename characters here; only '/' separates components.
-    Keep the stricter safe_relative policy for command targets and archives.
+    Command targets and archive members have their own path checks.
     """
     diagnostic = repr(value)[:160]
     if not isinstance(value, str) or not value or "\x00" in value:
@@ -912,7 +912,7 @@ def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=F
         for member in archive:
             name = member.name
             if production and is_android_packaging(archive_relative(name)):
-                raise ValueError("Public checkpoint contains Android packaging output: " + name)
+                raise ValueError("Public checkpoint contains Android packaging output: " + ascii(name)[:200])
             if name not in expected:
                 continue
             item = expected[name]
@@ -997,11 +997,19 @@ def canonicalize_logs(source_root=ROOTS["src"], max_file_bytes=32 * 1024 * 1024,
 
 
 def archive_relative(name):
+    # GNU tar extracts these archives on Linux, where only '/' separates path
+    # components. Backslashes and control characters are literal name bytes.
+    if not name or "\x00" in name:
+        raise ValueError("Invalid checkpoint archive path: " + ascii(name)[:200])
+    original_name = name
     while name.startswith("./"):
         name = name[2:]
-    relative = safe_relative(name.rstrip("/"))
+    name = name.rstrip("/")
+    relative = PurePosixPath(name)
+    if not name or relative.is_absolute() or ".." in relative.parts or relative.as_posix() != name:
+        raise ValueError("Unsafe checkpoint archive path: " + ascii(original_name)[:200])
     if relative.parts[:2] != ("out", "Bare"):
-        raise ValueError("Checkpoint archive member is outside out/Bare")
+        raise ValueError("Checkpoint archive path is outside out/Bare: " + ascii(original_name)[:200])
     return relative
 
 
@@ -1020,7 +1028,7 @@ def validate_archive(archive_path, max_archive_bytes=1024 ** 3,
             relative = archive_relative(member.name)
             name = relative.as_posix()
             if exclude_android_packaging and is_android_packaging(relative):
-                raise ValueError("Public checkpoint contains Android packaging output: " + name)
+                raise ValueError("Public checkpoint contains Android packaging output: " + ascii(name)[:200])
             if name in members:
                 raise ValueError("Checkpoint archive contains a duplicate member")
             if not (member.isdir() or member.isfile() or member.issym() or member.islnk()):
@@ -1040,8 +1048,10 @@ def validate_archive(archive_path, max_archive_bytes=1024 ** 3,
                 raise ValueError("Checkpoint archive exceeds the bounded extraction limit")
             if member.issym() or member.islnk():
                 target = member.linkname
-                if not target or "\x00" in target or "\\" in target or target.startswith("/"):
-                    raise ValueError("Unsafe checkpoint archive link target")
+                if (not target or "\\" in target or target.startswith("/")
+                        or any(ord(character) < 32 or ord(character) == 127 for character in target)):
+                    raise ValueError("Unsafe checkpoint archive link target: "
+                                     + ascii(name)[:200] + " -> " + ascii(target)[:200])
                 if member.issym():
                     target = posixpath.join(relative.parent.as_posix(), target)
                     symlinks[name] = member.linkname
@@ -1049,7 +1059,8 @@ def validate_archive(archive_path, max_archive_bytes=1024 ** 3,
                     hardlinks[name] = posixpath.normpath(target)
                 target_path = archive_relative(posixpath.normpath(target))
                 if exclude_android_packaging and is_android_packaging(target_path):
-                    raise ValueError("Public checkpoint contains a link to Android packaging output: " + name)
+                    raise ValueError("Public checkpoint contains a link to Android packaging output: "
+                                     + ascii(name)[:200])
     if "out/Bare" not in members:
         raise ValueError("Checkpoint archive root is missing")
     if exclude_android_packaging and gn_dependencies is None:
@@ -1082,7 +1093,8 @@ def validate_archive(archive_path, max_archive_bytes=1024 ** 3,
                 resolved.pop()
                 pending = symlinks[current].split("/") + pending
         if exclude_android_packaging and is_android_packaging(PurePosixPath(*resolved)):
-            raise ValueError("Public checkpoint contains a symlink to Android packaging output: " + name)
+            raise ValueError("Public checkpoint contains a symlink to Android packaging output: "
+                             + ascii(name)[:200])
     for target in hardlinks.values():
         followed = set()
         while target in hardlinks:
