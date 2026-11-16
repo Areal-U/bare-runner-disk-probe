@@ -40,7 +40,7 @@ SCALE_ARCHIVE_MEMBERS = 150_000
 LARGE_UNPACKED_BYTES = 7 * 1024 ** 3
 LARGE_ARCHIVE_MEMBERS = 320_000
 PRODUCTION_ARCHIVE_BYTES = 7 * 1024 ** 3 // 2
-PRODUCTION_UNPACKED_BYTES = 15 * 1024 ** 3
+PRODUCTION_UNPACKED_BYTES = 19 * 1024 ** 3
 PRODUCTION_ARCHIVE_MEMBERS = 550_000
 ANDROID_PACKAGING_SUFFIXES = {".apk", ".ap_", ".aab", ".apks"}
 GN_PACKAGING_INPUTS = {"apks/Trichrome.ssargs", "apks/Trichrome32.ssargs",
@@ -132,6 +132,17 @@ SNAPSHOT_PRODUCTION_PREDECESSOR = {
         "build_trial.py": "44ba516a96871bcbee948c8b002f3e8440ca6e7cf3e03bfba2ac7de31903ee09",
         "bare-arm64-probe.yml": "7089686f864c092641f8eb77604ca8b274a53a077e0ac0b4df705d6af0465118",
         "bare-checkpoint-transfer.yml": "b5e32fba220843108d1e081aca105650a95dfa94539c3d97e3a1ab822a9de285",
+    },
+}
+
+FINAL_LINK_PRODUCTION_PREDECESSOR = {
+    "ci_revision": "f0695d66e60385f869d101d3b535ee241373f28c",
+    "identity_sha256": "48072b06b2f4a0a059603abd3d7ce154479d44e991a8ebb79306d2fa0304b639",
+    "ci_files": {
+        "checkpoint.py": "5c152c6aabd377686b08088da465a575e7c80fb3d0c027ebca04a98c112f62e3",
+        "build_trial.py": "31b00801e741b4bd2cb6456e7ddd3f19b1bb07e8e7bb28bb07123927bec8bf53",
+        "bare-arm64-probe.yml": "58375380d6ca11f5aff6060d32df57b2bc1793598e0e8ca1a4aad70e68ce7292",
+        "bare-checkpoint-transfer.yml": "42a694501393db245bc0a902d4bdbd31db12ed7c1cb0f9e9a9460b6fac07f420",
     },
 }
 
@@ -560,6 +571,7 @@ def verify_provenance(path, ci_revision, base_image,
         expected = next((producer for producer in (
             PRODUCTION_PREDECESSOR, EXPANDED_PRODUCTION_PREDECESSOR,
             PRE_SNAPSHOT_PRODUCTION_PREDECESSOR, SNAPSHOT_PRODUCTION_PREDECESSOR,
+            FINAL_LINK_PRODUCTION_PREDECESSOR,
         ) if producer["ci_revision"] == revision), None)
         if expected is None:
             raise ValueError(mismatch)
