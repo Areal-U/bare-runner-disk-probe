@@ -1,4 +1,4 @@
-name: Bare ARM64 compile and checkpoint probe
+name: Bare Personal ARM64 checkpoint build
 'on':
   workflow_call:
     inputs:
@@ -17,6 +17,9 @@ name: Bare ARM64 compile and checkpoint probe
       expected_base_image:
         type: string
         default: ''
+      coexist_cold:
+        type: boolean
+        default: false
       repair_legacy_input_paths:
         type: boolean
         default: false
@@ -59,12 +62,12 @@ name: Bare ARM64 compile and checkpoint probe
 permissions: {}
 jobs:
   compile-probe:
-    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' && github.ref == 'refs/heads/main'
+    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' && github.ref == 'refs/heads/bare-coexist-v2.0.4' && inputs.probe == 'checkpoint-production'
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ inputs.probe == 'checkpoint-production' && 350 || inputs.probe == 'checkpoint-large' && 250 || inputs.probe == 'checkpoint-scale' && 190 || 120 }}
     concurrency:
-      group: bare-arm64-compile-probe
+      group: bare-coexist-204-compile
       cancel-in-progress: false
     outputs:
       checkpoint_key: ${{ steps.identity.outputs.key }}
@@ -77,11 +80,12 @@ jobs:
       apk_encrypted_sha: ${{ steps.apk_seal.outputs.sha }}
       apk_encrypted_bytes: ${{ steps.apk_seal.outputs.bytes }}
     env:
-      BARE_REV: e776f77629bb915e0f3df63449f1f993cc1b0648
-      CHROMIUM_REV: 2f9a11097447f226133bc1a31c787291a5eeab98
+      BARE_REV: 21cb542601950cbd5ee2eddcad6a9163bdf5ea99
+      CHROMIUM_REV: 800628ad1ca1fd0c51e3b43b5b2bca081e81c3f6
       DEPOT_REV: 96a7c1418eedaa6bea333a8941e8a0078681b4d0
       GIT_TERMINAL_PROMPT: '0'
       PROBE_MODE: ${{ inputs.probe }}
+      COEXIST_COLD: ${{ inputs.coexist_cold && 'true' || 'false' }}
       REPAIR_LEGACY_INPUT_PATHS: ${{ inputs.repair_legacy_input_paths && 'true' || 'false' }}
       LEGACY_PRODUCTION_KEY: bare-transfer-v2-42973841138-1-checkpoint-large
       LEGACY_PRODUCTION_REV: ee7b3e891fa6bd76d9c0c2d3c02a9bb3622d92b0
@@ -119,87 +123,25 @@ jobs:
           echo 'Expected a manually started GitHub-hosted x64 runner.' >&2
           exit 1
         fi
-        case "$PROBE_MODE" in
-          smoke|checkpoint-seed) ;;
-          checkpoint-restore)
-            [[ $EXPECTED_KEY =~ ^bare-transfer-v2-[0-9]+-[0-9]+-checkpoint-seed$ ]]
-            [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_IDENTITY =~ ^[0-9a-f]{64}$ ]]
-            [[ $EXPECTED_BASE =~ ^ubuntu@sha256:[0-9a-f]{64}$ ]]
-            ;;
-          checkpoint-scale)
-            [[ $GITHUB_REPOSITORY == Areal-U/bare-runner-disk-probe ]]
-            [[ $EXPECTED_KEY == bare-transfer-v2-42950651335-1-checkpoint-restore ]]
-            [[ $EXPECTED_SHA == 0fec6f756b98561191ef3199f86d965b5fe5b58146bcdb64b51f348f0aeab9a3 ]]
-            [[ $EXPECTED_IDENTITY == 87c8946d20f1f0f97d494c21291b1bb1865772084f0e1a09577414007c3ae170 ]]
-            [[ $EXPECTED_BASE == ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 ]]
-            ;;
-          checkpoint-large)
-            [[ $GITHUB_REPOSITORY == Areal-U/bare-runner-disk-probe ]]
-            [[ $EXPECTED_KEY == bare-transfer-v2-42963667278-1-checkpoint-scale ]]
-            [[ $EXPECTED_SHA == 62a4793fcbe6e25509d202ac6f180b2ab85c6f52b06f3acaedb4f0aaaf159b72 ]]
-            [[ $EXPECTED_IDENTITY == 5a1826fb351f149a8a4132fb21d80acba90d937131ce211c8c0b13d79970a966 ]]
-            [[ $EXPECTED_BASE == ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 ]]
-            ;;
-          checkpoint-production)
-            [[ $GITHUB_REPOSITORY == Areal-U/bare-runner-disk-probe ]]
-            [[ $EXPECTED_BASE == ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 ]]
-            [[ $APK_RECIPIENT =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$ ]]
-            [[ $APK_OUTPUT_GIB =~ ^(8|9|10|11|12|13|14|18)$ ]]
-            if [[ $APK_OUTPUT_GIB == 18 ]]; then
-              [[ $EXPECTED_KEY == "$FINAL_LINK_PRODUCTION_KEY" ]]
-            fi
-            [[ $APK_JOBS == 1 || $APK_JOBS == 2 ]]
-            if [[ $EXPECTED_KEY == "$LEGACY_PRODUCTION_KEY" ]]; then
-              [[ $EXPECTED_SHA == df07eee0870a0d5edc92de47a0a112d56ebb498d3c2bd0cf7229269a048e895b ]]
-              [[ $EXPECTED_IDENTITY == c4c736ec4c7f02a1c409f4fbe5919731bc5022d70edf512e17928eb81f2436f9 ]]
-            elif [[ $EXPECTED_KEY == "$EXPANDED_PRODUCTION_KEY" ]]; then
-              [[ $EXPECTED_SHA == 86d7b940ddde7d343e2924c38f2f52624e1c336f6d7dbef2c0f95961de1b1781 ]]
-              [[ $EXPECTED_IDENTITY == 3301cb0743cded0e318d57adf22af8956fc3d8e58630c447d68cd912019b4bcc ]]
-            elif [[ $EXPECTED_KEY == "$PRE_SNAPSHOT_KEY" || $EXPECTED_KEY == "$PRE_SNAPSHOT_BACKUP_KEY" ]]; then
-              if [[ $EXPECTED_KEY == "$PRE_SNAPSHOT_KEY" ]]; then
-                [[ $EXPECTED_SHA == 1b5c7cdcaf2ab31277826797656d786ff8cd550062d1f7200ce6b3c16a9307c1 ]]
-              else
-                [[ $EXPECTED_SHA == d7322d77cc9fc3edd1473f67a2250c1f41b57151bc7e226095aa04f1e8a4e803 ]]
-              fi
-              [[ $EXPECTED_IDENTITY == 712454d9e8eb4ae9d798fd0f4a01e817f91f2d38533ab4071dc3ceaeb56af822 ]]
-            elif [[ $EXPECTED_KEY == "$SNAPSHOT_PRODUCTION_KEY" || $EXPECTED_KEY == "$SNAPSHOT_PRODUCTION_BACKUP_KEY" ]]; then
-              if [[ $EXPECTED_KEY == "$SNAPSHOT_PRODUCTION_KEY" ]]; then
-                [[ $EXPECTED_SHA == d89b9a78abc6ee92a7ef95374b7238b60bb1d6f92e5615e7b6c56d129b59fd86 ]]
-              else
-                [[ $EXPECTED_SHA == 7b4f6ed453a856f74e2d6dc41faf7be91f9edffd2cbdf70db3485602b71711a2 ]]
-              fi
-              [[ $EXPECTED_IDENTITY == 5529d58104394e1cc51707851cd93d55599323bdff7aecea01c44f320675a8be ]]
-            elif [[ $EXPECTED_KEY == "$FINAL_LINK_PRODUCTION_KEY" ]]; then
-              [[ $EXPECTED_SHA == 318818efc10e8bcb888fb88618c7ee3e87f15ce8322d3092a2f0db244cac4421 ]]
-              [[ $EXPECTED_IDENTITY == 48072b06b2f4a0a059603abd3d7ce154479d44e991a8ebb79306d2fa0304b639 ]]
-            else
-              [[ $EXPECTED_KEY =~ ^bare-transfer-v2-[0-9]+-[0-9]+-checkpoint-production$ ]]
-              [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_IDENTITY =~ ^[0-9a-f]{64}$ ]]
-            fi
-            ;;
-          *) echo 'Only smoke and the bounded two-job checkpoint probe are enabled. The old logs-only APK mode is disabled.' >&2; exit 1 ;;
-        esac
-        if [[ $REPAIR_LEGACY_INPUT_PATHS == true ]]; then
-          [[ $PROBE_MODE == checkpoint-restore ]]
-          [[ $EXPECTED_KEY == bare-transfer-v2-42928862523-1-checkpoint-seed ]]
-          [[ $EXPECTED_SHA == d03e5ce8221691eec57a5610050931af5d117fe8bb61785f0c93ac89a2676d37 ]]
-          [[ $EXPECTED_IDENTITY == fc3b4584696b8239bfc3b04db9490e3c0b722b62b81c54c772b96f27543a8896 ]]
-          [[ $EXPECTED_BASE == ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 ]]
+        [[ $PROBE_MODE == checkpoint-production && $GITHUB_REPOSITORY == Areal-U/bare-runner-disk-probe ]]
+        [[ $EXPECTED_BASE == ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 ]]
+        [[ $APK_RECIPIENT =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$ ]]
+        [[ $APK_OUTPUT_GIB == 18 && ( $APK_JOBS == 1 || $APK_JOBS == 2 ) ]]
+        [[ $REPAIR_LEGACY_INPUT_PATHS == false ]]
+        if [[ $COEXIST_COLD == true ]]; then
+          [[ -z $EXPECTED_KEY && -z $EXPECTED_SHA && -z $EXPECTED_IDENTITY ]]
         else
-          [[ $REPAIR_LEGACY_INPUT_PATHS == false ]]
+          [[ $COEXIST_COLD == false ]]
+          [[ $EXPECTED_KEY =~ ^bare-coexist-204-[0-9]+-[0-9]+-checkpoint-production$ ]]
+          [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_IDENTITY =~ ^[0-9a-f]{64}$ ]]
         fi
-        if [[ $PROBE_MODE == smoke || $PROBE_MODE == checkpoint-seed ]]; then
-          [[ -z $EXPECTED_KEY && -z $EXPECTED_SHA && -z $EXPECTED_IDENTITY && -z $EXPECTED_BASE ]]
-        fi
-        if [[ $PROBE_MODE == checkpoint-* ]]; then
-          echo "key=bare-transfer-v2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$PROBE_MODE" >> "$GITHUB_OUTPUT"
-        fi
+        echo "key=bare-coexist-204-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-checkpoint-production" >> "$GITHUB_OUTPUT"
     - name: Load the exact CI code before costly preparation
       if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
       timeout-minutes: 5
       run: |
         mkdir -p "$RUNNER_TEMP/bare-ci"
-        for file in checkpoint.py build_trial.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+        for file in checkpoint.py build_trial.py coexist_inputs.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
           source=$file
           [[ $file != *.yml ]] || source=".github/workflows/$file"
           curl --fail --location --retry 2 --max-time 60 \
@@ -247,77 +189,18 @@ jobs:
                 break
         else:
             raise SystemExit('Cannot bound cache inventory; stopping before compilation.')
-        checkpoints = [item for item in caches if item['key'].startswith('bare-transfer-v2-')]
         gib = 1024**3
         limit_bytes = 10 * gib
-        mode = os.environ['PROBE_MODE']
-        if mode == 'checkpoint-production':
-            parent_key = os.environ['EXPECTED_KEY']
-            parents = [item for item in checkpoints
-                       if item['key'] == parent_key and item['ref'] == 'refs/heads/main']
-            cap = int(os.environ['PRODUCTION_CAP_BYTES'])
+        cap = int(os.environ['PRODUCTION_CAP_BYTES'])
+        candidate_bytes = int(os.environ.get('CANDIDATE_BYTES', str(cap - 1024**2)))
+        if not 0 < candidate_bytes <= cap - 1024**2:
+            raise SystemExit('Candidate size is outside the production envelope.')
+        if os.environ['COEXIST_COLD'] != 'true':
+            parents = [item for item in caches
+                       if item['key'] == os.environ['EXPECTED_KEY'] and item['ref'] == os.environ['GITHUB_REF']]
             if len(parents) != 1 or not 0 < parents[0]['size_in_bytes'] <= cap:
                 raise SystemExit('The exact selected checkpoint is absent or outside the production envelope.')
-            if parent_key == os.environ['LEGACY_PRODUCTION_KEY']:
-                if (parents[0]['id'], parents[0]['size_in_bytes']) != (10344233799, 1231546287):
-                    raise SystemExit('The initial checkpoint receipt differs.')
-            if parent_key == os.environ['EXPANDED_PRODUCTION_KEY']:
-                if (parents[0]['id'], parents[0]['size_in_bytes']) != (10356203698, 2008166401):
-                    raise SystemExit('The expanded production predecessor receipt differs.')
-            snapshot_predecessors = {
-                os.environ['PRE_SNAPSHOT_KEY']: (10414697600, 2607203602),
-                os.environ['PRE_SNAPSHOT_BACKUP_KEY']: (10396601027, 2443967687),
-                os.environ['SNAPSHOT_PRODUCTION_KEY']: (10461022769, 3276023820),
-                os.environ['SNAPSHOT_PRODUCTION_BACKUP_KEY']: (10452675674, 2898187518),
-                os.environ['FINAL_LINK_PRODUCTION_KEY']: (10573514137, 3487829992),
-            }
-            if parent_key in snapshot_predecessors:
-                if (parents[0]['id'], parents[0]['size_in_bytes']) != snapshot_predecessors[parent_key]:
-                    raise SystemExit('The pinned production predecessor receipt differs.')
-            # The pack and upload checks both leave 1 MiB below the hard cap.
-            upload_limit = cap - 1024**2
-            candidate_bytes = int(os.environ.get('CANDIDATE_BYTES', str(upload_limit)))
-            if not 0 < candidate_bytes <= upload_limit:
-                raise SystemExit('Candidate size is outside the production envelope.')
-            reserve_mib = 768
-            if parent_key == os.environ['FINAL_LINK_PRODUCTION_KEY'] and os.environ['APK_OUTPUT_GIB'] == '18':
-                backup_key = os.environ['SNAPSHOT_PRODUCTION_KEY']
-                retained = {(item['id'], item['key'], item['ref'], item['size_in_bytes']) for item in caches}
-                expected = {
-                    (snapshot_predecessors[key][0], key, 'refs/heads/main', snapshot_predecessors[key][1])
-                    for key in (parent_key, backup_key)
-                }
-                saved_key = os.environ.get('SAVED_CHECKPOINT_KEY')
-                if saved_key:
-                    successors = [entry for entry in retained
-                                  if entry[1:3] == (saved_key, 'refs/heads/main') and 0 < entry[3] <= cap]
-                    if len(successors) != 1:
-                        raise SystemExit('The saved final-link successor could not be confirmed.')
-                    expected.add(successors[0])
-                    candidate_bytes = 0  # The saved bytes are already in the live usage.
-                if len(caches) != len(expected) or retained != expected:
-                    raise SystemExit('The final link requires the exact parent, backup and any just-saved successor.')
-                reserve_mib = 128
-            reserve = candidate_bytes + reserve_mib * 1024**2
-        elif mode in {'checkpoint-scale', 'checkpoint-large'}:
-            expected = {
-                (10328651052, 'bare-transfer-v2-42928862523-1-checkpoint-seed', 'refs/heads/main', 293033682),
-                (10334906371, 'bare-transfer-v2-42950651335-1-checkpoint-restore', 'refs/heads/main', 353327569),
-            }
-            if mode == 'checkpoint-large':
-                expected.add((10338246659, 'bare-transfer-v2-42963667278-1-checkpoint-scale', 'refs/heads/main', 570920535))
-            observed = {(item['id'], item['key'], item['ref'], item['size_in_bytes']) for item in checkpoints}
-            if len(checkpoints) != len(expected) or observed != expected:
-                raise SystemExit('The one-continuation trial requires its exact retained generations.')
-            candidate_bytes = int(os.environ.get('CANDIDATE_BYTES', '2952790016'))
-            if not 0 < candidate_bytes <= 2952790016:
-                raise SystemExit('Scale candidate size is outside the measured trial envelope.')
-            reserve = candidate_bytes + gib
-        else:
-            limit = 0 if os.environ['PROBE_MODE'] == 'checkpoint-seed' else 1
-            if len(checkpoints) > limit:
-                raise SystemExit('The two-generation experiment limit is reached; keep existing checkpoints.')
-            reserve = 3 * gib
+        reserve = candidate_bytes + 128 * 1024**2
         used = max(usage['active_caches_size_in_bytes'], sum(item['size_in_bytes'] for item in caches))
         if used + reserve > limit_bytes:
             raise SystemExit('Insufficient cache headroom; retain existing checkpoints and choose storage first.')
@@ -326,14 +209,14 @@ jobs:
         python3 "$RUNNER_TEMP/bare-ci/check-cache-budget.py"
     - name: Restore the producer key exactly, including on a consumer-only rerun
       id: restore-checkpoint
-      if: ${{ startsWith(inputs.probe, 'checkpoint-') && inputs.probe != 'checkpoint-seed' }}
+      if: ${{ startsWith(inputs.probe, 'checkpoint-') && inputs.probe != 'checkpoint-seed' && !inputs.coexist_cold }}
       uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
       with:
         path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
         key: ${{ inputs.expected_checkpoint_key }}
         fail-on-cache-miss: true
     - name: Validate the received archive before checkout
-      if: ${{ startsWith(inputs.probe, 'checkpoint-') && inputs.probe != 'checkpoint-seed' }}
+      if: ${{ startsWith(inputs.probe, 'checkpoint-') && inputs.probe != 'checkpoint-seed' && !inputs.coexist_cold }}
       timeout-minutes: ${{ inputs.probe == 'checkpoint-production' && 15 || inputs.probe == 'checkpoint-large' && 10 || inputs.probe == 'checkpoint-scale' && 7 || 4 }}
       env:
         CACHE_HIT: ${{ steps.restore-checkpoint.outputs.cache-hit }}
@@ -419,14 +302,12 @@ jobs:
         [[ $(git rev-parse HEAD) == "$BARE_REV" ]]
         shopt -s nullglob
         patches=(patches/*.patch)
-        [[ ${#patches[@]} == 296 ]]
+        [[ ${#patches[@]} == 313 ]]
         cp -R patches exchange/
         crx=third_party/ublock_origin/uBlockOrigin-1.75.0.crx
         printf '%s  %s\n' d688ed3f0262ec4f8bdcd4c8f65987c5444c560aeb387a9e02aca1facdfa7046 "$crx" | sha256sum --check --strict
         cp "$crx" exchange/ublock_origin.crx
-        awk '/^```gn$/ { gn = 1; next } gn && /^```$/ { exit } gn { print }' docs/build-from-source.md > exchange/args.gn
-        printf '%s  %s\n' 6fb681205a50bf9b20d6c1f18a4dd5708bcd99cfc258e577069442a8be2114ab exchange/args.gn | sha256sum --check --strict
-        [[ $(python3 tools/version.py gn arm64) == "$(grep '^android_override_version_' exchange/args.gn)" ]]
+        python3 "$RUNNER_TEMP/bare-ci/coexist_inputs.py" gn --bare-root "$PWD" --output exchange/args.gn
 
         if [[ $PROBE_MODE == checkpoint-* ]]; then
           cp "$RUNNER_TEMP/bare-ci/"*.py "$RUNNER_TEMP/bare-ci/"*.yml exchange/
@@ -515,11 +396,11 @@ jobs:
         chmod 0644 "$fixture/input.tar.gz"
         digest=$(sha256sum "$fixture/input.tar.gz")
         docker compose exec -T -e "FIXTURE=/exchange/checkpoint/${fixture##*/}" \
-          -e "RUNNER_UID=$(id -u)" -e "PROBE_MODE=$PROBE_MODE" chromium-builder bash -seu <<'CONTAINER'
+          -e "RUNNER_UID=$(id -u)" -e "PROBE_MODE=$PROBE_MODE" -e "COEXIST_COLD=$COEXIST_COLD" chromium-builder bash -seu <<'CONTAINER'
         set -o pipefail
         [[ $(id -u) != "$RUNNER_UID" ]]
         [[ -r $FIXTURE/input.tar.gz && ! -w $FIXTURE/input.tar.gz ]]
-        if [[ $PROBE_MODE != checkpoint-seed ]]; then
+        if [[ $COEXIST_COLD != true ]]; then
           [[ -f /exchange/checkpoint/checkpoint-input.tar.gz && -r /exchange/checkpoint/checkpoint-input.tar.gz ]]
         fi
         tar -tzf "$FIXTURE/input.tar.gz" > /dev/null
@@ -585,13 +466,16 @@ jobs:
         PROBE_MODE: ${{ inputs.probe }}
       run: |
         cd "$RUNNER_TEMP/bare-official"
-        docker compose exec -T -e GIT_TERMINAL_PROMPT=0 -e "PROBE_MODE=$PROBE_MODE" chromium-builder \
+        docker compose exec -T -e GIT_TERMINAL_PROMPT=0 -e "PROBE_MODE=$PROBE_MODE" -e "COEXIST_COLD=$COEXIST_COLD" -e "UBUNTU_GLIBC_VERSION=$UBUNTU_GLIBC_VERSION" chromium-builder \
           timeout --kill-after=2m 30m bash -seu <<'CONTAINER'
         set -o pipefail
         export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
         cd /work/chromium/src
         echo 'Installing Chromium build dependencies'
         ./build/install-build-deps.sh --android --no-prompt
+        for package in libc6:amd64 libc6:i386 libc6-dev:amd64; do
+          [[ $(dpkg-query -W -f='${Version}' "$package") == "$UBUNTU_GLIBC_VERSION" ]]
+        done
         echo 'Running Chromium checkout hooks'
         gclient runhooks
         if [[ $PROBE_MODE == checkpoint-production ]]; then
@@ -610,17 +494,19 @@ jobs:
         df -B1 /work
         echo 'Applying the official Bare patch series'
         git apply --index /exchange/patches/*.patch
+        python3 /exchange/coexist_inputs.py label --chromium-src "$PWD"
+        git add -- chrome/android/java/res_chromium_base/values/channel_constants.xml
         mkdir -p chrome/browser/resources/bare out/Bare
         cp /exchange/ublock_origin.crx chrome/browser/resources/bare/ublock_origin.crx
         cp /exchange/args.gn out/Bare/args.gn
-        if [[ $PROBE_MODE != checkpoint-production ]]; then
+        if [[ $COEXIST_COLD == true ]]; then
           echo 'Generating ARM64 build rules'
           gn gen out/Bare
         fi
         df -B1 /work
         CONTAINER
     - name: Verify restored inputs and completed targets
-      if: ${{ startsWith(inputs.probe, 'checkpoint-') && inputs.probe != 'checkpoint-seed' }}
+      if: ${{ startsWith(inputs.probe, 'checkpoint-') && inputs.probe != 'checkpoint-seed' && !inputs.coexist_cold }}
       timeout-minutes: ${{ inputs.probe == 'checkpoint-production' && 29 || 23 }}
       env:
         EXPECTED_IDENTITY: ${{ inputs.expected_checkpoint_identity }}
@@ -792,7 +678,7 @@ jobs:
           exit 1
         fi
         phase=seed
-        [[ $PROBE_MODE == checkpoint-seed ]] || phase=restore
+        [[ $COEXIST_COLD == true ]] || phase=restore
         trial_timeout=9m
         kill_after=2m
         compile_seconds=0
@@ -885,13 +771,17 @@ jobs:
       timeout-minutes: 12
       env:
         APK_RECIPIENT: ${{ inputs.apk_recipient }}
+        TRIAL_PHASE: ${{ steps.trial.outputs.phase }}
       run: |
         set -euo pipefail
         cd "$RUNNER_TEMP/bare-official"
-        terminal=$(docker compose exec -T chromium-builder python3 - <<'PYTHON'
+        terminal=$(docker compose exec -T -e "TRIAL_PHASE=$TRIAL_PHASE" chromium-builder python3 - <<'PYTHON'
         import json
+        import os
         from pathlib import Path
-        report = Path('/exchange/checkpoint/trial-restore.json')
+        phase = os.environ['TRIAL_PHASE']
+        assert phase in ('seed', 'restore')
+        report = Path(f'/exchange/checkpoint/trial-{phase}.json')
         data = json.loads(report.read_text(encoding='utf-8')) if report.is_file() else {}
         print('true' if data.get('reason') == 'completed' else 'false')
         PYTHON
@@ -908,8 +798,8 @@ jobs:
         mkdir -m 700 "$final_dir"
         [[ $APK_RECIPIENT =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$ ]]
         docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CHROMIUM_REV=$CHROMIUM_REV" \
-          -e "CI_REVISION=$GITHUB_SHA" chromium-builder bash -seu <<'CONTAINER' \
-          | age -r "$APK_RECIPIENT" -o "$delivery/Bare-2.0.0-beta.6-arm64-v8a.tar.age"
+          -e "CI_REVISION=$GITHUB_SHA" -e "TRIAL_PHASE=$TRIAL_PHASE" chromium-builder bash -seu <<'CONTAINER' \
+          | age -r "$APK_RECIPIENT" -o "$delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age"
         set -o pipefail
         cd /work/chromium/src
         temp=$(mktemp -d)
@@ -938,7 +828,10 @@ jobs:
         from pathlib import Path
 
         apk, temp = map(Path, sys.argv[1:])
-        with Path('/exchange/checkpoint/trial-restore.json').open(encoding='utf-8') as stream:
+        phase = os.environ['TRIAL_PHASE']
+        if phase not in ('seed', 'restore'):
+            raise SystemExit('Unexpected production trial phase.')
+        with Path(f'/exchange/checkpoint/trial-{phase}.json').open(encoding='utf-8') as stream:
             report = json.load(stream)
         observed = report.get('apk')
         if not (report.get('reason') == 'completed' and report.get('returncode') == 0 and report.get('artifact_ready') is True
@@ -956,9 +849,9 @@ jobs:
         if info.st_size != observed.get('size') or digest != observed.get('sha256'):
             raise SystemExit('APK changed after the build completed.')
 
-        expected_package = 'org.barebrowser'
-        expected_version = '2.0.0-beta.6'
-        expected_code = '802000065'
+        expected_package = 'org.barebrowser.personal'
+        expected_version = '2.0.4'
+        expected_code = '802000415'
         expected_crx = 'd688ed3f0262ec4f8bdcd4c8f65987c5444c560aeb387a9e02aca1facdfa7046'
         expected_cert = '32a2fc74d731105859e5a85df16d95f102d85b22099b8064c5d8915c61dad1e0'
         badging = (temp / 'badging.txt').read_text(encoding='utf-8')
@@ -968,6 +861,8 @@ jobs:
             expected_package, expected_version, expected_code,
         ):
             raise SystemExit('Unexpected Android package name or version.')
+        if "application-label:'Bare Personal'" not in badging.splitlines():
+            raise SystemExit('Unexpected personal launcher label.')
         architectures = [line.strip() for line in badging.splitlines() if line.startswith('native-code:')]
         if architectures != ["native-code: 'arm64-v8a'"]:
             raise SystemExit('APK does not report exactly the ARM64 ABI.')
@@ -1015,7 +910,7 @@ jobs:
         # The only stream leaving the build container feeds directly into age.
         tar -cf - -C "$PWD/out/Bare/apks" ChromePublic.apk -C "$temp" apk-metadata.json
         CONTAINER
-        name=Bare-2.0.0-beta.6-arm64-v8a.tar.age
+        name=Bare-Personal-2.0.4-arm64-v8a.tar.age
         [[ $(head -n 1 -- "$delivery/$name") == age-encryption.org/v1 ]]
         encrypted_bytes=$(stat -c %s -- "$delivery/$name")
         (( encrypted_bytes > 0 && encrypted_bytes <= 451 * 1024 * 1024 ))
@@ -1031,8 +926,8 @@ jobs:
       continue-on-error: true
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
-        name: bare-arm64-apk-encrypted-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/bare-apk-delivery/Bare-2.0.0-beta.6-arm64-v8a.tar.age
+        name: bare-personal-204-encrypted-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/bare-apk-delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age
         if-no-files-found: error
         retention-days: 3
         compression-level: 0
@@ -1074,14 +969,14 @@ jobs:
         if max(usage, listed) + encrypted + 1024**2 + 1024**3 > 10 * 1024**3:
             raise SystemExit('Encrypted APK fallback exceeds the configured free cache budget.')
         PYTHON
-        echo "key=bare-private-apk-v1-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+        echo "key=bare-coexist-204-apk-v1-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
     - name: Save only the encrypted APK for retrieval retry
       id: apk_fallback_save
       if: ${{ always() && steps.apk_fallback_budget.outcome == 'success' }}
       timeout-minutes: 12
       uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
       with:
-        path: ${{ runner.temp }}/bare-apk-delivery/Bare-2.0.0-beta.6-arm64-v8a.tar.age
+        path: ${{ runner.temp }}/bare-apk-delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age
         key: ${{ steps.apk_fallback_budget.outputs.key }}
     - name: Record the encrypted APK fallback receipt
       id: apk_fallback_receipt
@@ -1092,7 +987,7 @@ jobs:
         ENCRYPTED_SHA: ${{ steps.apk_seal.outputs.sha }}
         ENCRYPTED_BYTES: ${{ steps.apk_seal.outputs.bytes }}
       run: |
-        [[ $ENCRYPTED_KEY == "bare-private-apk-v1-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
+        [[ $ENCRYPTED_KEY == "bare-coexist-204-apk-v1-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
         cache_id=$(python3 - <<'PYTHON'
         import json
         import os
@@ -1102,7 +997,7 @@ jobs:
 
         key = os.environ['ENCRYPTED_KEY']
         size = int(os.environ['ENCRYPTED_BYTES'])
-        query = urllib.parse.urlencode({'key': key, 'ref': 'refs/heads/main'})
+        query = urllib.parse.urlencode({'key': key, 'ref': os.environ['GITHUB_REF']})
         base = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/caches"
         request = urllib.request.Request(base + '?' + query, headers={
             'Accept': 'application/vnd.github+json', 'User-Agent': 'bare-encrypted-apk-recovery',
@@ -1111,7 +1006,7 @@ jobs:
             try:
                 with urllib.request.urlopen(request, timeout=20) as response:
                     caches = json.load(response)['actions_caches']
-                matches = [entry for entry in caches if entry['key'] == key and entry['ref'] == 'refs/heads/main']
+                matches = [entry for entry in caches if entry['key'] == key and entry['ref'] == os.environ['GITHUB_REF']]
                 if len(matches) == 1 and 0 < matches[0]['size_in_bytes'] <= size + 1024**2:
                     print(matches[0]['id'])
                     break
@@ -1194,6 +1089,15 @@ jobs:
           if ! python3 /exchange/checkpoint.py collect-evidence /exchange/checkpoint/trial-seed.json out/Bare/checkpoint-evidence.json; then
             proof=false
           fi
+          if [[ $PROBE_MODE == checkpoint-production ]]; then
+            # Keep the existing archive verifier's canonical receipt path.
+            # Its payload still identifies a cold seed and carries real completed actions.
+            mv -- out/Bare/checkpoint-trial-seed.json out/Bare/checkpoint-trial-restore.json
+            if ! python3 /exchange/checkpoint.py record-continuation \
+              out/Bare/checkpoint-trial-restore.json out/Bare/checkpoint-continuation.json "${limits[@]}"; then
+              proof=false
+            fi
+          fi
         else
           if ! python3 /exchange/checkpoint.py verify-evidence out/Bare/checkpoint-evidence.json; then
             proof=false
@@ -1221,7 +1125,8 @@ jobs:
         python3 /exchange/checkpoint.py record-provenance out/Bare/checkpoint-provenance.json \
           --ci-revision "$CI_REVISION" --base-image "$BASE_IMAGE"
         time python3 /exchange/checkpoint.py record-inputs out/Bare/checkpoint-inputs.jsonl.gz
-        du -sx -B1 out/Bare
+        output_bytes=$(du -sx -B1 out/Bare | cut -f1)
+        printf 'Allocated build output before compression: %s bytes\n' "$output_bytes"
         exclusions=()
         if [[ $PROBE_MODE == checkpoint-production ]]; then
           python3 /exchange/checkpoint.py check-gn-packaging out/Bare
@@ -1238,7 +1143,12 @@ jobs:
         trap 'rm -f -- "$candidate"' EXIT
         cap=2952790016
         [[ $PROBE_MODE != checkpoint-production ]] || cap=$PRODUCTION_CAP_BYTES
-        for level in 1 6; do
+        levels=(1 6)
+        if [[ $PROBE_MODE == checkpoint-production ]] && (( output_bytes >= 12 * 1024**3 )); then
+          # The previous final-link checkpoint missed the compressed limit at -1.
+          levels=(6)
+        fi
+        for level in "${levels[@]}"; do
           time tar --format=posix --pax-option=delete=atime,delete=ctime \
             "${exclusions[@]}" -I "gzip -$level" -cf "$candidate" out/Bare
           bytes=$(stat -c %s "$candidate")
@@ -1353,14 +1263,14 @@ jobs:
         python3 - <<'PYTHON'
         import json, os, time, urllib.parse, urllib.request
         key = os.environ['CHECKPOINT_KEY']
-        query = urllib.parse.urlencode({'key': key, 'ref': 'refs/heads/main', 'per_page': 100})
+        query = urllib.parse.urlencode({'key': key, 'ref': os.environ['GITHUB_REF'], 'per_page': 100})
         url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/actions/caches?' + query
         for attempt in range(5):
             try:
                 request = urllib.request.Request(url, headers={'Accept':'application/vnd.github+json','User-Agent':'bare-bounded-checkpoint'})
                 with urllib.request.urlopen(request, timeout=15) as response:
                     data = json.load(response)
-                exact = [item for item in data['actions_caches'] if item['key'] == key and item['ref'] == 'refs/heads/main' and item['size_in_bytes'] > 0]
+                exact = [item for item in data['actions_caches'] if item['key'] == key and item['ref'] == os.environ['GITHUB_REF'] and item['size_in_bytes'] > 0]
                 if len(exact) == 1:
                     if os.environ.get('PROBE_MODE') in {'checkpoint-scale', 'checkpoint-large'} and exact[0]['size_in_bytes'] > 2952790016:
                         raise SystemExit('The stored scale payload exceeds the approved capacity.')
@@ -1375,9 +1285,6 @@ jobs:
                 raise SystemExit('Save did not create the exact checkpoint. Keep the producer; do not claim success.')
             time.sleep(3)
         PYTHON
-        if [[ $PROBE_MODE == checkpoint-production && $APK_OUTPUT_GIB == 18 && $EXPECTED_KEY == "$FINAL_LINK_PRODUCTION_KEY" ]]; then
-          SAVED_CHECKPOINT_KEY="$CHECKPOINT_KEY" python3 "$RUNNER_TEMP/bare-ci/check-cache-budget.py"
-        fi
         echo "saved=true" >> "$GITHUB_OUTPUT"
     - name: Separate candidate preservation from a passing reuse test
       id: checkpoint-proof

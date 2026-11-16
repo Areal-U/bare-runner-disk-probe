@@ -1,36 +1,31 @@
-name: Bare checkpoint transfer probe
+name: Bare Personal v2.0.4 build and recovery
 'on':
   workflow_dispatch:
     inputs:
       mode:
-        description: Run a checkpoint transfer, verify private delivery, or continue the ARM64 APK build
+        description: Build the Bare Personal ARM64 APK or recover its encrypted artifact
         type: choice
-        default: restore-saved
+        default: build-apk
         options:
-        - restore-saved
-        - paired
-        - measure-scale
-        - measure-larger
-        - verify-private-delivery
         - build-apk
         - recover-encrypted-apk
       apk_recipient:
-        description: age public recipient for the delivery check or APK
+        description: age public recipient for the encrypted APK
         type: string
       checkpoint_key:
-        description: Verified checkpoint or encrypted APK fallback key
+        description: Leave empty for a cold build. For resume, use the verified v2.0.4 branch checkpoint key.
         type: string
       checkpoint_sha:
         description: SHA-256 from the selected readback
         type: string
       checkpoint_identity:
-        description: Input identity from the selected production readback (blank uses initial receipt)
+        description: Input identity from the selected production readback
         type: string
       output_gib:
         description: Output estimate limit for this segment
         type: choice
-        default: '11'
-        options: ['8', '9', '10', '11', '12', '13', '14', '18']
+        default: '18'
+        options: ['18']
       jobs:
         description: Concurrent build actions
         type: choice
@@ -41,70 +36,28 @@ name: Bare checkpoint transfer probe
         type: string
 permissions: {}
 concurrency:
-  group: bare-checkpoint-transfer-workflow
+  group: bare-coexist-204-build
   cancel-in-progress: false
 jobs:
-  seed:
-    if: ${{ inputs.mode == 'paired' }}
-    uses: ./.github/workflows/bare-arm64-probe.yml
-    with:
-      probe: checkpoint-seed
-  restore:
-    if: ${{ inputs.mode == 'paired' }}
-    needs: seed
-    uses: ./.github/workflows/bare-arm64-probe.yml
-    with:
-      probe: checkpoint-restore
-      expected_checkpoint_key: ${{ needs.seed.outputs.checkpoint_key }}
-      expected_checkpoint_sha: ${{ needs.seed.outputs.checkpoint_sha }}
-      expected_checkpoint_identity: ${{ needs.seed.outputs.checkpoint_identity }}
-      expected_base_image: ${{ needs.seed.outputs.base_image }}
-  restore-saved:
-    if: ${{ inputs.mode == 'restore-saved' }}
-    uses: ./.github/workflows/bare-arm64-probe.yml
-    with:
-      probe: checkpoint-restore
-      expected_checkpoint_key: bare-transfer-v2-42928862523-1-checkpoint-seed
-      expected_checkpoint_sha: d03e5ce8221691eec57a5610050931af5d117fe8bb61785f0c93ac89a2676d37
-      expected_checkpoint_identity: fc3b4584696b8239bfc3b04db9490e3c0b722b62b81c54c772b96f27543a8896
-      expected_base_image: ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
-      repair_legacy_input_paths: true
   readback:
     name: Read back the saved continuation on a fresh runner
-    needs:
-    - restore
-    - restore-saved
-    - measure-scale
-    - measure-larger
-    - production
-    if: ${{ !cancelled() && (needs.restore.result == 'success' || needs['restore-saved'].result == 'success' || (inputs.mode == 'measure-scale'
-      && needs['measure-scale'].outputs.checkpoint_saved == 'true') || (inputs.mode == 'measure-larger' && needs['measure-larger'].outputs.checkpoint_saved
-      == 'true') || (inputs.mode == 'build-apk' && needs.production.result == 'success' && needs.production.outputs.checkpoint_saved == 'true')) }}
+    needs: production
+    if: ${{ !cancelled() && needs.production.result == 'success' && needs.production.outputs.checkpoint_saved == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ inputs.mode == 'build-apk' && 35 || inputs.mode == 'measure-larger' && 30 || inputs.mode == 'measure-scale' && 20 || 10 }}
+    timeout-minutes: 35
     defaults:
       run:
         shell: bash
     env:
-      EXPECTED_KEY: ${{ needs.restore.outputs.checkpoint_key || needs['restore-saved'].outputs.checkpoint_key || needs['measure-scale'].outputs.checkpoint_key
-        || needs['measure-larger'].outputs.checkpoint_key || needs.production.outputs.checkpoint_key }}
-      EXPECTED_SHA: ${{ needs.restore.outputs.checkpoint_sha || needs['restore-saved'].outputs.checkpoint_sha || needs['measure-scale'].outputs.checkpoint_sha
-        || needs['measure-larger'].outputs.checkpoint_sha || needs.production.outputs.checkpoint_sha }}
-      EXPECTED_IDENTITY: ${{ needs.restore.outputs.checkpoint_identity || needs['restore-saved'].outputs.checkpoint_identity || needs['measure-scale'].outputs.checkpoint_identity
-        || needs['measure-larger'].outputs.checkpoint_identity || needs.production.outputs.checkpoint_identity }}
-      READBACK_MODE: ${{ inputs.mode }}
+      EXPECTED_KEY: ${{ needs.production.outputs.checkpoint_key }}
+      EXPECTED_SHA: ${{ needs.production.outputs.checkpoint_sha }}
+      EXPECTED_IDENTITY: ${{ needs.production.outputs.checkpoint_identity }}
     steps:
     - name: Validate the successor identity and load its exact verifier
       timeout-minutes: 4
       run: |
         [[ $GITHUB_EVENT_NAME == workflow_dispatch && $RUNNER_ENVIRONMENT == github-hosted && $RUNNER_ARCH == X64 ]]
-        suffix=restore
-        case "$READBACK_MODE" in
-          measure-scale) suffix=scale ;;
-          measure-larger) suffix=large ;;
-          build-apk) suffix=production ;;
-        esac
-        [[ $EXPECTED_KEY =~ ^bare-transfer-v2-${GITHUB_RUN_ID}-[0-9]+-checkpoint-$suffix$ ]]
+        [[ $EXPECTED_KEY =~ ^bare-coexist-204-${GITHUB_RUN_ID}-[0-9]+-checkpoint-production$ ]]
         [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_IDENTITY =~ ^[0-9a-f]{64}$ ]]
         curl --fail --location --retry 2 --max-time 60 \
           "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/checkpoint.py" \
@@ -117,7 +70,7 @@ jobs:
         key: ${{ env.EXPECTED_KEY }}
         fail-on-cache-miss: true
     - name: Verify the restored successor bytes and newly completed outputs
-      timeout-minutes: ${{ inputs.mode == 'build-apk' && 25 || inputs.mode == 'measure-larger' && 20 || inputs.mode == 'measure-scale' && 12 || 4 }}
+      timeout-minutes: 25
       env:
         CACHE_HIT: ${{ steps.successor.outputs.cache-hit }}
         MATCHED_KEY: ${{ steps.successor.outputs.cache-matched-key }}
@@ -126,79 +79,28 @@ jobs:
         archive="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
         [[ -f $archive && ! -L $archive ]]
         printf '%s  %s\n' "$EXPECTED_SHA" "$archive" | sha256sum --check --strict
-        limits=()
-        case "$READBACK_MODE" in
-          measure-scale) limits+=(--scale) ;;
-          measure-larger) limits+=(--large) ;;
-          build-apk) limits+=(--production) ;;
-        esac
-        python3 "$RUNNER_TEMP/checkpoint.py" validate-archive "$archive" "${limits[@]}"
+        python3 "$RUNNER_TEMP/checkpoint.py" validate-archive "$archive" --production
         python3 "$RUNNER_TEMP/checkpoint.py" verify-continuation "$archive" \
-          --expected-identity "$EXPECTED_IDENTITY" --ci-revision "$GITHUB_SHA" "${limits[@]}"
+          --expected-identity "$EXPECTED_IDENTITY" --ci-revision "$GITHUB_SHA" --production
         printf 'Verified successor cache %s\n' "$EXPECTED_KEY"
-        if [[ $READBACK_MODE == build-apk ]]; then
-          {
-            printf 'Verified checkpoint: `%s`\n\n' "$EXPECTED_KEY"
-            printf -- '- SHA-256: `%s`\n' "$EXPECTED_SHA"
-            printf -- '- Input identity: `%s`\n' "$EXPECTED_IDENTITY"
-          } >> "$GITHUB_STEP_SUMMARY"
-        fi
-  measure-scale:
-    if: ${{ inputs.mode == 'measure-scale' }}
-    uses: ./.github/workflows/bare-arm64-probe.yml
-    with:
-      probe: checkpoint-scale
-      expected_checkpoint_key: bare-transfer-v2-42950651335-1-checkpoint-restore
-      expected_checkpoint_sha: 0fec6f756b98561191ef3199f86d965b5fe5b58146bcdb64b51f348f0aeab9a3
-      expected_checkpoint_identity: 87c8946d20f1f0f97d494c21291b1bb1865772084f0e1a09577414007c3ae170
-      expected_base_image: ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
-  measure-larger:
-    if: ${{ inputs.mode == 'measure-larger' }}
-    uses: ./.github/workflows/bare-arm64-probe.yml
-    with:
-      probe: checkpoint-large
-      expected_checkpoint_key: bare-transfer-v2-42963667278-1-checkpoint-scale
-      expected_checkpoint_sha: 62a4793fcbe6e25509d202ac6f180b2ab85c6f52b06f3acaedb4f0aaaf159b72
-      expected_checkpoint_identity: 5a1826fb351f149a8a4132fb21d80acba90d937131ce211c8c0b13d79970a966
-      expected_base_image: ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+        {
+          printf 'Verified checkpoint: `%s`\n\n' "$EXPECTED_KEY"
+          printf -- '- SHA-256: `%s`\n' "$EXPECTED_SHA"
+          printf -- '- Input identity: `%s`\n' "$EXPECTED_IDENTITY"
+        } >> "$GITHUB_STEP_SUMMARY"
   production:
-    if: ${{ inputs.mode == 'build-apk' }}
+    if: ${{ inputs.mode == 'build-apk' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-coexist-v2.0.4' }}
     uses: ./.github/workflows/bare-arm64-probe.yml
     with:
       probe: checkpoint-production
-      expected_checkpoint_key: ${{ inputs.checkpoint_key || 'bare-transfer-v2-42997174308-1-checkpoint-production' }}
-      expected_checkpoint_sha: ${{ inputs.checkpoint_sha || '86d7b940ddde7d343e2924c38f2f52624e1c336f6d7dbef2c0f95961de1b1781' }}
-      expected_checkpoint_identity: ${{ inputs.checkpoint_identity || '3301cb0743cded0e318d57adf22af8956fc3d8e58630c447d68cd912019b4bcc' }}
+      coexist_cold: ${{ inputs.checkpoint_key == '' }}
+      expected_checkpoint_key: ${{ inputs.checkpoint_key }}
+      expected_checkpoint_sha: ${{ inputs.checkpoint_sha }}
+      expected_checkpoint_identity: ${{ inputs.checkpoint_identity }}
       expected_base_image: ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
       apk_recipient: ${{ inputs.apk_recipient }}
       apk_output_gib: ${{ fromJSON(inputs.output_gib) }}
       apk_jobs: ${{ fromJSON(inputs.jobs) }}
-  verify-private-delivery:
-    if: ${{ inputs.mode == 'verify-private-delivery' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/main' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 12
-    steps:
-    - name: Encrypt a small public test message
-      env:
-        APK_RECIPIENT: ${{ inputs.apk_recipient }}
-      run: |
-        set -euo pipefail
-        [[ $APK_RECIPIENT =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$ ]]
-        if ! command -v age >/dev/null; then
-          sudo -n apt-get update -qq
-          sudo -n apt-get install -y -qq age
-        fi
-        printf 'Bare ARM64 private delivery %s\n' "$GITHUB_RUN_ID" \
-          | age -r "$APK_RECIPIENT" -o "$RUNNER_TEMP/bare-delivery-probe.age"
-        sha256sum "$RUNNER_TEMP/bare-delivery-probe.age"
-    - name: Upload only the encrypted test
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-      with:
-        name: bare-private-delivery-test-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/bare-delivery-probe.age
-        if-no-files-found: error
-        retention-days: 1
-        compression-level: 0
   read-back-apk:
     name: Read back the encrypted APK on a fresh runner
     needs: production
@@ -223,7 +125,7 @@ jobs:
       timeout-minutes: 12
       uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
       with:
-        path: ${{ runner.temp }}/bare-apk-delivery/Bare-2.0.0-beta.6-arm64-v8a.tar.age
+        path: ${{ runner.temp }}/bare-apk-delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age
         key: ${{ needs.production.outputs.apk_cache_key }}
         fail-on-cache-miss: true
     - name: Verify the exact encrypted APK bytes
@@ -239,12 +141,12 @@ jobs:
         if [[ -n $EXPECTED_CACHE ]]; then
           [[ $CACHE_HIT == true && $CACHE_MATCH == "$EXPECTED_CACHE" ]]
         fi
-        file="$RUNNER_TEMP/bare-apk-delivery/Bare-2.0.0-beta.6-arm64-v8a.tar.age"
+        file="$RUNNER_TEMP/bare-apk-delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age"
         [[ -f $file && ! -L $file && $(stat -c %s -- "$file") == "$EXPECTED_BYTES" ]]
         [[ $(head -n 1 -- "$file") == age-encryption.org/v1 ]]
         printf '%s  %s\n' "$EXPECTED_SHA" "$file" | sha256sum --check --strict
   recover-encrypted-apk:
-    if: ${{ inputs.mode == 'recover-encrypted-apk' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/main' }}
+    if: ${{ inputs.mode == 'recover-encrypted-apk' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-coexist-v2.0.4' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
@@ -257,14 +159,14 @@ jobs:
     steps:
     - name: Check the exact encrypted APK receipt
       run: |
-        [[ $EXPECTED_KEY =~ ^bare-private-apk-v1-[0-9]+-[0-9]+$ && $EXPECTED_SHA =~ ^[0-9a-f]{64}$ ]]
+        [[ $EXPECTED_KEY =~ ^bare-coexist-204-apk-v1-[0-9]+-[0-9]+$ && $EXPECTED_SHA =~ ^[0-9a-f]{64}$ ]]
         [[ $EXPECTED_BYTES =~ ^[1-9][0-9]{0,8}$ ]]
         (( EXPECTED_BYTES <= 451 * 1024**2 ))
     - name: Restore only the encrypted APK
       id: restore
       uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
       with:
-        path: ${{ runner.temp }}/bare-apk-delivery/Bare-2.0.0-beta.6-arm64-v8a.tar.age
+        path: ${{ runner.temp }}/bare-apk-delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age
         key: ${{ env.EXPECTED_KEY }}
         fail-on-cache-miss: true
     - name: Verify encrypted bytes before re-upload
@@ -273,7 +175,7 @@ jobs:
         CACHE_MATCH: ${{ steps.restore.outputs.cache-matched-key }}
       run: |
         [[ $CACHE_HIT == true && $CACHE_MATCH == "$EXPECTED_KEY" ]]
-        file="$RUNNER_TEMP/bare-apk-delivery/Bare-2.0.0-beta.6-arm64-v8a.tar.age"
+        file="$RUNNER_TEMP/bare-apk-delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age"
         [[ -f $file && ! -L $file && $(stat -c %s -- "$file") == "$EXPECTED_BYTES" ]]
         [[ $(head -n 1 -- "$file") == age-encryption.org/v1 ]]
         printf '%s  %s\n' "$EXPECTED_SHA" "$file" | sha256sum --check --strict
@@ -281,7 +183,7 @@ jobs:
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: bare-arm64-apk-recovered-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/bare-apk-delivery/Bare-2.0.0-beta.6-arm64-v8a.tar.age
+        path: ${{ runner.temp }}/bare-apk-delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age
         if-no-files-found: error
         retention-days: 3
         compression-level: 0
