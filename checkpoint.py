@@ -43,8 +43,13 @@ PRODUCTION_ARCHIVE_BYTES = 7 * 1024 ** 3 // 2
 PRODUCTION_UNPACKED_BYTES = 19 * 1024 ** 3
 PRODUCTION_ARCHIVE_MEMBERS = 550_000
 ANDROID_PACKAGING_SUFFIXES = {".apk", ".ap_", ".aab", ".apks"}
-GN_PACKAGING_INPUTS = {"apks/Trichrome.ssargs", "apks/Trichrome32.ssargs",
-                       "apks/Trichrome64.ssargs"}
+GN_PACKAGING_INPUTS = {
+    "apks/Trichrome.ssargs",
+    "apks/Trichrome32.ssargs",
+    "apks/Trichrome64.ssargs",
+    "apks/ChromeAndWebView32.ssargs",
+    "apks/ChromeAndWebView64.ssargs",
+}
 GN_DEPFILE = "out/Bare/build.ninja.d"
 GN_DEPFILE_LIMIT = 8 * 1024 ** 2
 CI_FILES = ("checkpoint.py", "build_trial.py", "bare-arm64-probe.yml",
