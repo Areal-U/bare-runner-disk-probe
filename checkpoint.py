@@ -677,8 +677,9 @@ def verify_evidence(record_path, source_root=ROOTS["src"]):
 
 
 def successful_continuation_edges(trial, *, production=False):
+    phases = {"seed", "restore"} if production else {"restore"}
     if (not isinstance(trial, dict) or trial.get("format") != "bare-apk-trial"
-            or trial.get("version") != 1 or trial.get("phase") != "restore"
+            or trial.get("version") != 1 or trial.get("phase") not in phases
             or trial.get("target") != "chrome_public_apk" or trial.get("build_dir") != "out/Bare"
             or trial.get("ready_for_restore_test") is not True
             or trial.get("container_quiescence_verified") is not True
@@ -691,7 +692,8 @@ def successful_continuation_edges(trial, *, production=False):
                 or not isinstance(trial.get("production_limits"), dict)
                 or trial.get("artifact_ready") is not False):
             raise ValueError("Expected an interrupted production build")
-        values = trial["completed_outputs"]
+        if trial["phase"] == "restore":
+            values = trial["completed_outputs"]
     edges = {}
     for edge in values:
         if (not isinstance(edge, dict) or edge.get("success") is not True
@@ -796,6 +798,9 @@ def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *,
         raise ValueError("Continuation trial JSON exceeds its size limit")
     trial = json.loads(payload)
     edges = successful_continuation_edges(trial, production=production)
+    bootstrap = production and trial["phase"] == "seed"
+    if bootstrap and os.path.lexists(record_path):
+        raise ValueError("A production seed requires a new continuation record")
     new_paths = {"out/Bare/" + item["path"] for item in trial["new_completed_outputs"]}
 
     def output_priority(name):
@@ -806,6 +811,9 @@ def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *,
     outputs = []
     for name in sorted(edges, key=output_priority):
         relative = PurePosixPath(name)
+        if bootstrap and (relative.parts[:3] != ("out", "Bare", "obj")
+                          or relative.suffix != ".o" or any(char.isspace() for char in name)):
+            continue
         if production and is_android_packaging(relative):
             continue
         try:
@@ -818,7 +826,7 @@ def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *,
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not info.st_size:
             continue
         if ((production and info.st_size > PRODUCTION_UNPACKED_BYTES)
-                or (large and info.st_size > 2 * 1024 ** 3)):
+                or ((bootstrap or large) and info.st_size > 2 * 1024 ** 3)):
             continue
         metadata = object_metadata(path, source_root)
         outputs.append({"path": name, "step_id": edges[name], "size": metadata["size"],
@@ -830,7 +838,11 @@ def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *,
     record = {"format": CONTINUATION_FORMAT, "version": 2 if production else 1,
               "trial_sha256": hashlib.sha256(payload).hexdigest(), "outputs": outputs}
     if production:
-        markers = reuse_markers(json.loads(record_path.read_text(encoding="utf-8")))
+        if bootstrap:
+            record["reuse_markers"] = outputs
+            markers = reuse_markers(record)
+        else:
+            markers = reuse_markers(json.loads(record_path.read_text(encoding="utf-8")))
         verify_reuse_markers(markers, source_root)
         record["reuse_markers"] = list(markers.values())
     write_json(record_path, record)
@@ -899,6 +911,9 @@ def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=F
     sample_paths = sorted(expected)
     if production:
         markers = reuse_markers(record)
+        if trial["phase"] == "seed" and (markers.keys() != expected.keys()
+                or any(PurePosixPath(name).parts[:3] != ("out", "Bare", "obj") for name in markers)):
+            raise ValueError("Production seed reuse markers differ from its completed objects")
         for name, item in markers.items():
             if name in expected and any(expected[name][key] != item[key] for key in ("size", "sha256")):
                 raise ValueError("Progress output differs from its persistent reuse marker")

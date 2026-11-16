@@ -455,16 +455,19 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
         if phase not in {"seed", "restore"} or seconds <= 0 or sample_seconds <= 0:
             raise ValueError("Invalid trial phase or time budget")
         if sum((scale, large, production)) > 1:
-            raise ValueError("Choose only one restore trial mode")
+            raise ValueError("Choose only one trial size profile")
         if type(jobs) is not int or jobs not in (1, 2) or (jobs == 1 and not production):
             raise ValueError("Use two build jobs, or one in production")
         time_limit, output_limit, entry_limit, disk_floor = trial_limits(scale, large, production)
         if type(max_output_entries) is not int or not 1 <= max_output_entries <= entry_limit:
             raise ValueError(f"The output entry guard must be between 1 and {entry_limit}")
-        if expanded and (phase != "restore" or seconds > time_limit
-                                 or not 1 <= max_output_bytes <= output_limit
-                                 or min_free_bytes < disk_floor):
-            raise ValueError("Expanded trials require restore and bounded time, output bytes, and free disk")
+        if (scale or large) and phase != "restore":
+            raise ValueError("Scale and large trials require restore")
+        if expanded and (seconds > time_limit or not 1 <= max_output_bytes <= output_limit
+                         or min_free_bytes < disk_floor):
+            raise ValueError("Expanded trials require bounded time, output bytes, and free disk")
+        if production and phase == "seed" and previous_result is not None:
+            raise ValueError("A cold production seed cannot use a previous trial result")
         if phase == "restore" and previous_result is None and not expanded:
             raise ValueError("Restore requires the saved seed trial result")
         if metrics_path.exists() or metrics_path.is_symlink():
@@ -620,7 +623,8 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             result["apk"] = apk_metadata(output / "apks/ChromePublic.apk")
         no_failure = not result["forced_kill"] and not result["close"]["errors"] and not result["failed_steps"]
         complete = result["reason"] == "completed" and result["returncode"] == 0 and result["apk"] is not None
-        usable_outputs = result["completed_outputs"] if production else result["new_completed_outputs"]
+        usable_outputs = (result["completed_outputs"] if production and phase == "restore"
+                          else result["new_completed_outputs"])
         interrupted = (result["reason"] in {"time-limit", "output-limit", "output-entry-limit", "disk-limit"}
                        and bool(usable_outputs)
                        and (result["close"]["saved"] or result["close"]["journal_ready"]))
@@ -689,7 +693,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--scale", action="store_true", help="Use the bounded scale restore limits")
     mode.add_argument("--large", action="store_true", help="Use the larger restore trial limits")
-    mode.add_argument("--production", action="store_true", help="Use the APK production restore limits")
+    mode.add_argument("--production", action="store_true", help="Use the APK production limits")
     parser.add_argument("--jobs", type=int, choices=(1, 2), default=2)
     parser.add_argument("--seconds", type=int)
     parser.add_argument("--max-output-bytes", type=int)
@@ -699,8 +703,10 @@ def main():
     if Path.cwd() != SOURCE_ROOT:
         parser.error("Run only from the fixed /work/chromium/src directory")
     expanded = args.scale or args.large or args.production
-    if expanded and args.phase != "restore":
-        parser.error("--scale, --large, and --production require --phase restore")
+    if (args.scale or args.large) and args.phase != "restore":
+        parser.error("--scale and --large require --phase restore")
+    if args.production and args.phase == "seed" and args.previous_result is not None:
+        parser.error("--production --phase seed cannot use --previous-result")
     if args.jobs == 1 and not args.production:
         parser.error("--jobs 1 requires --production")
     time_limit, output_limit, entry_limit, disk_floor = trial_limits(args.scale, args.large, args.production)
