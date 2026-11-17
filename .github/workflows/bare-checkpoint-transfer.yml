@@ -26,6 +26,11 @@ name: Bare Personal v2.0.4 build and recovery
         type: choice
         default: '18'
         options: ['18']
+      compile_minutes:
+        description: Maximum compilation minutes for this segment
+        type: choice
+        default: '180'
+        options: ['180', '25']
       jobs:
         description: Concurrent build actions
         type: choice
@@ -101,6 +106,7 @@ jobs:
       apk_recipient: ${{ inputs.apk_recipient }}
       apk_output_gib: ${{ fromJSON(inputs.output_gib) }}
       apk_jobs: ${{ fromJSON(inputs.jobs) }}
+      compile_minutes: ${{ fromJSON(inputs.compile_minutes) }}
   read-back-apk:
     name: Read back the encrypted APK on a fresh runner
     needs: production

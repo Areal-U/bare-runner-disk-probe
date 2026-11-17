@@ -32,6 +32,9 @@ name: Bare Personal ARM64 checkpoint build
       apk_jobs:
         type: number
         default: 2
+      compile_minutes:
+        type: number
+        default: 180
     outputs:
       checkpoint_key:
         value: ${{ jobs.compile-probe.outputs.checkpoint_key }}
@@ -104,6 +107,7 @@ jobs:
       PRODUCTION_CAP_BYTES: '3758096384'
       EXPECTED_KEY: ${{ inputs.expected_checkpoint_key }}
       APK_OUTPUT_GIB: ${{ inputs.apk_output_gib }}
+      COMPILE_MINUTES: ${{ inputs.compile_minutes }}
     defaults:
       run:
         shell: bash
@@ -127,6 +131,7 @@ jobs:
         [[ $EXPECTED_BASE == ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 ]]
         [[ $APK_RECIPIENT =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$ ]]
         [[ $APK_OUTPUT_GIB == 18 && ( $APK_JOBS == 1 || $APK_JOBS == 2 ) ]]
+        [[ $COMPILE_MINUTES == 180 || $COMPILE_MINUTES == 25 ]]
         [[ $REPAIR_LEGACY_INPUT_PATHS == false ]]
         if [[ $COEXIST_COLD == true ]]; then
           [[ -z $EXPECTED_KEY && -z $EXPECTED_SHA && -z $EXPECTED_IDENTITY ]]
@@ -502,6 +507,7 @@ jobs:
         if [[ $COEXIST_COLD == true ]]; then
           echo 'Generating ARM64 build rules'
           gn gen out/Bare
+          python3 /exchange/checkpoint.py check-gn-packaging out/Bare
         fi
         df -B1 /work
         CONTAINER
@@ -692,9 +698,11 @@ jobs:
           # Allow time for quiescence, validation, packing, transfer, and the hard job deadline.
           compile_seconds=$(( (350 - 80 - 17 - 8) * 60 - elapsed ))
           (( compile_seconds > 0 ))
-          if (( compile_seconds > 10800 )); then
-            compile_seconds=10800
+          requested_seconds=$((COMPILE_MINUTES * 60))
+          if (( compile_seconds > requested_seconds )); then
+            compile_seconds=$requested_seconds
           fi
+          printf 'APK compilation budget: %s seconds\n' "$compile_seconds"
           trial_timeout="$((compile_seconds + 300))s"
           kill_after=1m
           df -B1 "$RUNNER_TEMP" "${TMPDIR:-/tmp}"
@@ -1124,12 +1132,14 @@ jobs:
         python3 /exchange/checkpoint.py canonicalize-logs "${log_limits[@]}"
         python3 /exchange/checkpoint.py record-provenance out/Bare/checkpoint-provenance.json \
           --ci-revision "$CI_REVISION" --base-image "$BASE_IMAGE"
+        if [[ $PROBE_MODE == checkpoint-production ]]; then
+          python3 /exchange/checkpoint.py check-gn-packaging out/Bare
+        fi
         time python3 /exchange/checkpoint.py record-inputs out/Bare/checkpoint-inputs.jsonl.gz
         output_bytes=$(du -sx -B1 out/Bare | cut -f1)
         printf 'Allocated build output before compression: %s bytes\n' "$output_bytes"
         exclusions=()
         if [[ $PROBE_MODE == checkpoint-production ]]; then
-          python3 /exchange/checkpoint.py check-gn-packaging out/Bare
           df -B1 /work /exchange /tmp
           df -Pi /work /exchange /tmp
           for path in /work /exchange /tmp; do
