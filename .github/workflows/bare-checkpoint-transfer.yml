@@ -144,6 +144,8 @@ jobs:
         } >> "$GITHUB_STEP_SUMMARY"
   production:
     needs: validate-build
+    permissions:
+      actions: read
     uses: ./.github/workflows/bare-arm64-probe.yml
     with:
       probe: checkpoint-production
@@ -213,6 +215,8 @@ jobs:
           needs.readback.outputs.checkpoint_key == needs.production.outputs.checkpoint_key &&
           needs.readback.outputs.checkpoint_sha == needs.production.outputs.checkpoint_sha &&
           needs.readback.outputs.checkpoint_identity == needs.production.outputs.checkpoint_identity }}
+    permissions:
+      actions: read
     uses: ./.github/workflows/bare-arm64-probe.yml
     with:
       probe: checkpoint-production

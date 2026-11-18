@@ -73,6 +73,8 @@ name: Bare Personal ARM64 checkpoint build
 permissions: {}
 jobs:
   compile-probe:
+    permissions:
+      actions: read
     if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' && github.ref == 'refs/heads/bare-coexist-v2.0.4' && inputs.probe == 'checkpoint-production'
       }}
     runs-on: ubuntu-24.04
@@ -228,27 +230,68 @@ jobs:
         fi
         # Check the recipient checksum with age itself. The ciphertext is discarded.
         printf 'Bare recovery preflight\n' | age -r "$APK_RECIPIENT" > /dev/null
-    - name: Check repository cache headroom without deleting older checkpoints
+    - name: Prepare the host-side cache metadata checks
       if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
       timeout-minutes: 5
       run: |
-        cat > "$RUNNER_TEMP/bare-ci/check-cache-budget.py" <<'PYTHON'
-        import json, os, time, urllib.request
-        base = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/actions'
-        def get(suffix):
+        mkdir "$RUNNER_TEMP/bare-cache-reader"
+        cat > "$RUNNER_TEMP/bare-cache-reader/cache_api.py" <<'PYTHON'
+        import http.client
+        import json
+        import os
+        import urllib.parse
+
+        def cache_get(resource, query=None, timeout=15):
+            if resource not in ('cache/usage', 'caches'):
+                raise ValueError('Unknown cache metadata endpoint.')
+            token = os.environ.get('CACHE_READ_TOKEN')
+            if not token:
+                raise SystemExit('Missing GitHub Actions cache read token.')
+            path = '/repos/Areal-U/bare-runner-disk-probe/actions/' + resource
+            if query:
+                path += '?' + urllib.parse.urlencode(query)
+            headers = {
+                'Accept': 'application/vnd.github+json',
+                'Authorization': 'Bearer ' + token,
+                'User-Agent': 'bare-bounded-checkpoint',
+                'X-GitHub-Api-Version': '2022-11-28',
+            }
+            # HTTPSConnection sends one request to this host and never follows redirects.
+            connection = http.client.HTTPSConnection('api.github.com', timeout=timeout)
+            try:
+                connection.request('GET', path, headers=headers)
+                response = connection.getresponse()
+                if response.status in (401, 403, 429):
+                    details = []
+                    for header in ('x-ratelimit-remaining', 'x-ratelimit-reset', 'retry-after'):
+                        value = response.getheader(header, '')
+                        if value.isascii() and value.isdecimal() and len(value) <= 12:
+                            details.append(f'{header}={value}')
+                    detail = ' (' + ', '.join(details) + ')' if details else ''
+                    raise SystemExit(f'GitHub cache metadata returned HTTP {response.status}{detail}.')
+                if response.status != 200:
+                    raise OSError(f'GitHub cache metadata returned HTTP {response.status}.')
+                return json.load(response)
+            except http.client.HTTPException as error:
+                raise OSError('Could not read GitHub cache metadata.') from error
+            finally:
+                connection.close()
+        PYTHON
+        cat > "$RUNNER_TEMP/bare-cache-reader/check-cache-budget.py" <<'PYTHON'
+        import json, os, runpy, time
+        cache_get = runpy.run_path(os.path.join(os.environ['RUNNER_TEMP'], 'bare-cache-reader/cache_api.py'))['cache_get']
+        def get(resource, query=None):
             for attempt in range(3):
                 try:
-                    request = urllib.request.Request(base + suffix, headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'bare-bounded-checkpoint'})
-                    with urllib.request.urlopen(request, timeout=15) as response:
-                        return json.load(response)
+                    return cache_get(resource, query)
                 except (OSError, ValueError):
                     if attempt == 2:
                         raise
                     time.sleep(2)
-        usage = get('/cache/usage')
+        usage = get('cache/usage')
         caches = []
         for page in range(1, 11):
-            batch = get(f'/caches?per_page=100&page={page}')['actions_caches']
+            batch = get('caches', {'per_page': 100, 'page': page})['actions_caches']
             caches.extend(batch)
             if len(batch) < 100:
                 break
@@ -280,7 +323,12 @@ jobs:
             raise SystemExit('Insufficient cache headroom; retain existing checkpoints and choose storage first.')
         print(json.dumps({'cache_bytes_observed': used, 'reserved_bytes': reserve, 'limit_bytes': limit_bytes}))
         PYTHON
-        python3 "$RUNNER_TEMP/bare-ci/check-cache-budget.py"
+    - name: Check repository cache headroom without deleting older checkpoints
+      if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
+      timeout-minutes: 5
+      env:
+        CACHE_READ_TOKEN: ${{ github.token }}
+      run: exec /usr/bin/python3 -I "$RUNNER_TEMP/bare-cache-reader/check-cache-budget.py"
     - name: Restore the producer key exactly, including on a consumer-only rerun
       id: restore-checkpoint
       if: ${{ startsWith(inputs.probe, 'checkpoint-') && inputs.probe != 'checkpoint-seed' && !inputs.coexist_cold }}
@@ -1073,22 +1121,16 @@ jobs:
       if: ${{ always() && steps.apk_seal.outputs.ready == 'true' && steps.apk_upload.outcome != 'success' }}
       timeout-minutes: 3
       env:
+        CACHE_READ_TOKEN: ${{ github.token }}
         ENCRYPTED_BYTES: ${{ steps.apk_seal.outputs.bytes }}
       run: |
-        python3 - <<'PYTHON'
-        import json
+        /usr/bin/python3 -I - <<'PYTHON'
         import os
-        import urllib.request
+        import runpy
 
-        base = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions"
-        headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'bare-encrypted-apk-recovery'}
-
-        def get(suffix):
-            with urllib.request.urlopen(urllib.request.Request(base + suffix, headers=headers), timeout=20) as response:
-                return json.load(response)
-
-        usage = get('/cache/usage')['active_caches_size_in_bytes']
-        entries = get('/caches?per_page=100')
+        cache_get = runpy.run_path(os.path.join(os.environ['RUNNER_TEMP'], 'bare-cache-reader/cache_api.py'))['cache_get']
+        usage = cache_get('cache/usage', timeout=20)['active_caches_size_in_bytes']
+        entries = cache_get('caches', {'per_page': 100}, timeout=20)
         if entries['total_count'] != len(entries['actions_caches']):
             raise SystemExit('Encrypted APK fallback cannot confirm full cache inventory.')
         listed = sum(entry['size_in_bytes'] for entry in entries['actions_caches'])
@@ -1110,29 +1152,24 @@ jobs:
       if: ${{ always() && steps.apk_fallback_save.outcome == 'success' }}
       timeout-minutes: 4
       env:
+        CACHE_READ_TOKEN: ${{ github.token }}
         ENCRYPTED_KEY: ${{ steps.apk_fallback_budget.outputs.key }}
         ENCRYPTED_SHA: ${{ steps.apk_seal.outputs.sha }}
         ENCRYPTED_BYTES: ${{ steps.apk_seal.outputs.bytes }}
       run: |
         [[ $ENCRYPTED_KEY == "bare-coexist-204-apk-v1-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
-        cache_id=$(python3 - <<'PYTHON'
-        import json
+        cache_id=$(/usr/bin/python3 -I - <<'PYTHON'
         import os
+        import runpy
         import time
-        import urllib.parse
-        import urllib.request
 
+        cache_get = runpy.run_path(os.path.join(os.environ['RUNNER_TEMP'], 'bare-cache-reader/cache_api.py'))['cache_get']
         key = os.environ['ENCRYPTED_KEY']
         size = int(os.environ['ENCRYPTED_BYTES'])
-        query = urllib.parse.urlencode({'key': key, 'ref': os.environ['GITHUB_REF']})
-        base = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/caches"
-        request = urllib.request.Request(base + '?' + query, headers={
-            'Accept': 'application/vnd.github+json', 'User-Agent': 'bare-encrypted-apk-recovery',
-        })
+        query = {'key': key, 'ref': os.environ['GITHUB_REF']}
         for attempt in range(5):
             try:
-                with urllib.request.urlopen(request, timeout=20) as response:
-                    caches = json.load(response)['actions_caches']
+                caches = cache_get('caches', query, timeout=20)['actions_caches']
                 matches = [entry for entry in caches if entry['key'] == key and entry['ref'] == os.environ['GITHUB_REF']]
                 if len(matches) == 1 and 0 < matches[0]['size_in_bytes'] <= size + 1024**2:
                     print(matches[0]['id'])
@@ -1145,6 +1182,7 @@ jobs:
             raise SystemExit('No exact encrypted APK cache receipt; handoff remains unverified.')
         PYTHON
         )
+        unset CACHE_READ_TOKEN
         [[ $cache_id =~ ^[1-9][0-9]*$ && $ENCRYPTED_SHA =~ ^[0-9a-f]{64}$ && $ENCRYPTED_BYTES =~ ^[1-9][0-9]*$ ]]
         echo "key=$ENCRYPTED_KEY" >> "$GITHUB_OUTPUT"
         printf 'APK artifact upload failed; temporary ciphertext cache ID %s, key %s, SHA-256 %s, %s bytes\n' \
@@ -1362,7 +1400,8 @@ jobs:
             echo '- Summary unavailable; inspect the recorded trial JSON in the checkpoint.'
           fi
         } | tee -a "$GITHUB_STEP_SUMMARY" || echo '::warning::Summary display failed; continue to checkpoint saving.'
-    - name: Recheck storage and predecessor keys before the scale upload
+    - name: Measure the checkpoint payload before upload
+      id: measure-checkpoint
       if: ${{ !cancelled() && (inputs.probe == 'checkpoint-scale' || inputs.probe == 'checkpoint-large' || inputs.probe == 'checkpoint-production') && steps.pack-checkpoint.outcome
         == 'success' }}
       timeout-minutes: ${{ (inputs.probe == 'checkpoint-large' || inputs.probe == 'checkpoint-production') && 8 || 5 }}
@@ -1378,12 +1417,19 @@ jobs:
         (( wrapper_bytes > 0 && wrapper_bytes <= cap - 1048576 ))
         printf 'Estimated GitHub cache payload: %s bytes\n' "$wrapper_bytes"
         if (( wrapper_bytes > CANDIDATE_BYTES )); then
-          export CANDIDATE_BYTES="$wrapper_bytes"
+          CANDIDATE_BYTES="$wrapper_bytes"
         fi
-        python3 "$RUNNER_TEMP/bare-ci/check-cache-budget.py"
-      id: scale-save-budget
+        echo "bytes=$CANDIDATE_BYTES" >> "$GITHUB_OUTPUT"
       env:
         CANDIDATE_BYTES: ${{ steps.pack-checkpoint.outputs.bytes }}
+    - name: Recheck storage and predecessor keys before the scale upload
+      id: scale-save-budget
+      if: ${{ !cancelled() && steps.measure-checkpoint.outcome == 'success' }}
+      timeout-minutes: 5
+      env:
+        CACHE_READ_TOKEN: ${{ github.token }}
+        CANDIDATE_BYTES: ${{ steps.measure-checkpoint.outputs.bytes }}
+      run: exec /usr/bin/python3 -I "$RUNNER_TEMP/bare-cache-reader/check-cache-budget.py"
     - name: Save a new bounded generation without replacing the producer
       id: save-checkpoint
       if: ${{ !cancelled() && steps.pack-checkpoint.outcome == 'success' && (!(inputs.probe == 'checkpoint-scale' || inputs.probe ==
@@ -1398,18 +1444,17 @@ jobs:
       if: ${{ always() && steps.save-checkpoint.outcome == 'success' }}
       timeout-minutes: ${{ (inputs.probe == 'checkpoint-large' || inputs.probe == 'checkpoint-production') && 4 || 3 }}
       env:
+        CACHE_READ_TOKEN: ${{ github.token }}
         CHECKPOINT_KEY: ${{ steps.identity.outputs.key }}
       run: |
-        python3 - <<'PYTHON'
-        import json, os, time, urllib.parse, urllib.request
+        /usr/bin/python3 -I - <<'PYTHON'
+        import json, os, runpy, time
+        cache_get = runpy.run_path(os.path.join(os.environ['RUNNER_TEMP'], 'bare-cache-reader/cache_api.py'))['cache_get']
         key = os.environ['CHECKPOINT_KEY']
-        query = urllib.parse.urlencode({'key': key, 'ref': os.environ['GITHUB_REF'], 'per_page': 100})
-        url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/actions/caches?' + query
+        query = {'key': key, 'ref': os.environ['GITHUB_REF'], 'per_page': 100}
         for attempt in range(5):
             try:
-                request = urllib.request.Request(url, headers={'Accept':'application/vnd.github+json','User-Agent':'bare-bounded-checkpoint'})
-                with urllib.request.urlopen(request, timeout=15) as response:
-                    data = json.load(response)
+                data = cache_get('caches', query)
                 exact = [item for item in data['actions_caches'] if item['key'] == key and item['ref'] == os.environ['GITHUB_REF'] and item['size_in_bytes'] > 0]
                 if len(exact) == 1:
                     if os.environ.get('PROBE_MODE') in {'checkpoint-scale', 'checkpoint-large'} and exact[0]['size_in_bytes'] > 2952790016:
