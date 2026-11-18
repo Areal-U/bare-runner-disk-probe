@@ -1,4 +1,5 @@
 name: Bare Personal v2.0.4 build and recovery
+run-name: ${{ inputs.mode == 'build-apk' && (inputs.build_segments == '2' && 'Bare ARM64 build (up to two segments)' || 'Bare ARM64 build (one segment)') || 'Recover encrypted Bare APK' }}
 'on':
   workflow_dispatch:
     inputs:
@@ -31,6 +32,11 @@ name: Bare Personal v2.0.4 build and recovery
         type: choice
         default: '180'
         options: ['180', '25']
+      build_segments:
+        description: Maximum sequential build segments (2 requires a verified parent, 180 minutes and two jobs)
+        type: choice
+        default: '1'
+        options: ['1', '2']
       retain_existing_caches:
         description: Limit checkpoint size for the first resume of run 43987539656 (set 25 minutes and one job)
         type: boolean
@@ -48,25 +54,60 @@ concurrency:
   group: bare-coexist-204-build
   cancel-in-progress: false
 jobs:
+  validate-build:
+    name: Check the requested build segments
+    if: ${{ inputs.mode == 'build-apk' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-coexist-v2.0.4' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+    - name: Validate the selected build settings
+      shell: bash
+      env:
+        SEGMENTS: ${{ inputs.build_segments }}
+        MINUTES: ${{ inputs.compile_minutes }}
+        JOBS: ${{ inputs.jobs }}
+        OUTPUT_GIB: ${{ inputs.output_gib }}
+        RETAIN: ${{ inputs.retain_existing_caches }}
+        PARENT_KEY: ${{ inputs.checkpoint_key }}
+        PARENT_SHA: ${{ inputs.checkpoint_sha }}
+        PARENT_IDENTITY: ${{ inputs.checkpoint_identity }}
+      run: |
+        [[ $SEGMENTS == 1 || $SEGMENTS == 2 ]]
+        if [[ $SEGMENTS == 2 ]]; then
+          [[ $MINUTES == 180 && $JOBS == 2 && $OUTPUT_GIB == 18 && $RETAIN == false ]] || {
+            echo 'Two segments require 180 minutes, two jobs, 18 GiB and normal cache settings.' >&2
+            exit 1
+          }
+          [[ $PARENT_KEY =~ ^bare-coexist-204-[0-9]+-[0-9]+-checkpoint-production(-s2)?$ &&
+            $PARENT_SHA =~ ^[0-9a-f]{64}$ && $PARENT_IDENTITY =~ ^[0-9a-f]{64}$ ]] || {
+            echo 'Two segments require a verified parent checkpoint key, SHA-256 and identity.' >&2
+            exit 1
+          }
+        fi
   readback:
     name: Read back the saved continuation on a fresh runner
     needs: production
     if: ${{ !cancelled() && needs.production.result == 'success' && needs.production.outputs.checkpoint_saved == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 35
-    defaults:
+    outputs: &checkpoint_outputs
+      checkpoint_key: ${{ steps.verified.outputs.key }}
+      checkpoint_sha: ${{ steps.verified.outputs.sha }}
+      checkpoint_identity: ${{ steps.verified.outputs.identity }}
+    defaults: &bash_defaults
       run:
         shell: bash
     env:
+      KEY_SUFFIX: ''
       EXPECTED_KEY: ${{ needs.production.outputs.checkpoint_key }}
       EXPECTED_SHA: ${{ needs.production.outputs.checkpoint_sha }}
       EXPECTED_IDENTITY: ${{ needs.production.outputs.checkpoint_identity }}
-    steps:
+    steps: &checkpoint_readback_steps
     - name: Validate the successor identity and load its exact verifier
       timeout-minutes: 4
       run: |
         [[ $GITHUB_EVENT_NAME == workflow_dispatch && $RUNNER_ENVIRONMENT == github-hosted && $RUNNER_ARCH == X64 ]]
-        [[ $EXPECTED_KEY =~ ^bare-coexist-204-${GITHUB_RUN_ID}-[0-9]+-checkpoint-production$ ]]
+        [[ $EXPECTED_KEY =~ ^bare-coexist-204-${GITHUB_RUN_ID}-[1-9][0-9]*-checkpoint-production${KEY_SUFFIX}$ ]]
         [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_IDENTITY =~ ^[0-9a-f]{64}$ ]]
         curl --fail --location --retry 2 --max-time 60 \
           "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/checkpoint.py" \
@@ -79,6 +120,7 @@ jobs:
         key: ${{ env.EXPECTED_KEY }}
         fail-on-cache-miss: true
     - name: Verify the restored successor bytes and newly completed outputs
+      id: verified
       timeout-minutes: 25
       env:
         CACHE_HIT: ${{ steps.successor.outputs.cache-hit }}
@@ -87,10 +129,13 @@ jobs:
         [[ $CACHE_HIT == true && $MATCHED_KEY == "$EXPECTED_KEY" ]]
         archive="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
         [[ -f $archive && ! -L $archive ]]
-        printf '%s  %s\n' "$EXPECTED_SHA" "$archive" | sha256sum --check --strict
+        actual_sha=$(sha256sum -- "$archive")
+        actual_sha=${actual_sha%% *}
+        [[ $actual_sha == "$EXPECTED_SHA" ]]
         python3 "$RUNNER_TEMP/checkpoint.py" validate-archive "$archive" --production
         python3 "$RUNNER_TEMP/checkpoint.py" verify-continuation "$archive" \
           --expected-identity "$EXPECTED_IDENTITY" --ci-revision "$GITHUB_SHA" --production
+        printf 'key=%s\nsha=%s\nidentity=%s\n' "$MATCHED_KEY" "$actual_sha" "$EXPECTED_IDENTITY" >> "$GITHUB_OUTPUT"
         printf 'Verified successor cache %s\n' "$EXPECTED_KEY"
         {
           printf 'Verified checkpoint: `%s`\n\n' "$EXPECTED_KEY"
@@ -98,7 +143,7 @@ jobs:
           printf -- '- Input identity: `%s`\n' "$EXPECTED_IDENTITY"
         } >> "$GITHUB_STEP_SUMMARY"
   production:
-    if: ${{ inputs.mode == 'build-apk' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-coexist-v2.0.4' }}
+    needs: validate-build
     uses: ./.github/workflows/bare-arm64-probe.yml
     with:
       probe: checkpoint-production
@@ -118,33 +163,33 @@ jobs:
     if: ${{ !cancelled() && needs.production.result == 'success' && (needs.production.outputs.apk_artifact_id != '' || needs.production.outputs.apk_cache_key != '') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
-    defaults:
-      run:
-        shell: bash
-    steps:
+    defaults: *bash_defaults
+    env:
+      ARTIFACT_ID: ${{ needs.production.outputs.apk_artifact_id }}
+      EXPECTED_CACHE: ${{ needs.production.outputs.apk_cache_key }}
+      EXPECTED_SHA: ${{ needs.production.outputs.apk_encrypted_sha }}
+      EXPECTED_BYTES: ${{ needs.production.outputs.apk_encrypted_bytes }}
+    steps: &apk_readback_steps
     - name: Download the exact encrypted APK artifact
-      if: ${{ needs.production.outputs.apk_artifact_id != '' }}
+      if: ${{ env.ARTIFACT_ID != '' }}
       uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
       timeout-minutes: 10
       with:
-        artifact-ids: ${{ needs.production.outputs.apk_artifact_id }}
+        artifact-ids: ${{ env.ARTIFACT_ID }}
         path: ${{ runner.temp }}/bare-apk-delivery
         merge-multiple: true
     - name: Restore the exact encrypted APK fallback cache
-      if: ${{ needs.production.outputs.apk_artifact_id == '' && needs.production.outputs.apk_cache_key != '' }}
+      if: ${{ env.ARTIFACT_ID == '' && env.EXPECTED_CACHE != '' }}
       id: apk_cached
       timeout-minutes: 12
       uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
       with:
         path: ${{ runner.temp }}/bare-apk-delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age
-        key: ${{ needs.production.outputs.apk_cache_key }}
+        key: ${{ env.EXPECTED_CACHE }}
         fail-on-cache-miss: true
     - name: Verify the exact encrypted APK bytes
       timeout-minutes: 2
       env:
-        EXPECTED_SHA: ${{ needs.production.outputs.apk_encrypted_sha }}
-        EXPECTED_BYTES: ${{ needs.production.outputs.apk_encrypted_bytes }}
-        EXPECTED_CACHE: ${{ needs.production.outputs.apk_cache_key }}
         CACHE_HIT: ${{ steps.apk_cached.outputs.cache-hit }}
         CACHE_MATCH: ${{ steps.apk_cached.outputs.cache-matched-key }}
       run: |
@@ -156,6 +201,59 @@ jobs:
         [[ -f $file && ! -L $file && $(stat -c %s -- "$file") == "$EXPECTED_BYTES" ]]
         [[ $(head -n 1 -- "$file") == age-encryption.org/v1 ]]
         printf '%s  %s\n' "$EXPECTED_SHA" "$file" | sha256sum --check --strict
+  production-next:
+    needs: [production, readback]
+    if: >-
+      ${{ !cancelled() && inputs.build_segments == '2' &&
+          needs.production.result == 'success' && needs.readback.result == 'success' &&
+          needs.production.outputs.checkpoint_saved == 'true' && needs.production.outputs.checkpoint_advanced == 'true' &&
+          needs.production.outputs.apk_artifact_id == '' && needs.production.outputs.apk_cache_key == '' &&
+          needs.production.outputs.apk_encrypted_sha == '' && needs.production.outputs.apk_encrypted_bytes == '' &&
+          needs.readback.outputs.checkpoint_key != '' && needs.readback.outputs.checkpoint_sha != '' && needs.readback.outputs.checkpoint_identity != '' &&
+          needs.readback.outputs.checkpoint_key == needs.production.outputs.checkpoint_key &&
+          needs.readback.outputs.checkpoint_sha == needs.production.outputs.checkpoint_sha &&
+          needs.readback.outputs.checkpoint_identity == needs.production.outputs.checkpoint_identity }}
+    uses: ./.github/workflows/bare-arm64-probe.yml
+    with:
+      probe: checkpoint-production
+      checkpoint_segment: next
+      coexist_cold: false
+      expected_checkpoint_key: ${{ needs.readback.outputs.checkpoint_key }}
+      expected_checkpoint_sha: ${{ needs.readback.outputs.checkpoint_sha }}
+      expected_checkpoint_identity: ${{ needs.readback.outputs.checkpoint_identity }}
+      expected_base_image: ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+      apk_recipient: ${{ inputs.apk_recipient }}
+      apk_output_gib: 18
+      apk_jobs: 2
+      compile_minutes: 180
+      retain_existing_caches: false
+  readback-next:
+    name: Read back the second continuation on a fresh runner
+    needs: production-next
+    if: ${{ !cancelled() && needs.production-next.result == 'success' && needs.production-next.outputs.checkpoint_saved == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    defaults: *bash_defaults
+    outputs: *checkpoint_outputs
+    env:
+      KEY_SUFFIX: '-s2'
+      EXPECTED_KEY: ${{ needs.production-next.outputs.checkpoint_key }}
+      EXPECTED_SHA: ${{ needs.production-next.outputs.checkpoint_sha }}
+      EXPECTED_IDENTITY: ${{ needs.production-next.outputs.checkpoint_identity }}
+    steps: *checkpoint_readback_steps
+  read-back-apk-next:
+    name: Read back the second segment's encrypted APK on a fresh runner
+    needs: production-next
+    if: ${{ !cancelled() && needs.production-next.result == 'success' && (needs.production-next.outputs.apk_artifact_id != '' || needs.production-next.outputs.apk_cache_key != '') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    defaults: *bash_defaults
+    env:
+      ARTIFACT_ID: ${{ needs.production-next.outputs.apk_artifact_id }}
+      EXPECTED_CACHE: ${{ needs.production-next.outputs.apk_cache_key }}
+      EXPECTED_SHA: ${{ needs.production-next.outputs.apk_encrypted_sha }}
+      EXPECTED_BYTES: ${{ needs.production-next.outputs.apk_encrypted_bytes }}
+    steps: *apk_readback_steps
   recover-encrypted-apk:
     if: ${{ inputs.mode == 'recover-encrypted-apk' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-coexist-v2.0.4' }}
     runs-on: ubuntu-24.04

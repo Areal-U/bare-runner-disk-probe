@@ -5,6 +5,9 @@ name: Bare Personal ARM64 checkpoint build
       probe:
         type: string
         default: smoke
+      checkpoint_segment:
+        type: string
+        default: initial
       expected_checkpoint_key:
         type: string
         default: ''
@@ -49,6 +52,8 @@ name: Bare Personal ARM64 checkpoint build
         value: ${{ jobs.compile-probe.outputs.base_image }}
       checkpoint_saved:
         value: ${{ jobs.compile-probe.outputs.checkpoint_saved }}
+      checkpoint_advanced:
+        value: ${{ jobs.compile-probe.outputs.checkpoint_advanced }}
       apk_artifact_id:
         value: ${{ jobs.compile-probe.outputs.apk_artifact_id }}
       apk_cache_key:
@@ -81,6 +86,7 @@ jobs:
       checkpoint_identity: ${{ steps.pack-checkpoint.outputs.identity }}
       base_image: ${{ steps.prepare.outputs.base_image }}
       checkpoint_saved: ${{ inputs.probe == 'checkpoint-production' && steps.checkpoint-proof.outputs.verified || inputs.probe != 'checkpoint-production' && steps.saved-receipt.outputs.saved || '' }}
+      checkpoint_advanced: ${{ steps.pack-checkpoint.outputs.checkpoint_advanced }}
       apk_artifact_id: ${{ steps.apk_upload.outcome == 'success' && steps.apk_upload.outputs.artifact-id || '' }}
       apk_cache_key: ${{ steps.apk_fallback_receipt.outputs.key }}
       apk_encrypted_sha: ${{ steps.apk_seal.outputs.sha }}
@@ -107,6 +113,8 @@ jobs:
       FINAL_LINK_PRODUCTION_REV: f0695d66e60385f869d101d3b535ee241373f28c
       COEXIST_22_KEY: bare-coexist-204-43987539656-1-checkpoint-production
       COEXIST_22_REV: 17a2bed5a26071215258627dc76f56e357b21a6b
+      COEXIST_23_KEY: bare-coexist-204-44281142681-1-checkpoint-production
+      COEXIST_23_REV: 66474f5823f5b773c70507009d0e1b694517cb22
       UBUNTU_SNAPSHOT_URL: https://snapshot.ubuntu.com/ubuntu/20261112T093000Z
       UBUNTU_GLIBC_VERSION: 2.35-0ubuntu3.15
       RETAIN_EXISTING_CACHES: ${{ inputs.retain_existing_caches && 'true' || 'false' }}
@@ -121,6 +129,7 @@ jobs:
     - name: Validate the bounded mode and producer checkpoint identity
       id: identity
       env:
+        CHECKPOINT_SEGMENT: ${{ inputs.checkpoint_segment }}
         EXPECTED_KEY: ${{ inputs.expected_checkpoint_key }}
         EXPECTED_SHA: ${{ inputs.expected_checkpoint_sha }}
         EXPECTED_IDENTITY: ${{ inputs.expected_checkpoint_identity }}
@@ -136,6 +145,16 @@ jobs:
         [[ $PROBE_MODE == checkpoint-production && $GITHUB_REPOSITORY == Areal-U/bare-runner-disk-probe ]]
         [[ $EXPECTED_BASE == ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 ]]
         [[ $APK_RECIPIENT =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$ ]]
+        key="bare-coexist-204-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-checkpoint-production"
+        [[ $CHECKPOINT_SEGMENT == initial || $CHECKPOINT_SEGMENT == next ]]
+        if [[ $CHECKPOINT_SEGMENT == next ]]; then
+          [[ $COEXIST_COLD == false && $RETAIN_EXISTING_CACHES == false ]]
+          # Failed-job reruns can consume the first job's original successful attempt.
+          [[ $EXPECTED_KEY =~ ^bare-coexist-204-([1-9][0-9]*)-([1-9][0-9]{0,8})-checkpoint-production$ ]]
+          [[ ${BASH_REMATCH[1]} == "$GITHUB_RUN_ID" ]]
+          (( BASH_REMATCH[2] <= GITHUB_RUN_ATTEMPT ))
+          key+="-s2"
+        fi
         if [[ $RETAIN_EXISTING_CACHES == true ]]; then
           [[ $COEXIST_COLD == false && $EXPECTED_KEY == "$COEXIST_22_KEY" ]]
           [[ $APK_OUTPUT_GIB == 4 && $APK_JOBS == 1 && $COMPILE_MINUTES == 25 ]]
@@ -144,18 +163,36 @@ jobs:
           [[ $COMPILE_MINUTES == 180 || $COMPILE_MINUTES == 25 ]]
         fi
         [[ $REPAIR_LEGACY_INPUT_PATHS == false ]]
+        predecessor_rev=''
+        predecessor_arm_sha=''
+        predecessor_transfer_sha=''
         if [[ $COEXIST_COLD == true ]]; then
           [[ -z $EXPECTED_KEY && -z $EXPECTED_SHA && -z $EXPECTED_IDENTITY ]]
         else
           [[ $COEXIST_COLD == false ]]
-          [[ $EXPECTED_KEY =~ ^bare-coexist-204-[0-9]+-[0-9]+-checkpoint-production$ ]]
+          [[ $EXPECTED_KEY =~ ^bare-coexist-204-[0-9]+-[0-9]+-checkpoint-production(-s2)?$ ]]
           [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_IDENTITY =~ ^[0-9a-f]{64}$ ]]
           if [[ $EXPECTED_KEY == "$COEXIST_22_KEY" ]]; then
             [[ $EXPECTED_SHA == 0e734d8a64f55bd83f5c0143b4dd8e87ede15e08691f1113e10dcb5bfa045115 ]]
             [[ $EXPECTED_IDENTITY == f038ad5f2db76b68a91e54d3b9b9da69651dedd6d7cbf5fa7093ad2155191b09 ]]
+            predecessor_rev=$COEXIST_22_REV
+            predecessor_arm_sha=26f64ca7ab4d8b72a53608d57bd5c856e1b456a337ce9cc5e7f1ae14f425760a
+            predecessor_transfer_sha=82c7036b25749a164041ec52ddb02fe373a600bcf643b9ad3920dee4a8368033
+          elif [[ $EXPECTED_KEY == "$COEXIST_23_KEY" ]]; then
+            [[ $EXPECTED_SHA == d05b4867fdbc8fecdcf3805f560cbbb078eb8a9b63192fb20a75c1581d5e0e3b ]]
+            [[ $EXPECTED_IDENTITY == c14e976472c1ba626fc1d39cfdd624dfe6ea8112c19aabd771152eb4cb105b1b ]]
+            predecessor_rev=$COEXIST_23_REV
+            predecessor_arm_sha=0454973adb8179fbf7d0876408ec64e2ace66b75afd7bd54938c5aed0e0e58de
+            predecessor_transfer_sha=fe0d87368877bb6c575f90e12a7102c03ec283db63361a50a159438a4e15eaaf
           fi
         fi
-        echo "key=bare-coexist-204-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-checkpoint-production" >> "$GITHUB_OUTPUT"
+        [[ $CHECKPOINT_SEGMENT == initial || -z $predecessor_rev ]]
+        {
+          echo "COEXIST_PREDECESSOR_REV=$predecessor_rev"
+          echo "COEXIST_PREDECESSOR_ARM_SHA=$predecessor_arm_sha"
+          echo "COEXIST_PREDECESSOR_TRANSFER_SHA=$predecessor_transfer_sha"
+        } >> "$GITHUB_ENV"
+        echo "key=$key" >> "$GITHUB_OUTPUT"
     - name: Load the exact CI code before costly preparation
       if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
       timeout-minutes: 5
@@ -169,11 +206,11 @@ jobs:
             --output "$RUNNER_TEMP/bare-ci/$file"
         done
         python3 -m py_compile "$RUNNER_TEMP/bare-ci/checkpoint.py" "$RUNNER_TEMP/bare-ci/build_trial.py"
-        if [[ $EXPECTED_KEY == "$COEXIST_22_KEY" ]]; then
+        if [[ -n $COEXIST_PREDECESSOR_REV ]]; then
           mkdir "$RUNNER_TEMP/bare-ci/predecessor-workflows"
           for file in bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
             curl --fail --location --retry 2 --max-time 60 \
-              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$COEXIST_22_REV/.github/workflows/$file" \
+              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$COEXIST_PREDECESSOR_REV/.github/workflows/$file" \
               --output "$RUNNER_TEMP/bare-ci/predecessor-workflows/$file"
           done
         fi
@@ -284,8 +321,8 @@ jobs:
               producer_revision=$SNAPSHOT_PRODUCTION_REV
             elif [[ $EXPECTED_KEY == "$FINAL_LINK_PRODUCTION_KEY" ]]; then
               producer_revision=$FINAL_LINK_PRODUCTION_REV
-            elif [[ $EXPECTED_KEY == "$COEXIST_22_KEY" ]]; then
-              producer_revision=$COEXIST_22_REV
+            elif [[ -n $COEXIST_PREDECESSOR_REV ]]; then
+              producer_revision=$COEXIST_PREDECESSOR_REV
             fi
           fi
         fi
@@ -350,7 +387,7 @@ jobs:
 
         if [[ $PROBE_MODE == checkpoint-* ]]; then
           cp "$RUNNER_TEMP/bare-ci/"*.py "$RUNNER_TEMP/bare-ci/"*.yml exchange/
-          if [[ $EXPECTED_KEY == "$COEXIST_22_KEY" ]]; then
+          if [[ -n $COEXIST_PREDECESSOR_REV ]]; then
             cp -R "$RUNNER_TEMP/bare-ci/predecessor-workflows" exchange/
           fi
           mkdir -p exchange/checkpoint
@@ -561,8 +598,9 @@ jobs:
           -e "EXPANDED_PRODUCTION_KEY=$EXPANDED_PRODUCTION_KEY" \
           -e "PRE_SNAPSHOT_KEY=$PRE_SNAPSHOT_KEY" -e "PRE_SNAPSHOT_BACKUP_KEY=$PRE_SNAPSHOT_BACKUP_KEY" \
           -e "SNAPSHOT_PRODUCTION_KEY=$SNAPSHOT_PRODUCTION_KEY" -e "SNAPSHOT_PRODUCTION_BACKUP_KEY=$SNAPSHOT_PRODUCTION_BACKUP_KEY" \
-          -e "FINAL_LINK_PRODUCTION_KEY=$FINAL_LINK_PRODUCTION_KEY" -e "COEXIST_22_KEY=$COEXIST_22_KEY" \
-          -e "COEXIST_22_REV=$COEXIST_22_REV" -e "UBUNTU_GLIBC_VERSION=$UBUNTU_GLIBC_VERSION" \
+          -e "FINAL_LINK_PRODUCTION_KEY=$FINAL_LINK_PRODUCTION_KEY" -e "UBUNTU_GLIBC_VERSION=$UBUNTU_GLIBC_VERSION" \
+          -e "COEXIST_PREDECESSOR_REV=$COEXIST_PREDECESSOR_REV" -e "COEXIST_PREDECESSOR_ARM_SHA=$COEXIST_PREDECESSOR_ARM_SHA" \
+          -e "COEXIST_PREDECESSOR_TRANSFER_SHA=$COEXIST_PREDECESSOR_TRANSFER_SHA" \
           -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 chromium-builder \
           timeout --kill-after=2m "${{ inputs.probe == 'checkpoint-production' && '26m' || '20m' }}" bash -seu <<'CONTAINER'
         set -o pipefail
@@ -602,8 +640,8 @@ jobs:
           repair+=(--allow-production-predecessor)
         fi
         [[ $REPAIR_LEGACY_INPUT_PATHS != true ]] || repair+=(--repair-legacy-input-paths)
-        if [[ $EXPECTED_KEY == "$COEXIST_22_KEY" ]]; then
-          # Recompute all of run 22's provenance with the freshly prepared inputs,
+        if [[ -n $COEXIST_PREDECESSOR_REV ]]; then
+          # Recompute the exact predecessor's provenance with the freshly prepared inputs,
           # unchanged helpers, and the immutable producer workflow definitions.
           python3 - <<'PYTHON' | tee /exchange/checkpoint/provenance-check.json
         import hashlib, json, os, shutil, sys, tempfile
@@ -616,8 +654,8 @@ jobs:
             'coexist_inputs.py': '0ca8a1136dbe23c3f4c70c1e2f47ddd7ce1b3f19b57ccbd6f0e33d00dc18f183',
         }
         workflows = {
-            'bare-arm64-probe.yml': '26f64ca7ab4d8b72a53608d57bd5c856e1b456a337ce9cc5e7f1ae14f425760a',
-            'bare-checkpoint-transfer.yml': '82c7036b25749a164041ec52ddb02fe373a600bcf643b9ad3920dee4a8368033',
+            'bare-arm64-probe.yml': os.environ['COEXIST_PREDECESSOR_ARM_SHA'],
+            'bare-checkpoint-transfer.yml': os.environ['COEXIST_PREDECESSOR_TRANSFER_SHA'],
         }
 
         with tempfile.TemporaryDirectory() as directory:
@@ -637,10 +675,10 @@ jobs:
                 raise SystemExit('Fresh GN arguments changed while copying verification inputs.')
             shutil.copytree(exchange / 'patches', producer / 'patches', symlinks=True)
             result = checkpoint.verify_provenance(
-                Path('out/Bare/checkpoint-provenance.json'), os.environ['COEXIST_22_REV'],
+                Path('out/Bare/checkpoint-provenance.json'), os.environ['COEXIST_PREDECESSOR_REV'],
                 os.environ['BASE_IMAGE'], exchange=producer,
             )
-        result['producer_ci_revision'] = os.environ['COEXIST_22_REV']
+        result['producer_ci_revision'] = os.environ['COEXIST_PREDECESSOR_REV']
         result['validator_ci_revision'] = os.environ['CI_REVISION']
         print(json.dumps(result))
         PYTHON
@@ -1285,6 +1323,12 @@ jobs:
         echo "sha=$sha" >> "$GITHUB_OUTPUT"
         echo "identity=$identity" >> "$GITHUB_OUTPUT"
         echo "bytes=$size" >> "$GITHUB_OUTPUT"
+        python3 - "exchange/checkpoint/trial-$phase.json" >> "$GITHUB_OUTPUT" <<'PYTHON'
+        import json, sys
+        with open(sys.argv[1]) as trial:
+            count = json.load(trial).get('new_completed_output_count')
+        print('checkpoint_advanced=' + ('true' if type(count) is int and count > 0 else 'false'))
+        PYTHON
         {
           echo '### Saved-output candidate'
           echo "- Key: $CHECKPOINT_KEY"
