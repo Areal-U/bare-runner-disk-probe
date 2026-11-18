@@ -31,6 +31,10 @@ name: Bare Personal v2.0.4 build and recovery
         type: choice
         default: '180'
         options: ['180', '25']
+      retain_existing_caches:
+        description: Limit checkpoint size for the first resume of run 43987539656 (set 25 minutes and one job)
+        type: boolean
+        default: false
       jobs:
         description: Concurrent build actions
         type: choice
@@ -107,6 +111,7 @@ jobs:
       apk_output_gib: ${{ fromJSON(inputs.output_gib) }}
       apk_jobs: ${{ fromJSON(inputs.jobs) }}
       compile_minutes: ${{ fromJSON(inputs.compile_minutes) }}
+      retain_existing_caches: ${{ inputs.retain_existing_caches }}
   read-back-apk:
     name: Read back the encrypted APK on a fresh runner
     needs: production
