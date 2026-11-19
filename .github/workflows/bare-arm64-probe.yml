@@ -113,6 +113,8 @@ jobs:
       SNAPSHOT_PRODUCTION_REV: 2601b4b4eb11f53204450c4c9909c868a2df04fb
       FINAL_LINK_PRODUCTION_KEY: bare-transfer-v2-43768891019-1-checkpoint-production
       FINAL_LINK_PRODUCTION_REV: f0695d66e60385f869d101d3b535ee241373f28c
+      COEXIST_26_KEY: bare-coexist-204-44477110657-1-checkpoint-production
+      COEXIST_26_SHA: 47c60e1b6c7e9d9668234a7ec3d6cedcf9ae041d1bb8e183c4c4630d40098b57
       COEXIST_22_KEY: bare-coexist-204-43987539656-1-checkpoint-production
       COEXIST_22_REV: 17a2bed5a26071215258627dc76f56e357b21a6b
       COEXIST_23_KEY: bare-coexist-204-44281142681-1-checkpoint-production
@@ -157,6 +159,14 @@ jobs:
           (( BASH_REMATCH[2] <= GITHUB_RUN_ATTEMPT ))
           key+="-s2"
         fi
+        delta26=false
+        if [[ $EXPECTED_KEY == "$COEXIST_26_KEY" || $EXPECTED_KEY == *-d26 ]]; then
+          [[ $CHECKPOINT_SEGMENT == initial && $COEXIST_COLD == false && $RETAIN_EXISTING_CACHES == false ]]
+          [[ $COMPILE_MINUTES == 180 && $APK_JOBS == 2 && $APK_OUTPUT_GIB == 18 ]]
+          delta26=true
+          key+="-d26"
+        fi
+        echo "DELTA26=$delta26" >> "$GITHUB_ENV"
         if [[ $RETAIN_EXISTING_CACHES == true ]]; then
           [[ $COEXIST_COLD == false && $EXPECTED_KEY == "$COEXIST_22_KEY" ]]
           [[ $APK_OUTPUT_GIB == 4 && $APK_JOBS == 1 && $COMPILE_MINUTES == 25 ]]
@@ -172,7 +182,7 @@ jobs:
           [[ -z $EXPECTED_KEY && -z $EXPECTED_SHA && -z $EXPECTED_IDENTITY ]]
         else
           [[ $COEXIST_COLD == false ]]
-          [[ $EXPECTED_KEY =~ ^bare-coexist-204-[0-9]+-[0-9]+-checkpoint-production(-s2)?$ ]]
+          [[ $EXPECTED_KEY =~ ^bare-coexist-204-[0-9]+-[0-9]+-checkpoint-production(-s2|-d26)?$ ]]
           [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_IDENTITY =~ ^[0-9a-f]{64}$ ]]
           if [[ $EXPECTED_KEY == "$COEXIST_22_KEY" ]]; then
             [[ $EXPECTED_SHA == 0e734d8a64f55bd83f5c0143b4dd8e87ede15e08691f1113e10dcb5bfa045115 ]]
@@ -180,6 +190,11 @@ jobs:
             predecessor_rev=$COEXIST_22_REV
             predecessor_arm_sha=26f64ca7ab4d8b72a53608d57bd5c856e1b456a337ce9cc5e7f1ae14f425760a
             predecessor_transfer_sha=82c7036b25749a164041ec52ddb02fe373a600bcf643b9ad3920dee4a8368033
+          elif [[ $EXPECTED_KEY == "$COEXIST_26_KEY" ]]; then
+            [[ $EXPECTED_SHA == "$COEXIST_26_SHA" && $EXPECTED_IDENTITY == a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc ]]
+            predecessor_rev=bf70ddbf474f3390a62220a076b8c43347fecc64
+            predecessor_arm_sha=7f4ba3e8ff94e91777a4bf0b400bfc0e4250cafaa485ad43b050818ea565911b
+            predecessor_transfer_sha=5cfc45c4033c052330ff00247ccde69f800828539df879f9eddd04800b039407
           elif [[ $EXPECTED_KEY == "$COEXIST_23_KEY" ]]; then
             [[ $EXPECTED_SHA == d05b4867fdbc8fecdcf3805f560cbbb078eb8a9b63192fb20a75c1581d5e0e3b ]]
             [[ $EXPECTED_IDENTITY == c14e976472c1ba626fc1d39cfdd624dfe6ea8112c19aabd771152eb4cb105b1b ]]
@@ -200,7 +215,7 @@ jobs:
       timeout-minutes: 5
       run: |
         mkdir -p "$RUNNER_TEMP/bare-ci"
-        for file in checkpoint.py build_trial.py coexist_inputs.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+        for file in checkpoint.py build_trial.py coexist_inputs.py bare-arm64-probe.yml bare-checkpoint-transfer.yml checkpoint_delta.sh; do
           source=$file
           [[ $file != *.yml ]] || source=".github/workflows/$file"
           curl --fail --location --retry 2 --max-time 60 \
@@ -210,10 +225,21 @@ jobs:
         python3 -m py_compile "$RUNNER_TEMP/bare-ci/checkpoint.py" "$RUNNER_TEMP/bare-ci/build_trial.py"
         if [[ -n $COEXIST_PREDECESSOR_REV ]]; then
           mkdir "$RUNNER_TEMP/bare-ci/predecessor-workflows"
-          for file in bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+          historical=(.github/workflows/bare-arm64-probe.yml .github/workflows/bare-checkpoint-transfer.yml)
+          if [[ $COEXIST_PREDECESSOR_REV == bf70ddbf474f3390a62220a076b8c43347fecc64 ]]; then
+            historical+=(checkpoint.py build_trial.py coexist_inputs.py)
+          fi
+          for source in "${historical[@]}"; do
+            file=${source##*/}
+            destination="$RUNNER_TEMP/bare-ci/predecessor-workflows/$file"
             curl --fail --location --retry 2 --max-time 60 \
-              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$COEXIST_PREDECESSOR_REV/.github/workflows/$file" \
-              --output "$RUNNER_TEMP/bare-ci/predecessor-workflows/$file"
+              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$COEXIST_PREDECESSOR_REV/$source" \
+              --output "$destination"
+            case "$file" in
+              bare-arm64-probe.yml) printf '%s  %s\n' "$COEXIST_PREDECESSOR_ARM_SHA" "$destination" | sha256sum --check --strict ;;
+              bare-checkpoint-transfer.yml) printf '%s  %s\n' "$COEXIST_PREDECESSOR_TRANSFER_SHA" "$destination" | sha256sum --check --strict ;;
+              *.py) cmp -- "$destination" "$RUNNER_TEMP/bare-ci/$file" ;;
+            esac
           done
         fi
     - name: Prepare encrypted APK recovery
@@ -227,6 +253,10 @@ jobs:
         if ! command -v age >/dev/null; then
           sudo -n apt-get update -qq
           sudo -n apt-get install -y -qq age
+        fi
+        if [[ $DELTA26 == true ]] && ! command -v rdiff >/dev/null; then
+          sudo -n apt-get update -qq
+          sudo -n apt-get install -y -qq rdiff
         fi
         # Check the recipient checksum with age itself. The ciphertext is discarded.
         printf 'Bare recovery preflight\n' | age -r "$APK_RECIPIENT" > /dev/null
@@ -276,10 +306,47 @@ jobs:
                 raise OSError('Could not read GitHub cache metadata.') from error
             finally:
                 connection.close()
+
+        def cache_inventory(get):
+            caches = []
+            totals = set()
+            for page in range(1, 11):
+                result = get('caches', {'per_page': 100, 'page': page})
+                batch = result['actions_caches']
+                count = result['total_count']
+                if type(count) is not int or count < 0 or not isinstance(batch, list) or len(batch) > 100:
+                    raise SystemExit('Invalid Actions cache inventory page.')
+                totals.add(count)
+                caches.extend(batch)
+                if len(caches) >= count or len(batch) < 100:
+                    break
+            ids = [item['id'] for item in caches]
+            if (totals != {len(caches)} or len(ids) != len(set(ids))
+                    or any(type(i) is not int or i <= 0 for i in ids)
+                    or any(type(item['size_in_bytes']) is not int or item['size_in_bytes'] < 0 for item in caches)):
+                raise SystemExit('Actions cache inventory changed or was incomplete.')
+            if os.environ.get('DELTA26') == 'true':
+                original = 'bare-coexist-204-44477110657-1-checkpoint-production'
+                required = {10780907241: (2318534667, original)}
+                if os.environ['EXPECTED_KEY'] == original:
+                    required.update({
+                        10769653943: (2034262991, 'bare-coexist-204-44412756135-1-checkpoint-production-s2'),
+                        10720237602: (849253635, None),
+                        10573514137: (3487829992, None),
+                    })
+                by_id = {item['id']: item for item in caches}
+                for cache_id, (byte_count, branch_key) in required.items():
+                    item = by_id.get(cache_id)
+                    if (item is None or item['size_in_bytes'] != byte_count
+                            or branch_key is not None and (item['key'] != branch_key or item['ref'] != os.environ['GITHUB_REF'])):
+                        raise SystemExit(f'Required original checkpoint receipt changed: {cache_id}')
+            return caches
         PYTHON
         cat > "$RUNNER_TEMP/bare-cache-reader/check-cache-budget.py" <<'PYTHON'
         import json, os, runpy, time
-        cache_get = runpy.run_path(os.path.join(os.environ['RUNNER_TEMP'], 'bare-cache-reader/cache_api.py'))['cache_get']
+        reader = runpy.run_path(os.path.join(os.environ['RUNNER_TEMP'], 'bare-cache-reader/cache_api.py'))
+        cache_get = reader['cache_get']
+        cache_inventory = reader['cache_inventory']
         def get(resource, query=None):
             for attempt in range(3):
                 try:
@@ -289,19 +356,14 @@ jobs:
                         raise
                     time.sleep(2)
         usage = get('cache/usage')
-        caches = []
-        for page in range(1, 11):
-            batch = get('caches', {'per_page': 100, 'page': page})['actions_caches']
-            caches.extend(batch)
-            if len(batch) < 100:
-                break
-        else:
-            raise SystemExit('Cannot bound cache inventory; stopping before compilation.')
+        caches = cache_inventory(get)
         gib = 1024**3
         limit_bytes = 10 * gib
         cap = int(os.environ['PRODUCTION_CAP_BYTES'])
-        candidate_bytes = int(os.environ.get('CANDIDATE_BYTES', str(cap - 1024**2)))
-        if not 0 < candidate_bytes <= cap - 1024**2:
+        delta = os.environ.get('DELTA26') == 'true'
+        storage_cap = 1900000000 if delta else cap
+        candidate_bytes = int(os.environ.get('CANDIDATE_BYTES', str(storage_cap - 1024**2)))
+        if not 0 < candidate_bytes <= storage_cap - 1024**2:
             raise SystemExit('Candidate size is outside the production envelope.')
         if os.environ['COEXIST_COLD'] != 'true':
             parents = [item for item in caches
@@ -317,8 +379,13 @@ jobs:
             for key, ref in protected:
                 if sum(item['key'] == key and item['ref'] == ref for item in caches) != 1:
                     raise SystemExit(f'Expected one protected checkpoint for {ref}: {key}')
-        reserve = candidate_bytes + 128 * 1024**2
         used = max(usage['active_caches_size_in_bytes'], sum(item['size_in_bytes'] for item in caches))
+        if delta and os.environ['EXPECTED_KEY'].endswith('-d26') and 'CANDIDATE_BYTES' not in os.environ:
+            # A later segment can fit a smaller live budget. Reserve at least its most recent actual delta.
+            candidate_bytes = min(candidate_bytes, limit_bytes - used - 128 * 1024**2)
+            if candidate_bytes < parents[0]['size_in_bytes']:
+                raise SystemExit('Current headroom does not fit even the latest stored delta; retain the base.')
+        reserve = candidate_bytes + 128 * 1024**2
         if used + reserve > limit_bytes:
             raise SystemExit('Insufficient cache headroom; retain existing checkpoints and choose storage first.')
         print(json.dumps({'cache_bytes_observed': used, 'reserved_bytes': reserve, 'limit_bytes': limit_bytes}))
@@ -329,14 +396,58 @@ jobs:
       env:
         CACHE_READ_TOKEN: ${{ github.token }}
       run: exec /usr/bin/python3 -I "$RUNNER_TEMP/bare-cache-reader/check-cache-budget.py"
+    - name: Restore the original checkpoint for this fixed-base delta
+      id: delta_basis
+      if: ${{ endsWith(inputs.expected_checkpoint_key, '-d26') }}
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+      with:
+        path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+        key: bare-coexist-204-44477110657-1-checkpoint-production
+        fail-on-cache-miss: true
+    - name: Check the exact base and prepare the delta reader
+      if: ${{ endsWith(inputs.expected_checkpoint_key, '-d26') }}
+      timeout-minutes: 8
+      env:
+        BASIS_MATCH: ${{ steps.delta_basis.outputs.cache-matched-key }}
+        BASIS_HIT: ${{ steps.delta_basis.outputs.cache-hit }}
+      run: |
+        [[ $BASIS_HIT == true && $BASIS_MATCH == 'bare-coexist-204-44477110657-1-checkpoint-production' ]]
+        base="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
+        [[ -f $base && ! -L $base ]]
+        printf '%s  %s\n' '47c60e1b6c7e9d9668234a7ec3d6cedcf9ae041d1bb8e183c4c4630d40098b57' "$base" | sha256sum --check --strict
+        mv -T -- "$base" "$RUNNER_TEMP/bare-delta26-base.tar.gz"
+        # Both delta consumers need room for one seekable TAR and the compressed reconstruction.
+        free=$(df -B1 --output=avail "$RUNNER_TEMP" | tail -1)
+        if (( free < 29 * 1024**3 )); then
+          for path in /usr/local/lib/android /usr/share/dotnet /usr/share/swift /usr/local/.ghcup; do
+            if [[ -d $path && $(realpath -- "$path") == "$path" ]] && ! mountpoint -q -- "$path"; then
+              sudo -n rm -rf --one-file-system -- "$path"
+            fi
+          done
+        fi
     - name: Restore the producer key exactly, including on a consumer-only rerun
       id: restore-checkpoint
       if: ${{ startsWith(inputs.probe, 'checkpoint-') && inputs.probe != 'checkpoint-seed' && !inputs.coexist_cold }}
       uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
       with:
-        path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+        path: ${{ endsWith(inputs.expected_checkpoint_key, '-d26') && format('{0}/bare-official/exchange/checkpoint/checkpoint.rdiff.zst', runner.temp) || format('{0}/bare-official/exchange/checkpoint/checkpoint.tar.gz', runner.temp) }}
         key: ${{ inputs.expected_checkpoint_key }}
         fail-on-cache-miss: true
+    - name: Reconstruct the exact full successor from the verified base
+      if: ${{ endsWith(inputs.expected_checkpoint_key, '-d26') }}
+      timeout-minutes: 35
+      env:
+        TARGET_SHA: ${{ inputs.expected_checkpoint_sha }}
+        DELTA_KEY: ${{ inputs.expected_checkpoint_key }}
+        DELTA_HIT: ${{ steps.restore-checkpoint.outputs.cache-hit }}
+        DELTA_MATCH: ${{ steps.restore-checkpoint.outputs.cache-matched-key }}
+      run: |
+        [[ $DELTA_HIT == true && $DELTA_MATCH == "$DELTA_KEY" ]]
+        dir="$RUNNER_TEMP/bare-official/exchange/checkpoint"
+        command -v rdiff >/dev/null || { sudo -n apt-get update -qq && sudo -n apt-get install -y -qq rdiff; }
+        bash "$RUNNER_TEMP/bare-ci/checkpoint_delta.sh" apply "$RUNNER_TEMP/bare-delta26-base.tar.gz" \
+          "$dir/checkpoint.rdiff.zst" "$dir/checkpoint.tar.gz" '47c60e1b6c7e9d9668234a7ec3d6cedcf9ae041d1bb8e183c4c4630d40098b57' "$TARGET_SHA"
+        rm -- "$dir/checkpoint.rdiff.zst"
     - name: Validate the received archive before checkout
       if: ${{ startsWith(inputs.probe, 'checkpoint-') && inputs.probe != 'checkpoint-seed' && !inputs.coexist_cold }}
       timeout-minutes: ${{ inputs.probe == 'checkpoint-production' && 15 || inputs.probe == 'checkpoint-large' && 10 || inputs.probe == 'checkpoint-scale' && 7 || 4 }}
@@ -708,7 +819,9 @@ jobs:
 
         with tempfile.TemporaryDirectory() as directory:
             producer = Path(directory)
-            for source, hashes in ((exchange, helpers), (exchange / 'predecessor-workflows', workflows)):
+            historical = exchange / 'predecessor-workflows'
+            helper_root = historical if os.environ['COEXIST_PREDECESSOR_REV'] == 'bf70ddbf474f3390a62220a076b8c43347fecc64' else exchange
+            for source, hashes in ((helper_root, helpers), (historical, workflows)):
                 for name, expected in hashes.items():
                     contents = (source / name).read_bytes()
                     if hashlib.sha256(contents).hexdigest() != expected:
@@ -846,6 +959,7 @@ jobs:
         latest_start=55
         [[ $PROBE_MODE != checkpoint-large ]] || latest_start=60
         [[ $PROBE_MODE != checkpoint-production ]] || latest_start=65
+        [[ $EXPECTED_KEY != *-d26 ]] || latest_start=100
         if (( elapsed > latest_start * 60 )); then
           echo 'Not enough time reserved for stop, hashing, packing, upload and diagnostics.' >&2
           exit 1
@@ -863,7 +977,9 @@ jobs:
           kill_after=1m
         elif [[ $PROBE_MODE == checkpoint-production ]]; then
           # Allow time for quiescence, validation, packing, transfer, and the hard job deadline.
-          compile_seconds=$(( (350 - 80 - 17 - 8) * 60 - elapsed ))
+          delta_minutes=0
+          [[ $DELTA26 != true ]] || delta_minutes=35
+          compile_seconds=$(( (350 - 80 - 17 - 8 - delta_minutes) * 60 - elapsed ))
           (( compile_seconds > 0 ))
           requested_seconds=$((COMPILE_MINUTES * 60))
           if (( compile_seconds > requested_seconds )); then
@@ -1128,12 +1244,11 @@ jobs:
         import os
         import runpy
 
-        cache_get = runpy.run_path(os.path.join(os.environ['RUNNER_TEMP'], 'bare-cache-reader/cache_api.py'))['cache_get']
+        reader = runpy.run_path(os.path.join(os.environ['RUNNER_TEMP'], 'bare-cache-reader/cache_api.py'))
+        cache_get = reader['cache_get']
         usage = cache_get('cache/usage', timeout=20)['active_caches_size_in_bytes']
-        entries = cache_get('caches', {'per_page': 100}, timeout=20)
-        if entries['total_count'] != len(entries['actions_caches']):
-            raise SystemExit('Encrypted APK fallback cannot confirm full cache inventory.')
-        listed = sum(entry['size_in_bytes'] for entry in entries['actions_caches'])
+        caches = reader['cache_inventory'](lambda resource, query: cache_get(resource, query, timeout=20))
+        listed = sum(entry['size_in_bytes'] for entry in caches)
         encrypted = int(os.environ['ENCRYPTED_BYTES'])
         if max(usage, listed) + encrypted + 1024**2 + 1024**3 > 10 * 1024**3:
             raise SystemExit('Encrypted APK fallback exceeds the configured free cache budget.')
@@ -1203,7 +1318,7 @@ jobs:
         [[ $PROBE_MODE != checkpoint-large ]] || pack_timeout=42m
         [[ $PROBE_MODE != checkpoint-production ]] || pack_timeout=42m
         docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CI_REVISION=$GITHUB_SHA" -e "BASE_IMAGE=$BARE_BASE_IMAGE" \
-          -e "TRIAL_PHASE=$phase" -e "PROBE_MODE=$PROBE_MODE" -e "PRODUCTION_CAP_BYTES=$PRODUCTION_CAP_BYTES" \
+          -e "TRIAL_PHASE=$phase" -e "PROBE_MODE=$PROBE_MODE" -e "DELTA26=$DELTA26" -e "PRODUCTION_CAP_BYTES=$PRODUCTION_CAP_BYTES" \
           -e "RETAIN_EXISTING_CACHES=$RETAIN_EXISTING_CACHES" chromium-builder \
           timeout --kill-after=2m "$pack_timeout" bash -seu <<'CONTAINER'
         set -o pipefail
@@ -1320,6 +1435,8 @@ jobs:
           # The previous final-link checkpoint missed the compressed limit at -1.
           levels=(6)
         fi
+        # Prefer faster gzip -1, retain the production -6 fallback if the complete archive exceeds its cap.
+        [[ $DELTA26 != true ]] || levels=(1 6)
         for level in "${levels[@]}"; do
           time tar --format=posix --pax-option=delete=atime,delete=ctime \
             "${exclusions[@]}" -I "gzip -$level" -cf "$candidate" out/Bare
@@ -1400,13 +1517,28 @@ jobs:
             echo '- Summary unavailable; inspect the recorded trial JSON in the checkpoint.'
           fi
         } | tee -a "$GITHUB_STEP_SUMMARY" || echo '::warning::Summary display failed; continue to checkpoint saving.'
+    - name: Encode the verified full checkpoint as a fixed-base delta
+      id: delta_encode
+      if: ${{ !cancelled() && env.DELTA26 == 'true' && steps.pack-checkpoint.outcome == 'success' }}
+      timeout-minutes: 35
+      env:
+        TARGET_SHA: ${{ steps.pack-checkpoint.outputs.sha }}
+      run: |
+        dir="$RUNNER_TEMP/bare-official/exchange/checkpoint"
+        base="$RUNNER_TEMP/bare-delta26-base.tar.gz"
+        [[ -f $base ]] || base="$dir/checkpoint-input.tar.gz"
+        command -v rdiff >/dev/null || { sudo -n apt-get update -qq && sudo -n apt-get install -y -qq rdiff; }
+        bash "$RUNNER_TEMP/bare-ci/checkpoint_delta.sh" create "$base" "$dir/checkpoint.tar.gz" \
+          "$dir/checkpoint.rdiff.zst" "$COEXIST_26_SHA" "$TARGET_SHA"
+        echo "bytes=$(stat -c %s "$dir/checkpoint.rdiff.zst")" >> "$GITHUB_OUTPUT"
     - name: Measure the checkpoint payload before upload
       id: measure-checkpoint
       if: ${{ !cancelled() && (inputs.probe == 'checkpoint-scale' || inputs.probe == 'checkpoint-large' || inputs.probe == 'checkpoint-production') && steps.pack-checkpoint.outcome
-        == 'success' }}
+        == 'success' && (env.DELTA26 != 'true' || steps.delta_encode.outcome == 'success') }}
       timeout-minutes: ${{ (inputs.probe == 'checkpoint-large' || inputs.probe == 'checkpoint-production') && 8 || 5 }}
       run: |
         archive="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
+        [[ $DELTA26 != true ]] || archive="${archive%.tar.gz}.rdiff.zst"
         [[ -f $archive && ! -L $archive && $CANDIDATE_BYTES =~ ^[0-9]+$ ]]
         [[ $(stat -c %s "$archive") == "$CANDIDATE_BYTES" ]]
         # Estimate the same single-file tar/zstd envelope used by the pinned cache action.
@@ -1414,6 +1546,7 @@ jobs:
           -C "$GITHUB_WORKSPACE" --files-from - --use-compress-program zstdmt | wc -c)
         cap=2952790016
         [[ $PROBE_MODE != checkpoint-production ]] || cap=$PRODUCTION_CAP_BYTES
+        [[ $DELTA26 != true ]] || cap=1900000000
         (( wrapper_bytes > 0 && wrapper_bytes <= cap - 1048576 ))
         printf 'Estimated GitHub cache payload: %s bytes\n' "$wrapper_bytes"
         if (( wrapper_bytes > CANDIDATE_BYTES )); then
@@ -1421,7 +1554,7 @@ jobs:
         fi
         echo "bytes=$CANDIDATE_BYTES" >> "$GITHUB_OUTPUT"
       env:
-        CANDIDATE_BYTES: ${{ steps.pack-checkpoint.outputs.bytes }}
+        CANDIDATE_BYTES: ${{ env.DELTA26 == 'true' && steps.delta_encode.outputs.bytes || steps.pack-checkpoint.outputs.bytes }}
     - name: Recheck storage and predecessor keys before the scale upload
       id: scale-save-budget
       if: ${{ !cancelled() && steps.measure-checkpoint.outcome == 'success' }}
@@ -1437,7 +1570,7 @@ jobs:
       timeout-minutes: ${{ (inputs.probe == 'checkpoint-large' || inputs.probe == 'checkpoint-production') && 15 || 10 }}
       uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
       with:
-        path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+        path: ${{ endsWith(steps.identity.outputs.key, '-d26') && format('{0}/bare-official/exchange/checkpoint/checkpoint.rdiff.zst', runner.temp) || format('{0}/bare-official/exchange/checkpoint/checkpoint.tar.gz', runner.temp) }}
         key: ${{ steps.identity.outputs.key }}
     - name: Confirm the exact saved key exists before reporting success
       id: saved-receipt
@@ -1459,6 +1592,8 @@ jobs:
                 if len(exact) == 1:
                     if os.environ.get('PROBE_MODE') in {'checkpoint-scale', 'checkpoint-large'} and exact[0]['size_in_bytes'] > 2952790016:
                         raise SystemExit('The stored scale payload exceeds the approved capacity.')
+                    if os.environ.get('DELTA26') == 'true' and exact[0]['size_in_bytes'] > 1900000000:
+                        raise SystemExit('Stored delta exceeded the bounded storage envelope.')
                     if os.environ.get('PROBE_MODE') == 'checkpoint-production' and exact[0]['size_in_bytes'] > int(os.environ['PRODUCTION_CAP_BYTES']):
                         raise SystemExit('The stored production payload exceeds the approved capacity.')
                     print(json.dumps({'saved_key': key, 'cache_id': exact[0]['id'], 'cache_bytes': exact[0]['size_in_bytes']}))
