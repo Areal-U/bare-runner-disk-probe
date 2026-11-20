@@ -12,7 +12,7 @@ cache-mode: none
 jobs:
   sample:
     name: Check the existing harmless draft probe
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == 'f8779292f27b6dcf597d6a1e79280b707f16a2b1' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '54511017688ea53fb37c1b0535567f487796b894' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
     runs-on: ubuntu-24.04
     timeout-minutes: 7
     permissions:
@@ -99,10 +99,77 @@ jobs:
                 raise
 
 
-        def metadata(path, *, auth=True):
+        def failure_reason(response):
+            # Emit only a fixed category. Never log the response or a message fragment.
+            try:
+                raw = response.read(4097)
+                if len(raw) > 4096:
+                    return "other"
+                body = json.loads(raw.decode("utf-8"))
+            except (OSError, http.client.HTTPException, ValueError, RecursionError):
+                return "other"
+            message = body.get("message") if isinstance(body, dict) else None
+            if not isinstance(message, str):
+                return "other"
+            fixed = {
+                "Resource not accessible by integration": "integration_access_denied",
+                "Resource not accessible by personal access token": "personal_token_access_denied",
+                "Requires authentication": "authentication_required",
+                "Bad credentials": "invalid_credentials",
+                "Must have push access to repository": "push_access_required",
+                "Must have admin rights to Repository": "admin_access_required",
+                "Must have admin rights to the repository": "admin_access_required",
+            }
+            if message.startswith(("You have exceeded a secondary rate limit",
+                                   "You have triggered an abuse detection mechanism")):
+                return "secondary_rate_limit"
+            if message.startswith("API rate limit exceeded"):
+                import ipaddress
+                ip_match = re.match(r"API rate limit exceeded for (\[?[A-Fa-f0-9:.]+\]?)(?:\s|$)", message)
+                if ip_match:
+                    try:
+                        if ipaddress.ip_address(ip_match[1].strip("[]").rstrip(".")).is_global:
+                            return "primary_rate_limit_public_ip"
+                    except ValueError:
+                        pass
+                return "primary_rate_limit"
+            exact = fixed.get(message.removesuffix("."))
+            if exact:
+                return exact
+            # Describe only restrictions explicitly mentioned in the same clause.
+            for clause in re.split(r"[;\n]|\.\s+", message[:640].lower()):
+                clause = re.split(r"https?://", clause, maxsplit=1)[0]
+                if not re.search(r"\b(cannot|can't|may not|restricted|forbidden|denied|requires?|"
+                                 r"not (allowed|authorized|accessible|permitted|supported)|"
+                                 r"only (available|visible|accessible))\b", clause):
+                    continue
+                draft = re.search(r"\b(draft|unpublished) releases?\b", clause)
+                actions = re.search(r"\b(github_token|github actions|workflow tokens?|actions tokens?)\b", clause)
+                if draft and actions:
+                    return "draft_and_actions_restriction_mentioned"
+                if draft:
+                    return "draft_restriction_mentioned"
+                if actions:
+                    return "actions_restriction_mentioned"
+            return "other"
+
+
+        def metadata(path, *, label, auth=True):
             conn, response = request(API, "GET", path, auth=auth)
             try:
-                require(response.status == 200, f"GitHub metadata GET returned {response.status}")
+                if response.status != 200:
+                    def safe_header(name, pattern):
+                        value = response.getheader(name) or ""
+                        return value if re.fullmatch(pattern, value) else "unavailable"
+
+                    remaining = safe_header("X-RateLimit-Remaining", r"[0-9]{1,12}")
+                    reset = safe_header("X-RateLimit-Reset", r"[0-9]{1,12}")
+                    retry = safe_header("Retry-After", r"[0-9]{1,12}")
+                    request_id = safe_header("X-GitHub-Request-Id", r"[0-9A-Fa-f]{1,16}(?::[0-9A-Fa-f]{1,16}){3,5}")
+                    raise Invalid(f"metadata_get={label} auth={'job_token' if auth else 'none'} "
+                                  f"status={response.status} rate_remaining={remaining} rate_reset_epoch={reset} "
+                                  f"retry_after_s={retry} request_id={request_id} "
+                                  f"reason={failure_reason(response)}")
                 raw = response.read(1024 * 1024 + 1)
                 require(len(raw) <= 1024 * 1024, "Unexpectedly large metadata")
                 return json.loads(raw)
@@ -145,7 +212,7 @@ jobs:
         def locate_draft():
             matches = []
             for page_number in range(1, 6):
-                page = metadata(f"{BASE}/releases?per_page=20&page={page_number}")
+                page = metadata(f"{BASE}/releases?per_page=20&page={page_number}", label="release_list")
                 require(isinstance(page, list), "Unexpected release inventory")
                 matches.extend(item for item in page if item.get("name") == DRAFT_TITLE and
                                item.get("draft") is True and is_owner(item.get("author") or {}))
@@ -158,7 +225,7 @@ jobs:
 
 
         def draft(release_id):
-            return draft_matches(metadata(f"{BASE}/releases/{release_id}"), release_id)
+            return draft_matches(metadata(f"{BASE}/releases/{release_id}", label="draft_by_id"), release_id)
 
 
         def asset_info(release, name, size, digest, asset_id=None):
@@ -201,7 +268,7 @@ jobs:
 
 
         def check_anonymous(asset):
-            control = metadata(BASE, auth=False)
+            control = metadata(BASE, label="public_repo_control", auth=False)
             require(control["full_name"] == REPO and control["private"] is False,
                     "Anonymous public-repository control failed")
             ref = urlsplit(asset["browser_download_url"])
@@ -254,7 +321,7 @@ jobs:
 
         def source_receipt():
             query = urlencode({"key": KEY, "ref": "refs/heads/bare-coexist-v2.0.4", "per_page": 100})
-            result = metadata(f"{BASE}/actions/caches?{query}")
+            result = metadata(f"{BASE}/actions/caches?{query}", label="source_cache_rows")
             entries = [r for r in result["actions_caches"] if r["key"] == KEY]
             require(result["total_count"] == len(result["actions_caches"]) and len(entries) == 1 and
                     entries[0]["id"] == CACHE_ID and entries[0]["size_in_bytes"] == CACHE_BYTES and
@@ -278,7 +345,7 @@ jobs:
                 output(release_id=release_id, probe_id=receipt["id"], bytes=PROBE_BYTES, sha256=PROBE_SHA)
             elif args.stage == "read-boundary":
                 release_id, probe_id = integer("RELEASE_ID"), integer("PROBE_ID")
-                owner_info = metadata(BASE)
+                owner_info = metadata(BASE, label="token_repo_control")
                 require(owner_info["full_name"] == REPO, "Authenticated public control failed")
                 # Ordinary PR jobs may receive contents:read. Check the exact harmless probe
                 # by ID with that token before allowing any checkpoint to enter this draft.
@@ -351,7 +418,7 @@ jobs:
       run: python3 -I "$RUNNER_TEMP/draft_transport.py" probe-locate
   limited:
     name: Check draft access with an ordinary read-only job
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == 'f8779292f27b6dcf597d6a1e79280b707f16a2b1' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '54511017688ea53fb37c1b0535567f487796b894' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
     runs-on: ubuntu-24.04
     timeout-minutes: 7
     permissions:
@@ -369,7 +436,7 @@ jobs:
       run: python3 -I "$RUNNER_TEMP/draft_transport.py" read-boundary
   reader:
     name: Verify the probe from a separate authorized runner
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == 'f8779292f27b6dcf597d6a1e79280b707f16a2b1' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '54511017688ea53fb37c1b0535567f487796b894' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
     runs-on: ubuntu-24.04
     timeout-minutes: 7
     permissions:
@@ -389,7 +456,7 @@ jobs:
       run: python3 -I "$RUNNER_TEMP/draft_transport.py" probe-read
   save:
     name: Save the verified stage-two archive to the draft
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == 'f8779292f27b6dcf597d6a1e79280b707f16a2b1' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '54511017688ea53fb37c1b0535567f487796b894' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     permissions:
@@ -423,7 +490,7 @@ jobs:
       run: python3 -I "$RUNNER_TEMP/draft_transport.py" archive-write --path "$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
   restore:
     name: Restore the external archive on a fresh runner
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == 'f8779292f27b6dcf597d6a1e79280b707f16a2b1' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '54511017688ea53fb37c1b0535567f487796b894' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
     runs-on: ubuntu-24.04
     timeout-minutes: 170
     permissions:
@@ -459,7 +526,7 @@ jobs:
         export PRODUCER_REV=bf70ddbf474f3390a62220a076b8c43347fecc64
         jq -e --arg repo "$GITHUB_REPOSITORY" --arg rev "$PRODUCER_REV" '
           .action == "synchronize" and .number == 9 and
-          .before == "f8779292f27b6dcf597d6a1e79280b707f16a2b1" and
+          .before == "54511017688ea53fb37c1b0535567f487796b894" and
           .pull_request.head.ref == "work-bare-27-storage-check" and .pull_request.base.repo.full_name == $repo and
           .pull_request.head.repo.full_name == $repo and
           .pull_request.base.ref == "bare-coexist-v2.0.4" and .pull_request.base.sha == $rev and
