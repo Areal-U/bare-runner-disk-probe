@@ -1,0 +1,743 @@
+name: Private stage-two checkpoint round trip
+'on':
+  pull_request:
+    types:
+    - synchronize
+    branches:
+    - bare-coexist-v2.0.4
+    paths:
+    - .github/workflows/bare-private-25s2-trial.yml
+permissions: {}
+cache-mode: none
+jobs:
+  sample:
+    name: Check the existing harmless draft probe
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == 'f8779292f27b6dcf597d6a1e79280b707f16a2b1' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.transfer.outputs.release_id }}
+      probe_id: ${{ steps.transfer.outputs.probe_id }}
+    steps:
+    - &id001
+      name: Prepare the reviewed transport client
+      run: |
+        cat > "$RUNNER_TEMP/draft_transport.py" <<'TRIAL_PY'
+        """Transfer the fixed 2.0.4 checkpoint using the owner-created, preflighted draft."""
+        import argparse
+        import hashlib
+        import http.client
+        import json
+        import os
+        from pathlib import Path
+        import re
+        import sys
+        import tarfile
+        import time
+        from urllib.parse import quote, urlencode, urlsplit
+
+        REPO = "Areal-U/bare-runner-disk-probe"
+        OWNER = "Areal-U"
+        BASE = "/repos/" + REPO
+        DRAFT_TAG_SHA256 = "87e74b8d9cea507bbd968b4ef71a0f0398b7f1eb861a13b16ca8a54c16eae9bb"
+        DRAFT_TITLE = "Private checkpoint transport probe (25-s2)"
+        DRAFT_TARGETS = {"main", "7e82bca69557079315df4813effbe46c41644c0f"}
+        OWNER_ID = 292261483
+        PROBE_BYTES = 49
+        PROBE_SHA = "6d3adfcb254e849273bf1acb809da3e670b55706abda9e791798b2f4002a9055"
+        KEY = "bare-coexist-204-44412756135-1-checkpoint-production-s2"
+        CACHE_ID = 10769653943
+        CACHE_BYTES = 2034262991
+        BYTES = 2042700560
+        SHA = "dd2177a80c72db7d0d6b558bec1fbd2c0acf448b28144d02dd26796104315413"
+        IDENTITY = "a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc"
+        SAMPLE = "owner-storage-probe.txt"
+        ARCHIVE = "checkpoint-25-s2.tar.gz"
+        API = "api.github.com"
+        UPLOAD = "uploads.github.com"
+        CDNS = {"release-assets.githubusercontent.com", "objects.githubusercontent.com"}
+        CHUNK = 1024 * 1024
+
+
+        class Invalid(Exception):
+            pass
+
+
+        def require(value, message):
+            if not value:
+                raise Invalid(message)
+
+
+        def integer(name):
+            value = os.environ.get(name, "")
+            require(re.fullmatch("[1-9][0-9]{0,19}", value), f"Invalid {name}")
+            return int(value)
+
+
+        def request(host, method, path, *, auth=False, accept="application/vnd.github+json",
+                    body=None, length=None, content_type=None):
+            headers = {"Accept": accept, "User-Agent": "bare-private-checkpoint-trial/1"}
+            if host in {API, UPLOAD}:
+                headers["X-GitHub-Api-Version"] = "2022-11-28"
+            if auth:
+                require(host in {API, UPLOAD}, "Refusing authentication to asset host")
+                token = os.environ.get("GH_TOKEN", "")
+                require(token, "Job token missing")
+                headers["Authorization"] = "Bearer " + token
+            if length is not None:
+                headers["Content-Length"] = str(length)
+            if content_type:
+                headers["Content-Type"] = content_type
+            conn = http.client.HTTPSConnection(host, timeout=150, blocksize=CHUNK)
+            try:
+                conn.request(method, path, body, headers)
+                return conn, conn.getresponse()
+            except BaseException:
+                conn.close()
+                raise
+
+
+        def metadata(path, *, auth=True):
+            conn, response = request(API, "GET", path, auth=auth)
+            try:
+                require(response.status == 200, f"GitHub metadata GET returned {response.status}")
+                raw = response.read(1024 * 1024 + 1)
+                require(len(raw) <= 1024 * 1024, "Unexpectedly large metadata")
+                return json.loads(raw)
+            finally:
+                conn.close()
+
+
+        def output(**values):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii") as stream:
+                for name, value in values.items():
+                    stream.write(f"{name}={value}\n")
+            print(" ".join(f"{name}={value}" for name, value in values.items()), flush=True)
+
+
+        def is_owner(user):
+            return user.get("id") == OWNER_ID and user.get("login") == OWNER
+
+
+        def draft_matches(record, release_id=None):
+            require(record["draft"] is True and record["published_at"] is None and
+                    record["name"] == DRAFT_TITLE and is_owner(record["author"]) and
+                    isinstance(record["id"], int) and record["id"] > 0 and
+                    (release_id is None or record["id"] == release_id),
+                    "Draft owner, name, numeric ID, or publication state changed")
+            target = record["target_commitish"]
+            tag = record["tag_name"]
+            # The editor assigns an untagged-... permalink when the owner saves an
+            # untagged draft. Accept an empty API tag only with that exact permalink.
+            url = urlsplit(record.get("html_url") or "")
+            prefix = f"/{REPO}/releases/tag/"
+            permalink_tag = url.path[len(prefix):] if url.scheme == "https" and url.netloc == "github.com" and url.path.startswith(prefix) else ""
+            def pinned_tag(value):
+                return isinstance(value, str) and hashlib.sha256(value.encode()).hexdigest() == DRAFT_TAG_SHA256
+            require(pinned_tag(tag) or (tag in (None, "") and pinned_tag(permalink_tag)),
+                    "Draft tag or permalink differs from the independently verified owner draft")
+            require(target in DRAFT_TARGETS, "Draft target differs from the owner receipt")
+            return record
+
+
+        def locate_draft():
+            matches = []
+            for page_number in range(1, 6):
+                page = metadata(f"{BASE}/releases?per_page=20&page={page_number}")
+                require(isinstance(page, list), "Unexpected release inventory")
+                matches.extend(item for item in page if item.get("name") == DRAFT_TITLE and
+                               item.get("draft") is True and is_owner(item.get("author") or {}))
+                if len(page) < 20:
+                    break
+            else:
+                raise Invalid("Cannot establish complete bounded draft inventory")
+            require(len(matches) == 1, "Expected exactly one matching owner-created draft")
+            return draft_matches(matches[0])
+
+
+        def draft(release_id):
+            return draft_matches(metadata(f"{BASE}/releases/{release_id}"), release_id)
+
+
+        def asset_info(release, name, size, digest, asset_id=None):
+            items = [a for a in release["assets"] if a["name"] == name]
+            require(len(items) == 1, "Expected one asset on this draft")
+            asset = items[0]
+            require(asset["state"] == "uploaded" and asset["size"] == size and
+                    asset.get("digest") == "sha256:" + digest and
+                    isinstance(asset["id"], int) and asset["id"] > 0 and
+                    (asset_id is None or asset["id"] == asset_id),
+                    "Draft asset receipt does not match")
+            if name == SAMPLE:
+                require(is_owner(asset.get("uploader") or {}), "Probe asset owner changed")
+            return asset
+
+
+        def upload(release_id, name, file, size, digest):
+            require((name, size, digest) == (ARCHIVE, BYTES, SHA), "Only the fixed checkpoint may be uploaded")
+            release = draft(release_id)
+            require(not any(a["name"] == name for a in release["assets"]),
+                    "Refusing to overwrite an asset")
+            path = f"{BASE}/releases/{release_id}/assets?name=" + quote(name)
+            connection, response = request(UPLOAD, "POST", path, auth=True, body=file,
+                                           length=size, content_type="application/octet-stream")
+            try:
+                require(response.status == 201, f"Asset upload returned {response.status}")
+                result = json.loads(response.read(128 * 1024))
+            finally:
+                connection.close()
+            return asset_info(draft(release_id), name, size, digest, result["id"])["id"]
+
+
+        def anonymous_denial(host, path):
+            conn, response = request(host, "GET", path, accept="application/octet-stream")
+            try:
+                # A 302 can be a signed asset URL. Do not follow it or print its value.
+                require(response.status == 404, f"Anonymous denial inconclusive: HTTP {response.status}")
+            finally:
+                conn.close()
+
+
+        def check_anonymous(asset):
+            control = metadata(BASE, auth=False)
+            require(control["full_name"] == REPO and control["private"] is False,
+                    "Anonymous public-repository control failed")
+            ref = urlsplit(asset["browser_download_url"])
+            require(ref.scheme == "https" and ref.netloc == "github.com" and
+                    ref.path.startswith("/" + REPO + "/releases/download/") and not ref.query and
+                    not ref.fragment, "Unexpected direct asset URL")
+            anonymous_denial("github.com", ref.path)
+            anonymous_denial(API, f"{BASE}/releases/assets/{asset['id']}")
+            print("anonymous_public_control=200 anonymous_direct=404 anonymous_asset_api=404", flush=True)
+
+
+        def download(asset_id, size, expected_hash, destination):
+            path = f"{BASE}/releases/assets/{asset_id}"
+            conn, response = request(API, "GET", path, auth=True, accept="application/octet-stream")
+            try:
+                if response.status == 302:
+                    target = urlsplit(response.getheader("Location", ""))
+                    require(target.scheme == "https" and target.netloc in CDNS and
+                            target.path.startswith("/") and not target.fragment, "Unrecognized asset redirect")
+                    conn.close()
+                    # Signed URL is consumed in memory. Never send the repository token to a CDN.
+                    conn, response = request(target.netloc, "GET", target.path + ("?" + target.query if target.query else ""),
+                                             accept="application/octet-stream")
+                require(response.status == 200, f"Asset retrieval returned {response.status}")
+                found = 0
+                digest = hashlib.sha256()
+                while block := response.read(CHUNK):
+                    found += len(block)
+                    require(found <= size, "Download exceeded expected length")
+                    digest.update(block)
+                    if destination is not None:
+                        destination.write(block)
+                require(found == size and digest.hexdigest() == expected_hash, "Retrieved asset bytes differ")
+            finally:
+                conn.close()
+
+
+        def archive_identity(path):
+            with tarfile.open(path, mode="r|gz") as archive:
+                for member in archive:
+                    if member.name.removeprefix("./") != "out/Bare/checkpoint-provenance.json":
+                        continue
+                    require(member.isfile() and 0 < member.size <= 1024 * 1024, "Invalid provenance member")
+                    with archive.extractfile(member) as stream:
+                        provenance = json.load(stream)
+                    require(provenance["identity_sha256"] == IDENTITY, "Incorrect checkpoint input identity")
+                    return
+            raise Invalid("Checkpoint provenance was absent")
+
+
+        def source_receipt():
+            query = urlencode({"key": KEY, "ref": "refs/heads/bare-coexist-v2.0.4", "per_page": 100})
+            result = metadata(f"{BASE}/actions/caches?{query}")
+            entries = [r for r in result["actions_caches"] if r["key"] == KEY]
+            require(result["total_count"] == len(result["actions_caches"]) and len(entries) == 1 and
+                    entries[0]["id"] == CACHE_ID and entries[0]["size_in_bytes"] == CACHE_BYTES and
+                    entries[0]["ref"] == "refs/heads/bare-coexist-v2.0.4", "Original cache receipt differs")
+            require(os.environ.get("MATCHED_CACHE_KEY") == KEY, "Restore action did not report the exact key")
+
+
+        def main():
+            parser = argparse.ArgumentParser()
+            parser.add_argument("stage", choices=["probe-locate", "read-boundary", "probe-read", "archive-write", "archive-read"])
+            parser.add_argument("--path", type=Path)
+            args = parser.parse_args()
+            require(os.environ.get("GITHUB_REPOSITORY") == REPO and os.environ.get("GITHUB_ACTOR") == OWNER and
+                    os.environ.get("GITHUB_TRIGGERING_ACTOR") == OWNER, "Unexpected repository or actor")
+            start = time.monotonic()
+
+            if args.stage == "probe-locate":
+                release_id = locate_draft()["id"]
+                receipt = asset_info(draft(release_id), SAMPLE, PROBE_BYTES, PROBE_SHA)
+                check_anonymous(receipt)
+                output(release_id=release_id, probe_id=receipt["id"], bytes=PROBE_BYTES, sha256=PROBE_SHA)
+            elif args.stage == "read-boundary":
+                release_id, probe_id = integer("RELEASE_ID"), integer("PROBE_ID")
+                owner_info = metadata(BASE)
+                require(owner_info["full_name"] == REPO, "Authenticated public control failed")
+                # Ordinary PR jobs may receive contents:read. Check the exact harmless probe
+                # by ID with that token before allowing any checkpoint to enter this draft.
+                codes = []
+                for path, accept in [(f"{BASE}/releases/{release_id}", "application/vnd.github+json"),
+                                     (f"{BASE}/releases/assets/{probe_id}", "application/octet-stream")]:
+                    conn, response = request(API, "GET", path, auth=True, accept=accept)
+                    try:
+                        codes.append(response.status)
+                    finally:
+                        conn.close()
+                print(f"read_only_draft_status={codes[0]} read_only_asset_status={codes[1]}", flush=True)
+                require(codes == [404, 404], "The draft or asset did not meet the read boundary")
+                output(read_boundary_verified=probe_id)
+            else:
+                release_id = integer("RELEASE_ID")
+                release = draft(release_id)
+                if args.stage == "probe-read":
+                    asset = asset_info(release, SAMPLE, PROBE_BYTES, PROBE_SHA, integer("PROBE_ID"))
+                    check_anonymous(asset)
+                    download(asset["id"], PROBE_BYTES, PROBE_SHA, None)
+                    output(probe_verified=asset["id"], bytes=PROBE_BYTES, sha256=PROBE_SHA)
+                elif args.stage == "archive-write":
+                    require(integer("PROBE_VERIFIED") == integer("PROBE_ID"), "Separate probe receipt mismatch")
+                    probe_asset = asset_info(release, SAMPLE, PROBE_BYTES, PROBE_SHA, integer("PROBE_ID"))
+                    check_anonymous(probe_asset)
+                    source_receipt()
+                    require(args.path is not None and args.path.is_file() and not args.path.is_symlink()
+                            and args.path.stat().st_size == BYTES, "Unexpected local checkpoint file")
+                    with args.path.open("rb") as stream:
+                        digest = hashlib.sha256()
+                        while block := stream.read(CHUNK):
+                            digest.update(block)
+                        require(digest.hexdigest() == SHA, "Original checkpoint digest differs")
+                        archive_identity(args.path)
+                        stream.seek(0)
+                        write_started = time.monotonic()
+                        asset = upload(release_id, ARCHIVE, stream, BYTES, SHA)
+                    output(asset_id=asset, bytes=BYTES, sha256=SHA, identity=IDENTITY,
+                           cache_id=CACHE_ID, upload_seconds=round(time.monotonic() - write_started, 3))
+                else:
+                    asset = asset_info(release, ARCHIVE, BYTES, SHA, integer("ASSET_ID"))
+                    check_anonymous(asset)
+                    require(args.path is not None and not args.path.is_symlink() and not args.path.exists(),
+                            "Restore destination must be fresh")
+                    started = time.monotonic()
+                    with args.path.open("xb") as stream:
+                        download(asset["id"], BYTES, SHA, stream)
+                    received = round(time.monotonic() - started, 3)
+                    archive_identity(args.path)
+                    draft(release_id)
+                    output(asset_id=asset["id"], bytes=BYTES, sha256=SHA, identity=IDENTITY,
+                           download_seconds=received)
+            output(stage_seconds=round(time.monotonic() - start, 3))
+
+
+        if __name__ == "__main__":
+            try:
+                main()
+            except Invalid as exc:
+                sys.exit(str(exc))
+            except Exception as exc:
+                # Transport errors may contain a signed CDN URL. Never stringify them in CI.
+                sys.exit("Transport interrupted: " + type(exc).__name__)
+        TRIAL_PY
+    - name: Verify the known draft and deny anonymous access
+      id: transfer
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 -I "$RUNNER_TEMP/draft_transport.py" probe-locate
+  limited:
+    name: Check draft access with an ordinary read-only job
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == 'f8779292f27b6dcf597d6a1e79280b707f16a2b1' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    permissions:
+      contents: read
+    needs:
+    - sample
+    steps:
+    - *id001
+    - name: Check draft access with an ordinary read-only job
+      id: transfer
+      env:
+        RELEASE_ID: ${{ needs.sample.outputs.release_id }}
+        PROBE_ID: ${{ needs.sample.outputs.probe_id }}
+        GH_TOKEN: ${{ github.token }}
+      run: python3 -I "$RUNNER_TEMP/draft_transport.py" read-boundary
+  reader:
+    name: Verify the probe from a separate authorized runner
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == 'f8779292f27b6dcf597d6a1e79280b707f16a2b1' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    permissions:
+      contents: write
+    needs:
+    - sample
+    outputs:
+      probe_verified: ${{ steps.transfer.outputs.probe_verified }}
+    steps:
+    - *id001
+    - name: Verify the probe from a separate authorized runner
+      id: transfer
+      env:
+        RELEASE_ID: ${{ needs.sample.outputs.release_id }}
+        PROBE_ID: ${{ needs.sample.outputs.probe_id }}
+        GH_TOKEN: ${{ github.token }}
+      run: python3 -I "$RUNNER_TEMP/draft_transport.py" probe-read
+  save:
+    name: Save the verified stage-two archive to the draft
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == 'f8779292f27b6dcf597d6a1e79280b707f16a2b1' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      actions: read
+      contents: write
+    needs:
+    - sample
+    - limited
+    - reader
+    outputs:
+      asset_id: ${{ steps.transfer.outputs.asset_id }}
+    cache-mode: read
+    steps:
+    - *id001
+    - name: Restore only the exact original on the sender
+      id: cache
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+      timeout-minutes: 12
+      with:
+        path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+        key: bare-coexist-204-44412756135-1-checkpoint-production-s2
+        fail-on-cache-miss: true
+    - name: Save the verified stage-two archive to the draft
+      id: transfer
+      env:
+        RELEASE_ID: ${{ needs.sample.outputs.release_id }}
+        PROBE_ID: ${{ needs.sample.outputs.probe_id }}
+        PROBE_VERIFIED: ${{ needs.reader.outputs.probe_verified }}
+        MATCHED_CACHE_KEY: ${{ steps.cache.outputs.cache-matched-key }}
+        GH_TOKEN: ${{ github.token }}
+      run: python3 -I "$RUNNER_TEMP/draft_transport.py" archive-write --path "$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
+  restore:
+    name: Restore the external archive on a fresh runner
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == 'f8779292f27b6dcf597d6a1e79280b707f16a2b1' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 170
+    permissions:
+      contents: write
+    needs:
+    - sample
+    - save
+    steps:
+    - *id001
+    - name: Restore the external archive on a fresh runner
+      id: transfer
+      env:
+        RELEASE_ID: ${{ needs.sample.outputs.release_id }}
+        ASSET_ID: ${{ needs.save.outputs.asset_id }}
+        GH_TOKEN: ${{ github.token }}
+      run: python3 -I "$RUNNER_TEMP/draft_transport.py" archive-read --path "$RUNNER_TEMP/bare-s2-download.tar.gz"
+    - name: Validate restored build inputs and target reuse
+      timeout-minutes: 140
+      run: |
+        set -- "$RUNNER_TEMP/bare-s2-download.tar.gz"
+        #!/usr/bin/env bash
+        # A fresh GitHub-hosted runner receives one authenticated draft asset before calling this.
+        # The caller downloads to RUNNER_TEMP; this script never obtains a cache or an asset.
+        set -euo pipefail
+        umask 022
+        [[ $# == 1 && ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]]
+        [[ $RUNNER_OS == Linux && $RUNNER_ARCH == X64 && $GITHUB_EVENT_NAME == pull_request ]]
+        [[ $GITHUB_REPOSITORY == Areal-U/bare-runner-disk-probe ]]
+        [[ -d $RUNNER_TEMP && ! -L $RUNNER_TEMP && -f $1 && ! -L $1 ]]
+        asset=$(realpath -e -- "$1")
+        [[ $asset == "$RUNNER_TEMP/"* && ! -e $RUNNER_TEMP/bare-official && ! -e $RUNNER_TEMP/bare-ci ]]
+        # The base/head and actor are checked again at the workflow entry point.
+        export PRODUCER_REV=bf70ddbf474f3390a62220a076b8c43347fecc64
+        jq -e --arg repo "$GITHUB_REPOSITORY" --arg rev "$PRODUCER_REV" '
+          .action == "synchronize" and .number == 9 and
+          .before == "f8779292f27b6dcf597d6a1e79280b707f16a2b1" and
+          .pull_request.head.ref == "work-bare-27-storage-check" and .pull_request.base.repo.full_name == $repo and
+          .pull_request.head.repo.full_name == $repo and
+          .pull_request.base.ref == "bare-coexist-v2.0.4" and .pull_request.base.sha == $rev and
+          .repository.owner.login == "Areal-U" and .pull_request.user.login == .repository.owner.login
+        ' "$GITHUB_EVENT_PATH" >/dev/null
+        export BARE_REV=21cb542601950cbd5ee2eddcad6a9163bdf5ea99
+        export CHROMIUM_REV=800628ad1ca1fd0c51e3b43b5b2bca081e81c3f6
+        export DEPOT_REV=96a7c1418eedaa6bea333a8941e8a0078681b4d0
+        export BARE_BASE_IMAGE=ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+        export UBUNTU_SNAPSHOT_URL=https://snapshot.ubuntu.com/ubuntu/20261112T093000Z
+        export UBUNTU_GLIBC_VERSION=2.35-0ubuntu3.15
+        export GIT_TERMINAL_PROMPT=0 PROBE_MODE=checkpoint-production COEXIST_COLD=false
+        export EXPECTED_IDENTITY=a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc
+        archive_sha=dd2177a80c72db7d0d6b558bec1fbd2c0acf448b28144d02dd26796104315413
+        archive_bytes=2042700560
+        SECONDS=0
+        [[ $(stat -c %s -- "$asset") == "$archive_bytes" ]]
+        printf '%s  %s\n' "$archive_sha" "$asset" | sha256sum --strict --check
+        ci="$RUNNER_TEMP/bare-ci"
+        mkdir "$ci"
+        for file in checkpoint.py build_trial.py coexist_inputs.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+            source_path=$file
+            [[ $file != *.yml ]] || source_path=".github/workflows/$file"
+            curl --proto '=https' -fsSL --retry 2 --max-time 60 \
+                "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$PRODUCER_REV/$source_path" -o "$ci/$file"
+        done
+        (
+            cd "$ci"
+            sha256sum --strict --check <<'HASHES'
+        20ca6c2f1ac6862e730ec06575e3cd009673e34a833610b1b7bc9c10fca4683d  checkpoint.py
+        5102b18404ccdfe8071549f411e28f75f1b10dec7d0f6007056339dc8e94094a  build_trial.py
+        0ca8a1136dbe23c3f4c70c1e2f47ddd7ce1b3f19b57ccbd6f0e33d00dc18f183  coexist_inputs.py
+        7f4ba3e8ff94e91777a4bf0b400bfc0e4250cafaa485ad43b050818ea565911b  bare-arm64-probe.yml
+        5cfc45c4033c052330ff00247ccde69f800828539df879f9eddd04800b039407  bare-checkpoint-transfer.yml
+        HASHES
+        )
+        python3 -I "$ci/checkpoint.py" validate-archive "$asset" --production
+        python3 -I "$ci/checkpoint.py" verify-continuation "$asset" --production \
+            --expected-identity "$EXPECTED_IDENTITY" --ci-revision "$PRODUCER_REV"
+        python3 -I "$ci/checkpoint.py" inspect-input-paths "$asset" --production
+        printf 'External archive verified: %s bytes, SHA-256 %s, identity %s, %ss.\n' \
+            "$archive_bytes" "$archive_sha" "$EXPECTED_IDENTITY" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"
+
+        # All remaining writes are on this ephemeral runner. Reuse the inode and make it
+        # readable by the distinct container UID under the private runner temp directory.
+        incoming="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint-input.tar.gz"
+        mkdir -p "$(dirname "$incoming")"
+        ln -- "$asset" "$incoming"
+        chmod a+r "$incoming"
+
+        . /etc/os-release
+        [[ $ID == ubuntu && $VERSION_ID == 24.04 ]]
+        docker_root=$(sudo -n docker info --format '{{.DockerRootDir}}')
+        [[ $docker_root == /* ]]
+        echo "Runner image: ${ImageVersion:-unknown}"
+        sudo -n df -B1 -- "$docker_root"
+        awk '/^(MemTotal|MemAvailable|SwapTotal):/' /proc/meminfo
+
+        tool_dirs=(
+          /usr/local/lib/android
+          /usr/local/share/boost
+          /usr/share/dotnet
+          /usr/share/swift
+          /usr/local/.ghcup
+          /opt/ghc
+          /usr/lib/google-cloud-sdk
+        )
+        for path in "${tool_dirs[@]}"; do
+          if [[ -d $path && $(realpath -- "$path") == "$path" ]] && ! mountpoint -q -- "$path"; then
+            sudo -n rm -rf --one-file-system -- "$path"
+          fi
+        done
+        sudo -n df -B1 -- "$docker_root"
+
+        mkdir -p "$RUNNER_TEMP/bare-official"
+        cd "$RUNNER_TEMP/bare-official"
+        git init -q
+        git fetch --no-tags --depth=1 https://github.com/BareBrowser/bare-browser.git "$BARE_REV"
+        git checkout --detach FETCH_HEAD
+        [[ $(git rev-parse HEAD) == "$BARE_REV" ]]
+        shopt -s nullglob
+        patches=(patches/*.patch)
+        [[ ${#patches[@]} == 313 ]]
+        cp -R patches exchange/
+        crx=third_party/ublock_origin/uBlockOrigin-1.75.0.crx
+        printf '%s  %s\n' d688ed3f0262ec4f8bdcd4c8f65987c5444c560aeb387a9e02aca1facdfa7046 "$crx" | sha256sum --check --strict
+        cp "$crx" exchange/ublock_origin.crx
+        python3 "$RUNNER_TEMP/bare-ci/coexist_inputs.py" gn --bare-root "$PWD" --output exchange/args.gn
+
+        cp "$ci/"*.py "$ci/"*.yml exchange/
+        chmod 777 exchange/checkpoint
+        docker pull --platform linux/amd64 "$BARE_BASE_IMAGE"
+        if [[ $PROBE_MODE == checkpoint-production ]]; then
+          cp /etc/ssl/certs/ca-certificates.crt docker/bare-ci-apt-ca.pem
+        fi
+        python3 - <<'PYTHON'
+        import os
+        from pathlib import Path
+        path = Path('docker/Dockerfile')
+        text = path.read_text()
+        expected = 'FROM --platform=linux/amd64 ubuntu:22.04'
+        if text.splitlines()[0] != expected or text.count(expected) != 1:
+            raise SystemExit('Unexpected pinned Bare base image instruction.')
+        text = text.replace(expected, 'FROM --platform=linux/amd64 ' + os.environ['BARE_BASE_IMAGE'], 1)
+        if os.environ['PROBE_MODE'] == 'checkpoint-production':
+            apt_install = 'RUN apt-get update \\\n    && apt-get install'
+            if text.count(apt_install) != 1:
+                raise SystemExit('Unexpected pinned Bare APT installation instruction.')
+            snapshot_url = os.environ['UBUNTU_SNAPSHOT_URL']
+            bootstrap = fr"""RUN --mount=type=bind,source=bare-ci-apt-ca.pem,target=/tmp/bare-ci-apt-ca.pem \
+            sed -Ei 's@http://(archive|security)\.ubuntu\.com/ubuntu/?@{snapshot_url}/@g' /etc/apt/sources.list \
+            && grep -qF 'deb {snapshot_url}/ jammy-updates ' /etc/apt/sources.list \
+            && grep -qF 'deb {snapshot_url}/ jammy-security ' /etc/apt/sources.list \
+            && apt-get -o Acquire::https::CAInfo=/tmp/bare-ci-apt-ca.pem -o APT::Update::Error-Mode=any update \
+            && apt-get -o Acquire::https::CAInfo=/tmp/bare-ci-apt-ca.pem install"""
+            text = text.replace(apt_install, bootstrap, 1)
+        path.write_text(text)
+        PYTHON
+        bash builder.sh build
+        bash builder.sh start
+        if [[ $PROBE_MODE == checkpoint-production ]]; then
+          for package in libc6:amd64 libc6-dev:amd64; do
+            actual=$(docker compose exec -T chromium-builder dpkg-query -W -f='${Version}' "$package")
+            [[ $actual == "$UBUNTU_GLIBC_VERSION" ]]
+          done
+        fi
+        docker compose exec -T chromium-builder bash -seu <<'CONTAINER'
+        id
+        test -w /work
+        df -B1 /work
+        free_bytes=$(df -B1 --output=avail /work | awk 'NR == 2 { print $1 }')
+        if (( free_bytes < 100000000000 )); then
+          echo 'Stopping before checkout: the build volume has less than 100 GB free.' >&2
+          exit 1
+        fi
+        CONTAINER
+
+        cd "$RUNNER_TEMP/bare-official"
+        docker compose exec -T -e "DEPOT_REV=$DEPOT_REV" -e "CHROMIUM_REV=$CHROMIUM_REV" -e GIT_TERMINAL_PROMPT=0 chromium-builder \
+          timeout --kill-after=2m 40m bash -seu <<'CONTAINER'
+        set -o pipefail
+        export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
+        git init -q "$HOME/depot_tools"
+        git -C "$HOME/depot_tools" fetch --no-tags --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_REV"
+        git -C "$HOME/depot_tools" checkout --detach FETCH_HEAD
+        [[ $(git -C "$HOME/depot_tools" rev-parse HEAD) == "$DEPOT_REV" ]]
+        "$HOME/depot_tools/ensure_bootstrap"
+        mkdir /work/chromium
+        cd /work/chromium
+        cat > .gclient <<'GCLIENT'
+        solutions = [{
+            'name': 'src',
+            'url': 'https://chromium.googlesource.com/chromium/src.git',
+            'deps_file': 'DEPS',
+            'managed': False,
+            'custom_deps': {},
+            'custom_vars': {},
+        }]
+        target_os = ['linux', 'android']
+        cache_dir = None
+        GCLIENT
+        gclient sync --no-history --nohooks --revision "src@$CHROMIUM_REV" --jobs 4
+        [[ $(git -C src rev-parse HEAD) == "$CHROMIUM_REV" ]]
+        df -B1 /work
+        CONTAINER
+
+        cd "$RUNNER_TEMP/bare-official"
+        docker compose exec -T -e GIT_TERMINAL_PROMPT=0 -e "PROBE_MODE=$PROBE_MODE" -e "COEXIST_COLD=$COEXIST_COLD" -e "UBUNTU_GLIBC_VERSION=$UBUNTU_GLIBC_VERSION" chromium-builder \
+          timeout --kill-after=2m 30m bash -seu <<'CONTAINER'
+        set -o pipefail
+        export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
+        cd /work/chromium/src
+        echo 'Installing Chromium build dependencies'
+        ./build/install-build-deps.sh --android --no-prompt
+        for package in libc6:amd64 libc6:i386 libc6-dev:amd64; do
+          [[ $(dpkg-query -W -f='${Version}' "$package") == "$UBUNTU_GLIBC_VERSION" ]]
+        done
+        echo 'Running Chromium checkout hooks'
+        gclient runhooks
+        if [[ $PROBE_MODE == checkpoint-production ]]; then
+          sdk=third_party/android_sdk/public/build-tools/37.0.0
+          [[ -x $sdk/aapt2 && -x $sdk/apksigner && -x third_party/jdk/current/bin/java ]]
+        fi
+        if [[ $PROBE_MODE == checkpoint-* ]]; then
+          echo 'Fetching and validating the V8 builtin PGO profiles for the pinned revision'
+          (
+            cd /work/chromium
+            python3 src/v8/tools/builtins-pgo/download_profiles.py download \
+              --depot-tools src/third_party/depot_tools --check-v8-revision --quiet
+            test -s src/v8/tools/builtins-pgo/profiles/x64.profile
+          )
+        fi
+        df -B1 /work
+        echo 'Applying the official Bare patch series'
+        git apply --index /exchange/patches/*.patch
+        python3 /exchange/coexist_inputs.py label --chromium-src "$PWD"
+        git add -- chrome/android/java/res_chromium_base/values/channel_constants.xml
+        mkdir -p chrome/browser/resources/bare out/Bare
+        cp /exchange/ublock_origin.crx chrome/browser/resources/bare/ublock_origin.crx
+        cp /exchange/args.gn out/Bare/args.gn
+        if [[ $COEXIST_COLD == true ]]; then
+          echo 'Generating ARM64 build rules'
+          gn gen out/Bare
+          python3 /exchange/checkpoint.py check-gn-packaging out/Bare
+        fi
+        df -B1 /work
+        CONTAINER
+
+
+        cd "$RUNNER_TEMP/bare-official"
+        docker compose exec -T -e "BARE_REV=$BARE_REV" -e "EXPECTED_IDENTITY=$EXPECTED_IDENTITY" -e "BASE_IMAGE=$BARE_BASE_IMAGE" \
+            -e "CI_REVISION=$PRODUCER_REV" -e "UBUNTU_GLIBC_VERSION=$UBUNTU_GLIBC_VERSION" \
+            -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 chromium-builder \
+            timeout --kill-after=2m 26m bash -seu <<'CONTAINER'
+        set -o pipefail
+        cd /work/chromium/src
+        python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint-input.tar.gz --production
+
+        for package in libc6:amd64 libc6:i386 libc6-dev:amd64; do
+          [[ $(dpkg-query -W -f='${Version}' "$package") == "$UBUNTU_GLIBC_VERSION" ]]
+        done
+        df -B1 /work /exchange /tmp
+        df -Pi /work /exchange /tmp
+        free=$(df -B1 --output=avail /work | awk 'NR == 2 { print $1 }')
+        inodes=$(df -Pi /work | awk 'NR == 2 { print $4 }')
+        [[ $free =~ ^[0-9]+$ && $inodes =~ ^[0-9]+$ ]]
+        # Leave 20 GiB free and 3 GiB for allocated blocks/metadata at the 19 GiB tar limit.
+        (( free >= 42 * 1024**3 && inodes >= 570000 ))
+        rm -rf --one-file-system -- out/Bare
+        tar -xzf /exchange/checkpoint/checkpoint-input.tar.gz
+
+        python3 /exchange/checkpoint.py verify-provenance out/Bare/checkpoint-provenance.json \
+          --ci-revision "$CI_REVISION" --base-image "$BASE_IMAGE" | tee /exchange/checkpoint/provenance-check.json
+
+        cp out/Bare/checkpoint-provenance.json /exchange/checkpoint/producer-provenance.json
+        python3 - <<'PYTHON'
+        import json, os
+        data = json.load(open('out/Bare/checkpoint-provenance.json'))
+        if data['identity_sha256'] != os.environ['EXPECTED_IDENTITY']:
+            raise SystemExit('Producer input identity differs.')
+        PYTHON
+        python3 /exchange/checkpoint.py restore-inputs out/Bare/checkpoint-inputs.jsonl.gz
+
+        # The public archive omits apks/, including GN's own text descriptors.
+        # Generate them before Siso takes its snapshot of the restored inputs.
+        echo 'Regenerating the ARM64 manifest and its local packaging descriptors'
+        gn gen out/Bare
+        cmp -- /exchange/args.gn out/Bare/args.gn
+        python3 /exchange/checkpoint.py check-gn-packaging out/Bare
+        object=out/Bare/obj/base/third_party/cityhash/cityhash/city.o
+        python3 /exchange/checkpoint.py verify-object "$object" out/Bare/checkpoint-object.json
+        python3 /exchange/checkpoint.py verify-evidence out/Bare/checkpoint-evidence.json
+        autoninja -C out/Bare -j 2 -v base/third_party/cityhash:cityhash | tee /exchange/checkpoint/cityhash-noop.log
+        grep -F 'ninja: no work to do.' /exchange/checkpoint/cityhash-noop.log
+        python3 /exchange/checkpoint.py evidence-targets out/Bare/checkpoint-evidence.json > /exchange/checkpoint/evidence-targets.txt
+        mapfile -t targets < /exchange/checkpoint/evidence-targets.txt
+        (( ${#targets[@]} > 0 ))
+        autoninja -C out/Bare -j 2 -v "${targets[@]}" | tee /exchange/checkpoint/apk-objects-noop.log
+        grep -F 'ninja: no work to do.' /exchange/checkpoint/apk-objects-noop.log
+        python3 /exchange/checkpoint.py verify-object "$object" out/Bare/checkpoint-object.json
+        python3 /exchange/checkpoint.py verify-evidence out/Bare/checkpoint-evidence.json
+
+        record=out/Bare/checkpoint-continuation.json
+        python3 /exchange/checkpoint.py reuse-markers "$record" > /exchange/checkpoint/production-targets.txt
+        python3 /exchange/checkpoint.py verify-reuse-markers "$record" > /exchange/checkpoint/production-before.json
+        mapfile -t targets < /exchange/checkpoint/production-targets.txt
+        (( ${#targets[@]} == 3 ))
+        autoninja -C out/Bare -j 2 -v "${targets[@]}" 2>&1 | tee /exchange/checkpoint/production-noop.log
+        tr '\r' '\n' < /exchange/checkpoint/production-noop.log > /exchange/checkpoint/production-noop.txt
+        grep -Fx 'ninja: no work to do.' /exchange/checkpoint/production-noop.txt
+        summary=$(grep -F 'Build Succeeded:' /exchange/checkpoint/production-noop.txt | tail -n 1)
+        [[ $summary == *'Build Succeeded: 0 steps -'* ]]
+        python3 /exchange/checkpoint.py verify-reuse-markers "$record" > /exchange/checkpoint/production-after.json
+        cmp /exchange/checkpoint/production-before.json /exchange/checkpoint/production-after.json
+        printf 'Verified production reuse: %s\n' "$summary"
+
+
+        touch /exchange/checkpoint/reuse-verified
+        CONTAINER
+        [[ -f exchange/checkpoint/reuse-verified ]]
+        printf 'Real #25-s2 reuse passed on the recipient runner. All three continuation targets required zero build steps and their recorded outputs were unchanged. Validation and setup took %ss.\n' "$SECONDS" >> "$GITHUB_STEP_SUMMARY"
