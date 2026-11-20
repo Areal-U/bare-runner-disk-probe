@@ -1,0 +1,337 @@
+name: Bare checkpoint 26 storage measurement
+run-name: Measure checkpoint 26 compression and round-trip integrity
+'on':
+  pull_request:
+    types: [opened]
+    branches: [bare-coexist-v2.0.4]
+permissions:
+  actions: read
+  contents: read
+concurrency:
+  group: bare-27-read-only-storage-measurement
+  cancel-in-progress: false
+jobs:
+  measure:
+    if: >-
+      github.repository == 'Areal-U/bare-runner-disk-probe' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'work-bare-27-storage-check' &&
+      github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 165
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_REF: refs/heads/bare-coexist-v2.0.4
+      SOURCE_REV: bf70ddbf474f3390a62220a076b8c43347fecc64
+      VERIFIER_SHA: 20ca6c2f1ac6862e730ec06575e3cd009673e34a833610b1b7bc9c10fca4683d
+      SOURCE_KEY: bare-coexist-204-44477110657-1-checkpoint-production
+      SOURCE_SHA: 47c60e1b6c7e9d9668234a7ec3d6cedcf9ae041d1bb8e183c4c4630d40098b57
+      SOURCE_IDENTITY: a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc
+      SOURCE_ID: '10780907241'
+      SOURCE_INNER: '2328180957'
+      SOURCE_OUTER: '2318534667'
+    steps:
+      - name: Check the original cache receipt and measure current headroom
+        id: inventory
+        timeout-minutes: 4
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ $RUNNER_ENVIRONMENT == github-hosted && $RUNNER_ARCH == X64 ]]
+          mkdir -m 700 "$RUNNER_TEMP/bare-storage-27"
+          cd "$RUNNER_TEMP/bare-storage-27"
+          api="repos/$GITHUB_REPOSITORY/actions"
+          gh api "$api/cache/usage" > usage.json
+          gh api --paginate --slurp "$api/caches?per_page=100" > pages.json
+          python3 -I - <<'PY'
+          import json, os
+          from pathlib import Path
+          pages = json.loads(Path("pages.json").read_text())
+          if not pages:
+              raise SystemExit("Missing cache inventory")
+          entries = [e for page in pages for e in page["actions_caches"]]
+          if (len({e["id"] for e in entries}) != len(entries) or
+                  any(page["total_count"] != len(entries) for page in pages)):
+              raise SystemExit("Inventory changed while paging; rerun before comparing storage")
+          env = os.environ
+          source = [e for e in entries if e["ref"] == env["SOURCE_REF"] and e["key"] == env["SOURCE_KEY"]]
+          if (len(source) != 1 or source[0]["id"] != int(env["SOURCE_ID"]) or
+                  source[0]["size_in_bytes"] != int(env["SOURCE_OUTER"])):
+              raise SystemExit("The exact #26 cache receipt did not match the base branch")
+          usage = json.loads(Path("usage.json").read_text())["active_caches_size_in_bytes"]
+          used = max(usage, sum(e["size_in_bytes"] for e in entries))
+          budget = 10 * 1024**3 - used - 128 * 1024**2
+          with open(env["GITHUB_OUTPUT"], "a") as out:
+              print(f"budget={budget}", file=out)
+          with open(env["GITHUB_STEP_SUMMARY"], "a") as out:
+              print(f"Cache inventory: {len(entries)} entries, {used:,} bytes in use. "
+                    f"With 128 MiB reserved, the 10 GiB budget allows {budget:,} additional bytes.", file=out)
+              print(f"\nOriginal #26 cache ID {source[0]['id']}: {env['SOURCE_INNER']} inner bytes, "
+                    f"{env['SOURCE_OUTER']} stored bytes.", file=out)
+          PY
+      - name: Restore the exact branch checkpoint
+        id: source
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        timeout-minutes: 12
+        with:
+          path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+          key: ${{ env.SOURCE_KEY }}
+          fail-on-cache-miss: true
+      - name: Verify original archive, continuation and tar identity
+        id: verify
+        timeout-minutes: 30
+        env:
+          MATCH: ${{ steps.source.outputs.cache-matched-key }}
+          HIT: ${{ steps.source.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          [[ $HIT == true && $MATCH == "$SOURCE_KEY" ]]
+          archive="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
+          work="$RUNNER_TEMP/bare-storage-27"
+          [[ -f $archive && ! -L $archive && $(stat -c %s "$archive") == "$SOURCE_INNER" ]]
+          printf '%s  %s\n' "$SOURCE_SHA" "$archive" | sha256sum -c --strict
+          curl --fail --silent --show-error --location --retry 2 --max-time 60 \
+            "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$SOURCE_REV/checkpoint.py" -o "$work/checkpoint.py"
+          printf '%s  %s\n' "$VERIFIER_SHA" "$work/checkpoint.py" | sha256sum -c --strict
+          python3 -I "$work/checkpoint.py" validate-archive "$archive" --production
+          python3 -I "$work/checkpoint.py" verify-continuation "$archive" \
+            --expected-identity "$SOURCE_IDENTITY" --ci-revision "$SOURCE_REV" --production
+          digest=$(gzip -dc -- "$archive" | sha256sum)
+          printf 'tar_sha=%s\n' "${digest%% *}" >> "$GITHUB_OUTPUT"
+          printf 'Validated original SHA-256 `%s`, input identity `%s`, and tar SHA-256 `%s`.\n' \
+            "$SOURCE_SHA" "$SOURCE_IDENTITY" "${digest%% *}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Measure and read back each candidate on the runner
+        timeout-minutes: 115
+        env:
+          TAR_SHA: ${{ steps.verify.outputs.tar_sha }}
+          BUDGET: ${{ steps.inventory.outputs.budget }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
+          work="$RUNNER_TEMP/bare-storage-27"
+          candidate="$work/checkpoint.tar.gz"
+          wrapper="$work/cache.tzst"
+          trap 'rm -f -- "$candidate" "$wrapper"' EXIT
+          [[ $BUDGET =~ ^-?[0-9]+$ && $TAR_SHA =~ ^[0-9a-f]{64}$ ]]
+          gzip --version | sed -n '1p'
+          zstdmt --version
+          {
+            echo 'Packing time includes streaming decompression of the original. Decoding time includes the SHA-256 check.'
+            echo 'Zstd, if measured, requires a gzip conversion or a production reader change for continued use.'
+            echo 'Outer bytes are measured with the production tar/zstdmt command on a runner-local candidate path. The base receipt above is the actual stored size.'
+            echo
+            echo '|Codec|Inner bytes|Outer bytes|Encode s|Decode + hash s|Outer pack s|Outer readback s|Fits current budget|Fits 1,913,319,227 B|'
+            echo '|---|---:|---:|---:|---:|---:|---:|---|---|'
+          } >> "$GITHUB_STEP_SUMMARY"
+          export archive candidate
+          any_gzip_fit=false
+          timed_out=false
+          for codec in gzip-1 gzip-6 gzip-9 zstd-9; do
+            if [[ $codec == zstd-9 && $any_gzip_fit == true ]]; then
+              break
+            fi
+            case "$codec" in
+              gzip-1) minutes=12; encoder=(gzip -n -1 -c); decoder=(gzip -dc);;
+              gzip-6) minutes=25; encoder=(gzip -n -6 -c); decoder=(gzip -dc);;
+              gzip-9) minutes=40; encoder=(gzip -n -9 -c); decoder=(gzip -dc);;
+              zstd-9) minutes=16; encoder=(zstd -q -T2 -9 -c); decoder=(zstd -q -dc);;
+            esac
+            # Keep at most one inner file and one envelope. Never expand the tar to disk.
+            rm -f -- "$candidate" "$wrapper"
+            avail=$(df -B1 --output=avail "$work" | tail -1)
+            (( avail >= 2 * SOURCE_INNER + 1024**3 ))
+            started=$SECONDS
+            if timeout -k 10s "${minutes}m" bash -euo pipefail -c \
+              'gzip -dc -- "$archive" | "$@" > "$candidate"' bash "${encoder[@]}"; then
+              encode_s=$((SECONDS - started))
+            else
+              status=$?
+              if (( status != 124 && status != 137 )); then exit "$status"; fi
+              timed_out=true
+              printf '|%s|timed out|—|%s|—|—|—|unknown|unknown|\n' \
+                "$codec" "$((SECONDS - started))" | tee -a "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            started=$SECONDS
+            tar_digest=$("${decoder[@]}" -- "$candidate" | sha256sum)
+            [[ ${tar_digest%% *} == "$TAR_SHA" ]]
+            decode_s=$((SECONDS - started))
+            inner=$(stat -c %s "$candidate")
+            inner_digest=$(sha256sum -- "$candidate")
+            touch --reference="$archive" "$candidate"
+            started=$SECONDS
+            printf '%s\n' "$candidate" | tar --posix -cf "$wrapper" --exclude cache.tzst -P \
+              -C "$GITHUB_WORKSPACE" --files-from - --use-compress-program zstdmt
+            outer_s=$((SECONDS - started))
+            outer=$(stat -c %s "$wrapper")
+            started=$SECONDS
+            recovered=$(tar -xOf "$wrapper" -P --use-compress-program zstdmt | sha256sum)
+            [[ ${recovered%% *} == "${inner_digest%% *}" ]]
+            readback_s=$((SECONDS - started))
+            bound=$((inner > outer ? inner : outer))
+            live_fit=no
+            if (( bound <= BUDGET )); then
+              live_fit=yes
+              if [[ $codec == gzip-* ]]; then any_gzip_fit=true; fi
+            fi
+            prior_fit=no
+            if (( bound <= 1913319227 )); then prior_fit=yes; fi
+            printf '|%s|%d|%d|%d|%d|%d|%d|%s|%s|\n' \
+              "$codec" "$inner" "$outer" "$encode_s" "$decode_s" "$outer_s" "$readback_s" \
+              "$live_fit" "$prior_fit" | tee -a "$GITHUB_STEP_SUMMARY"
+            printf '%s: verified outer → inner SHA-256 %s → tar SHA-256 %s\n' \
+              "$codec" "${inner_digest%% *}" "${tar_digest%% *}"
+          done
+          printf '%s  %s\n' "$SOURCE_SHA" "$archive" | sha256sum -c --strict
+          printf '\nSource still matched its original SHA-256. Verified candidates passed outer-to-inner and inner-to-tar round trips.\n' >> "$GITHUB_STEP_SUMMARY"
+          if [[ $timed_out == true ]]; then
+            echo 'At least one codec exceeded its time budget. See its row for elapsed time.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+  roundtrip:
+    name: Reconstruct both original checkpoints from tar deltas
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'opened' &&
+      github.repository == 'Areal-U/bare-runner-disk-probe' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'work-bare-27-storage-check' &&
+      github.base_ref == 'bare-coexist-v2.0.4' &&
+      github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      BASE_KEY: bare-coexist-204-44412756135-1-checkpoint-production-s2
+      BASE_SHA: dd2177a80c72db7d0d6b558bec1fbd2c0acf448b28144d02dd26796104315413
+      NEXT_KEY: bare-coexist-204-44477110657-1-checkpoint-production
+      NEXT_SHA: 47c60e1b6c7e9d9668234a7ec3d6cedcf9ae041d1bb8e183c4c4630d40098b57
+      CI_REV: bf70ddbf474f3390a62220a076b8c43347fecc64
+      IDENTITY: a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc
+    steps:
+      - name: Prepare a fresh hosted runner and load the original verifier
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          [[ $RUNNER_ENVIRONMENT == github-hosted && $RUNNER_ARCH == X64 ]]
+          umask 077
+          work="$RUNNER_TEMP/bare-rdiff-27"
+          mkdir "$work"
+          if ! command -v rdiff >/dev/null; then
+            sudo -n apt-get -o Acquire::Retries=2 -qq update
+            sudo -n apt-get -o Acquire::Retries=2 install -y --no-install-recommends rdiff
+          fi
+          dpkg-query -W rdiff gzip zstd
+          curl -fsSL --retry 2 --max-time 60 \
+            "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$CI_REV/checkpoint.py" -o "$work/checkpoint.py"
+          [[ $(git hash-object "$work/checkpoint.py") == 7d66d1ba6373b26d8dd0c5c81c632187ff0f48de ]]
+          # Two originals, one expanded basis, and bounded local intermediates.
+          if (( $(df -B1 --output=avail "$work" | tail -1) < 22 * 1024**3 )); then
+            sudo -n rm -rf -- /usr/local/lib/android/sdk /usr/share/dotnet
+          fi
+          df -h "$work"
+      - name: Restore the exact stage-two checkpoint
+        id: base
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        timeout-minutes: 12
+        with:
+          path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+          key: ${{ env.BASE_KEY }}
+          fail-on-cache-miss: true
+      - name: Verify the stage-two bytes and clear the restore path
+        env:
+          HIT: ${{ steps.base.outputs.cache-hit }}
+          MATCHED: ${{ steps.base.outputs.cache-matched-key }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
+          [[ $HIT == true && $MATCHED == "$BASE_KEY" && -f $archive && ! -L $archive ]]
+          [[ $(stat -c %s "$archive") == 2042700560 ]]
+          printf '%s  %s\n' "$BASE_SHA" "$archive" | sha256sum -c --strict
+          mv -T -- "$archive" "$RUNNER_TEMP/bare-rdiff-27/base.gz"
+      - name: Restore the exact checkpoint 26
+        id: successor
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        timeout-minutes: 12
+        with:
+          path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+          key: ${{ env.NEXT_KEY }}
+          fail-on-cache-miss: true
+      - name: Measure forward and reverse deltas and verify reconstruction
+        timeout-minutes: 65
+        env:
+          HIT: ${{ steps.successor.outputs.cache-hit }}
+          MATCHED: ${{ steps.successor.outputs.cache-matched-key }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
+          [[ $HIT == true && $MATCHED == "$NEXT_KEY" && -f $archive && ! -L $archive ]]
+          [[ $(stat -c %s "$archive") == 2328180957 ]]
+          printf '%s  %s\n' "$NEXT_SHA" "$archive" | sha256sum -c --strict
+          cd "$RUNNER_TEMP/bare-rdiff-27"
+          mv -T -- "$archive" next.gz
+          {
+            echo 'GNU gzip -1 was used for both original checkpoints. Each reconstruction starts with the restored basis and the runner-local cache envelope.'
+            echo
+            echo '|Basis → target|Target gzip B|Basis tar B|Signature B|Delta B|Delta zstd B|Cache envelope B|Basis + signature s|Delta + compress s|Wrap s|Unwrap + apply + gzip s|Read-back + checks s|Exact gzip SHA-256|'
+            echo '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exact_all=yes
+          for direction in forward reverse; do
+            if [[ $direction == forward ]]; then
+              basis=base.gz; reference=next.gz; expected=$NEXT_SHA; label='25s2 → 26'
+            else
+              basis=next.gz; reference=base.gz; expected=$BASE_SHA; label='26 → 25s2'
+            fi
+            echo "::group::$label"
+            started=$SECONDS
+            gzip -dc -- "$basis" | tee basis.tar | rdiff --block-size=4096 -- signature - signature
+            basis_bytes=$(stat -c %s basis.tar)
+            sig_bytes=$(stat -c %s signature)
+            signature_s=$((SECONDS - started))
+            started=$SECONDS
+            gzip -dc -- "$reference" | rdiff -- delta signature | zstd -q -T2 -3 -c > change.rdiff.zst
+            delta_s=$((SECONDS - started))
+            delta_bytes=$(stat -c %s change.rdiff.zst)
+            delta_raw=$(zstd -qdc -- change.rdiff.zst | wc -c)
+            delta_hash=$(sha256sum change.rdiff.zst | cut -d' ' -f1)
+            started=$SECONDS
+            printf '%s\n' "$PWD/change.rdiff.zst" | tar --posix -cf cache.tzst --exclude cache.tzst -P \
+              -C "$GITHUB_WORKSPACE" --files-from - --use-compress-program zstdmt
+            pack_s=$((SECONDS - started))
+            wrapper_bytes=$(stat -c %s cache.tzst)
+            rm -- signature change.rdiff.zst
+            started=$SECONDS
+            tar -xOf cache.tzst -P --use-compress-program zstdmt \
+              | zstd -qdc | rdiff -- patch basis.tar | gzip -n -1 -c > rebuilt.tar.gz
+            patch_s=$((SECONDS - started))
+            rm -- basis.tar cache.tzst
+            started=$SECONDS
+            reference_tar=$(gzip -dc -- "$reference" | sha256sum | cut -d' ' -f1)
+            rebuilt_tar=$(gzip -dc -- rebuilt.tar.gz | sha256sum | cut -d' ' -f1)
+            [[ $rebuilt_tar == "$reference_tar" ]]
+            got=$(sha256sum rebuilt.tar.gz | cut -d' ' -f1)
+            exact=yes
+            if [[ $got != "$expected" ]]; then exact=no; exact_all=no; fi
+            python3 -I checkpoint.py validate-archive rebuilt.tar.gz --production
+            python3 -I checkpoint.py verify-continuation rebuilt.tar.gz \
+              --expected-identity "$IDENTITY" --ci-revision "$CI_REV" --production
+            verify_s=$((SECONDS - started))
+            target_bytes=$(stat -c %s "$reference")
+            printf '|%s|%s|%s|%s|%s|%s|%s|%d|%d|%d|%d|%d|%s|\n' \
+              "$label" "$target_bytes" "$basis_bytes" "$sig_bytes" "$delta_raw" "$delta_bytes" \
+              "$wrapper_bytes" "$signature_s" "$delta_s" "$pack_s" "$patch_s" "$verify_s" "$exact" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            printf '%s tar_sha=%s rebuilt_gzip_sha=%s expected_gzip_sha=%s delta_zstd_sha=%s\n' \
+              "$direction" "$rebuilt_tar" "$got" "$expected" "$delta_hash"
+            rm -- rebuilt.tar.gz
+            echo '::endgroup::'
+          done
+          printf '%s  %s\n' "$BASE_SHA" base.gz "$NEXT_SHA" next.gz | sha256sum -c --strict
+          [[ $exact_all == yes ]]
