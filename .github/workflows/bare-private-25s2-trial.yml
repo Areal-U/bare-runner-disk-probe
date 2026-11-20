@@ -12,9 +12,9 @@ cache-mode: none
 jobs:
   sample:
     name: Check the existing harmless draft probe
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '8b22b3356a5d6ef7cc570faef4cd9b1f56572feb' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '1667f574738060a4cda1ad75b5966d4b1cb0aee2' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
     runs-on: ubuntu-24.04
-    timeout-minutes: 7
+    timeout-minutes: 75
     permissions:
       contents: write
     outputs:
@@ -154,8 +154,55 @@ jobs:
             return "other"
 
 
+        # Shared by the two anonymous API checks in this one runner process.
+        anonymous_wait_seconds = 0
+
+
+        def rate_wait(response, reason, now):
+            primary = reason in {"primary_rate_limit", "primary_rate_limit_public_ip"}
+            secondary = reason == "secondary_rate_limit"
+            if not (primary or secondary) or response.getheader("Location") is not None:
+                return None
+            remaining = response.getheader("X-RateLimit-Remaining")
+            reset = response.getheader("X-RateLimit-Reset")
+            retry = response.getheader("Retry-After")
+            if any(value is not None and not re.fullmatch(r"[0-9]{1,12}", value)
+                   for value in (remaining, reset, retry)):
+                return None
+            if primary and (remaining != "0" or reset is None or int(reset) < now):
+                return None
+            if secondary and (retry is None or int(retry) <= 0 or (remaining == "0" and reset is None)):
+                return None
+            reset_delay = int(reset) - now if reset is not None else 0
+            # Respect the later of both provider deadlines, with five seconds of margin.
+            return max(reset_delay, int(retry or 0)) + 5
+
+
+        def anonymous_api_get(path, label, accept):
+            global anonymous_wait_seconds
+            for attempt in range(2):
+                conn, response = request(API, "GET", path, auth=False, accept=accept)
+                if response.status not in (403, 429):
+                    return conn, response, None
+                reason = failure_reason(response)
+                now = int(time.time())
+                delay = rate_wait(response, reason, now)
+                if attempt or delay is None or anonymous_wait_seconds + delay > 3660:
+                    return conn, response, reason
+                conn.close()
+                anonymous_wait_seconds += delay
+                print(f"anonymous_get={label} status={response.status} reason={reason} "
+                      f"retry_at_epoch={now + delay} wait_seconds={delay}", flush=True)
+                time.sleep(delay)
+            raise AssertionError("Unreachable anonymous retry state")
+
+
         def metadata(path, *, label, auth=True):
-            conn, response = request(API, "GET", path, auth=auth)
+            error_reason = None
+            if not auth and path == BASE and label == "public_repo_control":
+                conn, response, error_reason = anonymous_api_get(path, label, "application/vnd.github+json")
+            else:
+                conn, response = request(API, "GET", path, auth=auth)
             try:
                 if response.status != 200:
                     def safe_header(name, pattern):
@@ -169,7 +216,7 @@ jobs:
                     raise Invalid(f"metadata_get={label} auth={'job_token' if auth else 'none'} "
                                   f"status={response.status} rate_remaining={remaining} rate_reset_epoch={reset} "
                                   f"retry_after_s={retry} request_id={request_id} "
-                                  f"reason={failure_reason(response)}")
+                                  f"reason={error_reason or failure_reason(response)}")
                 raw = response.read(1024 * 1024 + 1)
                 require(len(raw) <= 1024 * 1024, "Unexpectedly large metadata")
                 return json.loads(raw)
@@ -184,6 +231,11 @@ jobs:
             print(" ".join(f"{name}={value}" for name, value in values.items()), flush=True)
 
 
+        TRIAL_PY
+    - &transport_tail
+      name: Complete the reviewed transport client
+      run: |
+        cat >> "$RUNNER_TEMP/draft_transport.py" <<'TRIAL_PY'
         def is_owner(user):
             return user.get("id") == OWNER_ID and user.get("login") == OWNER
 
@@ -259,10 +311,17 @@ jobs:
 
 
         def anonymous_denial(host, path):
-            conn, response = request(host, "GET", path, accept="application/octet-stream")
+            if host == API:
+                conn, response, reason = anonymous_api_get(path, "probe_or_archive_asset", "application/octet-stream")
+            else:
+                conn, response = request(host, "GET", path, accept="application/octet-stream")
+                reason = None
             try:
                 # A 302 can be a signed asset URL. Do not follow it or print its value.
-                require(response.status == 404, f"Anonymous denial inconclusive: HTTP {response.status}")
+                location = response.getheader("Location") is not None
+                require(response.status == 404 and not location,
+                        f"Anonymous denial inconclusive: HTTP {response.status}, "
+                        f"location_present={location}, reason={reason or 'unclassified'}")
             finally:
                 conn.close()
 
@@ -438,7 +497,7 @@ jobs:
       run: python3 -I "$RUNNER_TEMP/draft_transport.py" probe-locate
   limited:
     name: Check draft access with an ordinary read-only job
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '8b22b3356a5d6ef7cc570faef4cd9b1f56572feb' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '1667f574738060a4cda1ad75b5966d4b1cb0aee2' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
     runs-on: ubuntu-24.04
     timeout-minutes: 7
     permissions:
@@ -447,6 +506,7 @@ jobs:
     - sample
     steps:
     - *id001
+    - *transport_tail
     - name: Check draft access with an ordinary read-only job
       id: transfer
       env:
@@ -456,9 +516,9 @@ jobs:
       run: python3 -I "$RUNNER_TEMP/draft_transport.py" read-boundary
   reader:
     name: Verify the probe from a separate authorized runner
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '8b22b3356a5d6ef7cc570faef4cd9b1f56572feb' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '1667f574738060a4cda1ad75b5966d4b1cb0aee2' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
     runs-on: ubuntu-24.04
-    timeout-minutes: 7
+    timeout-minutes: 75
     permissions:
       contents: write
     needs:
@@ -467,6 +527,7 @@ jobs:
       probe_verified: ${{ steps.transfer.outputs.probe_verified }}
     steps:
     - *id001
+    - *transport_tail
     - name: Verify the probe from a separate authorized runner
       id: transfer
       env:
@@ -476,9 +537,9 @@ jobs:
       run: python3 -I "$RUNNER_TEMP/draft_transport.py" probe-read
   save:
     name: Save the verified stage-two archive to the draft
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '8b22b3356a5d6ef7cc570faef4cd9b1f56572feb' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '1667f574738060a4cda1ad75b5966d4b1cb0aee2' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 103
     permissions:
       actions: read
       contents: write
@@ -491,6 +552,7 @@ jobs:
     cache-mode: read
     steps:
     - *id001
+    - *transport_tail
     - name: Restore only the exact original on the sender
       id: cache
       uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
@@ -510,9 +572,9 @@ jobs:
       run: python3 -I "$RUNNER_TEMP/draft_transport.py" archive-write --path "$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
   restore:
     name: Restore the external archive on a fresh runner
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '8b22b3356a5d6ef7cc570faef4cd9b1f56572feb' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '1667f574738060a4cda1ad75b5966d4b1cb0aee2' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
     runs-on: ubuntu-24.04
-    timeout-minutes: 170
+    timeout-minutes: 238
     permissions:
       contents: write
     needs:
@@ -520,6 +582,7 @@ jobs:
     - save
     steps:
     - *id001
+    - *transport_tail
     - name: Restore the external archive on a fresh runner
       id: transfer
       env:
@@ -546,7 +609,7 @@ jobs:
         export PRODUCER_REV=bf70ddbf474f3390a62220a076b8c43347fecc64
         jq -e --arg repo "$GITHUB_REPOSITORY" --arg rev "$PRODUCER_REV" '
           .action == "synchronize" and .number == 9 and
-          .before == "8b22b3356a5d6ef7cc570faef4cd9b1f56572feb" and
+          .before == "1667f574738060a4cda1ad75b5966d4b1cb0aee2" and
           .pull_request.head.ref == "work-bare-27-storage-check" and .pull_request.base.repo.full_name == $repo and
           .pull_request.head.repo.full_name == $repo and
           .pull_request.base.ref == "bare-coexist-v2.0.4" and .pull_request.base.sha == $rev and
