@@ -10,22 +10,19 @@ name: Private stage-two checkpoint round trip
 permissions: {}
 cache-mode: none
 jobs:
-  sample:
-    name: Check the existing harmless draft probe
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '1667f574738060a4cda1ad75b5966d4b1cb0aee2' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+  restore:
+    name: Restore the saved external archive on a fresh runner
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == 'e629a7bbb27ef61fede06ef7b743e2f90aaf8f54' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 170
     permissions:
       contents: write
-    outputs:
-      release_id: ${{ steps.transfer.outputs.release_id }}
-      probe_id: ${{ steps.transfer.outputs.probe_id }}
     steps:
-    - &id001
-      name: Prepare the reviewed transport client
+    - &prepare_saved_asset_client
+      name: Prepare the fixed-asset retrieval client
       run: |
         cat > "$RUNNER_TEMP/draft_transport.py" <<'TRIAL_PY'
-        """Transfer the fixed 2.0.4 checkpoint using the owner-created, preflighted draft."""
+        """Retrieve the fixed, previously saved checkpoint or verify its anonymous access boundary."""
         import argparse
         import hashlib
         import http.client
@@ -36,27 +33,22 @@ jobs:
         import sys
         import tarfile
         import time
-        from urllib.parse import quote, urlencode, urlsplit
+        from urllib.parse import urlsplit
 
         REPO = "Areal-U/bare-runner-disk-probe"
         OWNER = "Areal-U"
+        OWNER_ID = 292261483
+        RELEASE_ID = 452114666
+        ASSET_ID = 770240309
         BASE = "/repos/" + REPO
-        DRAFT_TAG_SHA256 = "87e74b8d9cea507bbd968b4ef71a0f0398b7f1eb861a13b16ca8a54c16eae9bb"
         DRAFT_TITLE = "Private checkpoint transport probe (25-s2)"
         DRAFT_TARGETS = {"main", "7e82bca69557079315df4813effbe46c41644c0f"}
-        OWNER_ID = 292261483
-        PROBE_BYTES = 49
-        PROBE_SHA = "6d3adfcb254e849273bf1acb809da3e670b55706abda9e791798b2f4002a9055"
-        KEY = "bare-coexist-204-44412756135-1-checkpoint-production-s2"
-        CACHE_ID = 10769653943
-        CACHE_BYTES = 2034262991
+        DRAFT_TAG_SHA256 = "87e74b8d9cea507bbd968b4ef71a0f0398b7f1eb861a13b16ca8a54c16eae9bb"
+        ARCHIVE = "checkpoint-25-s2.tar.gz"
         BYTES = 2042700560
         SHA = "dd2177a80c72db7d0d6b558bec1fbd2c0acf448b28144d02dd26796104315413"
         IDENTITY = "a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc"
-        SAMPLE = "owner-storage-probe.txt"
-        ARCHIVE = "checkpoint-25-s2.tar.gz"
         API = "api.github.com"
-        UPLOAD = "uploads.github.com"
         CDNS = {"release-assets.githubusercontent.com", "objects.githubusercontent.com"}
         CHUNK = 1024 * 1024
 
@@ -70,278 +62,138 @@ jobs:
                 raise Invalid(message)
 
 
-        def integer(name):
-            value = os.environ.get(name, "")
-            require(re.fullmatch("[1-9][0-9]{0,19}", value), f"Invalid {name}")
-            return int(value)
-
-
-        def request(host, method, path, *, auth=False, accept="application/vnd.github+json",
-                    body=None, length=None, content_type=None):
+        def get(host, path, *, auth=False, accept="application/vnd.github+json"):
+            require(host in {API, "github.com"} | CDNS, "Unexpected host")
             headers = {"Accept": accept, "User-Agent": "bare-private-checkpoint-trial/1"}
-            if host in {API, UPLOAD}:
+            if host == API:
                 headers["X-GitHub-Api-Version"] = "2022-11-28"
             if auth:
-                require(host in {API, UPLOAD}, "Refusing authentication to asset host")
-                token = os.environ.get("GH_TOKEN", "")
-                require(token, "Job token missing")
-                headers["Authorization"] = "Bearer " + token
-            if length is not None:
-                headers["Content-Length"] = str(length)
-            if content_type:
-                headers["Content-Type"] = content_type
+                require(host == API and os.environ.get("GH_TOKEN"), "Missing scoped API authorization")
+                headers["Authorization"] = "Bearer " + os.environ["GH_TOKEN"]
             conn = http.client.HTTPSConnection(host, timeout=150, blocksize=CHUNK)
             try:
-                conn.request(method, path, body, headers)
+                conn.request("GET", path, headers=headers)
                 return conn, conn.getresponse()
             except BaseException:
                 conn.close()
                 raise
 
 
-        def failure_reason(response):
-            # Emit only a fixed category. Never log the response or a message fragment.
+        def pinned_tag(value):
+            return isinstance(value, str) and hashlib.sha256(value.encode()).hexdigest() == DRAFT_TAG_SHA256
+
+
+        def fixed_asset():
+            conn, response = get(API, f"{BASE}/releases/{RELEASE_ID}", auth=True)
             try:
-                raw = response.read(4097)
-                if len(raw) > 4096:
-                    return "other"
-                body = json.loads(raw.decode("utf-8"))
-            except (OSError, http.client.HTTPException, ValueError, RecursionError):
-                return "other"
-            message = body.get("message") if isinstance(body, dict) else None
-            if not isinstance(message, str):
-                return "other"
-            fixed = {
-                "Resource not accessible by integration": "integration_access_denied",
-                "Resource not accessible by personal access token": "personal_token_access_denied",
-                "Requires authentication": "authentication_required",
-                "Bad credentials": "invalid_credentials",
-                "Must have push access to repository": "push_access_required",
-                "Must have admin rights to Repository": "admin_access_required",
-                "Must have admin rights to the repository": "admin_access_required",
-            }
-            if message.startswith(("You have exceeded a secondary rate limit",
-                                   "You have triggered an abuse detection mechanism")):
-                return "secondary_rate_limit"
-            if message.startswith("API rate limit exceeded"):
-                import ipaddress
-                ip_match = re.match(r"API rate limit exceeded for (\[?[A-Fa-f0-9:.]+\]?)(?:\s|$)", message)
-                if ip_match:
-                    try:
-                        if ipaddress.ip_address(ip_match[1].strip("[]").rstrip(".")).is_global:
-                            return "primary_rate_limit_public_ip"
-                    except ValueError:
-                        pass
-                return "primary_rate_limit"
-            exact = fixed.get(message.removesuffix("."))
-            if exact:
-                return exact
-            # Describe only restrictions explicitly mentioned in the same clause.
-            for clause in re.split(r"[;\n]|\.\s+", message[:640].lower()):
-                clause = re.split(r"https?://", clause, maxsplit=1)[0]
-                if not re.search(r"\b(cannot|can't|may not|restricted|forbidden|denied|requires?|"
-                                 r"not (allowed|authorized|accessible|permitted|supported)|"
-                                 r"only (available|visible|accessible))\b", clause):
-                    continue
-                draft = re.search(r"\b(draft|unpublished) releases?\b", clause)
-                actions = re.search(r"\b(github_token|github actions|workflow tokens?|actions tokens?)\b", clause)
-                if draft and actions:
-                    return "draft_and_actions_restriction_mentioned"
-                if draft:
-                    return "draft_restriction_mentioned"
-                if actions:
-                    return "actions_restriction_mentioned"
-            return "other"
-
-
-        # Shared by the two anonymous API checks in this one runner process.
-        anonymous_wait_seconds = 0
-
-
-        def rate_wait(response, reason, now):
-            primary = reason in {"primary_rate_limit", "primary_rate_limit_public_ip"}
-            secondary = reason == "secondary_rate_limit"
-            if not (primary or secondary) or response.getheader("Location") is not None:
-                return None
-            remaining = response.getheader("X-RateLimit-Remaining")
-            reset = response.getheader("X-RateLimit-Reset")
-            retry = response.getheader("Retry-After")
-            if any(value is not None and not re.fullmatch(r"[0-9]{1,12}", value)
-                   for value in (remaining, reset, retry)):
-                return None
-            if primary and (remaining != "0" or reset is None or int(reset) < now):
-                return None
-            if secondary and (retry is None or int(retry) <= 0 or (remaining == "0" and reset is None)):
-                return None
-            reset_delay = int(reset) - now if reset is not None else 0
-            # Respect the later of both provider deadlines, with five seconds of margin.
-            return max(reset_delay, int(retry or 0)) + 5
-
-
-        def anonymous_api_get(path, label, accept):
-            global anonymous_wait_seconds
-            for attempt in range(2):
-                conn, response = request(API, "GET", path, auth=False, accept=accept)
-                if response.status not in (403, 429):
-                    return conn, response, None
-                reason = failure_reason(response)
-                now = int(time.time())
-                delay = rate_wait(response, reason, now)
-                if attempt or delay is None or anonymous_wait_seconds + delay > 3660:
-                    return conn, response, reason
-                conn.close()
-                anonymous_wait_seconds += delay
-                print(f"anonymous_get={label} status={response.status} reason={reason} "
-                      f"retry_at_epoch={now + delay} wait_seconds={delay}", flush=True)
-                time.sleep(delay)
-            raise AssertionError("Unreachable anonymous retry state")
-
-
-        def metadata(path, *, label, auth=True):
-            error_reason = None
-            if not auth and path == BASE and label == "public_repo_control":
-                conn, response, error_reason = anonymous_api_get(path, label, "application/vnd.github+json")
-            else:
-                conn, response = request(API, "GET", path, auth=auth)
-            try:
-                if response.status != 200:
-                    def safe_header(name, pattern):
-                        value = response.getheader(name) or ""
-                        return value if re.fullmatch(pattern, value) else "unavailable"
-
-                    remaining = safe_header("X-RateLimit-Remaining", r"[0-9]{1,12}")
-                    reset = safe_header("X-RateLimit-Reset", r"[0-9]{1,12}")
-                    retry = safe_header("Retry-After", r"[0-9]{1,12}")
-                    request_id = safe_header("X-GitHub-Request-Id", r"[0-9A-Fa-f]{1,16}(?::[0-9A-Fa-f]{1,16}){3,5}")
-                    raise Invalid(f"metadata_get={label} auth={'job_token' if auth else 'none'} "
-                                  f"status={response.status} rate_remaining={remaining} rate_reset_epoch={reset} "
-                                  f"retry_after_s={retry} request_id={request_id} "
-                                  f"reason={error_reason or failure_reason(response)}")
+                require(response.status == 200, f"Authenticated draft metadata HTTP {response.status}")
                 raw = response.read(1024 * 1024 + 1)
                 require(len(raw) <= 1024 * 1024, "Unexpectedly large metadata")
-                return json.loads(raw)
+                draft = json.loads(raw)
             finally:
                 conn.close()
-
-
-        def output(**values):
-            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii") as stream:
-                for name, value in values.items():
-                    stream.write(f"{name}={value}\n")
-            print(" ".join(f"{name}={value}" for name, value in values.items()), flush=True)
-
-
-        TRIAL_PY
-    - &transport_tail
-      name: Complete the reviewed transport client
-      run: |
-        cat >> "$RUNNER_TEMP/draft_transport.py" <<'TRIAL_PY'
-        def is_owner(user):
-            return user.get("id") == OWNER_ID and user.get("login") == OWNER
-
-
-        def draft_matches(record, release_id=None):
-            require(record["draft"] is True and record["published_at"] is None and
-                    record["name"] == DRAFT_TITLE and is_owner(record["author"]) and
-                    isinstance(record["id"], int) and record["id"] > 0 and
-                    (release_id is None or record["id"] == release_id),
-                    "Draft owner, name, numeric ID, or publication state changed")
-            target = record["target_commitish"]
-            tag = record["tag_name"]
-            # The editor assigns an untagged-... permalink when the owner saves an
-            # untagged draft. Accept an empty API tag only with that exact permalink.
-            url = urlsplit(record.get("html_url") or "")
+            require(draft["id"] == RELEASE_ID and draft["draft"] is True and draft["published_at"] is None and
+                    draft["author"]["login"] == OWNER and draft["author"]["id"] == OWNER_ID and
+                    draft["name"] == DRAFT_TITLE and draft["target_commitish"] in DRAFT_TARGETS,
+                    "Draft owner, receipt, target or publication status changed")
+            tag = draft["tag_name"]
+            url = urlsplit(draft.get("html_url") or "")
             prefix = f"/{REPO}/releases/tag/"
-            permalink_tag = url.path[len(prefix):] if url.scheme == "https" and url.netloc == "github.com" and url.path.startswith(prefix) else ""
-            def pinned_tag(value):
-                return isinstance(value, str) and hashlib.sha256(value.encode()).hexdigest() == DRAFT_TAG_SHA256
-            require(pinned_tag(tag) or (tag in (None, "") and pinned_tag(permalink_tag)),
-                    "Draft tag or permalink differs from the independently verified owner draft")
-            require(target in DRAFT_TARGETS, "Draft target differs from the owner receipt")
-            return record
-
-
-        def locate_draft():
-            matches = []
-            for page_number in range(1, 6):
-                page = metadata(f"{BASE}/releases?per_page=20&page={page_number}", label="release_list")
-                require(isinstance(page, list), "Unexpected release inventory")
-                matches.extend(item for item in page if item.get("name") == DRAFT_TITLE and
-                               item.get("draft") is True and is_owner(item.get("author") or {}))
-                if len(page) < 20:
-                    break
-            else:
-                raise Invalid("Cannot establish complete bounded draft inventory")
-            require(len(matches) == 1, "Expected exactly one matching owner-created draft")
-            return draft_matches(matches[0])
-
-
-        def draft(release_id):
-            return draft_matches(metadata(f"{BASE}/releases/{release_id}", label="draft_by_id"), release_id)
-
-
-        def asset_info(release, name, size, digest, asset_id=None):
-            items = [a for a in release["assets"] if a["name"] == name]
-            require(len(items) == 1, "Expected one asset on this draft")
-            asset = items[0]
-            require(asset["state"] == "uploaded" and asset["size"] == size and
-                    asset.get("digest") == "sha256:" + digest and
-                    isinstance(asset["id"], int) and asset["id"] > 0 and
-                    (asset_id is None or asset["id"] == asset_id),
-                    "Draft asset receipt does not match")
-            if name == SAMPLE:
-                require(is_owner(asset.get("uploader") or {}), "Probe asset owner changed")
+            permalink = url.path[len(prefix):] if url.scheme == "https" and url.netloc == "github.com" and url.path.startswith(prefix) else ""
+            require(pinned_tag(tag) or (tag in (None, "") and pinned_tag(permalink)), "Draft tag or permalink changed")
+            entries = [a for a in draft["assets"] if a["name"] == ARCHIVE]
+            require(len(entries) == 1, "Expected one checkpoint with this name")
+            asset = entries[0]
+            require(asset["id"] == ASSET_ID and asset["state"] == "uploaded" and
+                    asset["size"] == BYTES and asset.get("digest") == "sha256:" + SHA, "Stored asset receipt changed")
             return asset
 
 
-        def upload(release_id, name, file, size, digest):
-            require((name, size, digest) == (ARCHIVE, BYTES, SHA), "Only the fixed checkpoint may be uploaded")
-            release = draft(release_id)
-            require(not any(a["name"] == name for a in release["assets"]),
-                    "Refusing to overwrite an asset")
-            path = f"{BASE}/releases/{release_id}/assets?name=" + quote(name)
-            connection, response = request(UPLOAD, "POST", path, auth=True, body=file,
-                                           length=size, content_type="application/octet-stream")
+        def rate_reason(response):
+            # Print only a known classification. Never echo an error body, IP address, or redirect.
             try:
-                require(response.status == 201, f"Asset upload returned {response.status}")
-                result = json.loads(response.read(128 * 1024))
-            finally:
-                connection.close()
-            return asset_info(draft(release_id), name, size, digest, result["id"])["id"]
+                raw = response.read(4097)
+                if len(raw) > 4096:
+                    return "unclassified"
+                body = json.loads(raw)
+            except (OSError, http.client.HTTPException, ValueError, RecursionError):
+                return "unclassified"
+            message = body.get("message") if isinstance(body, dict) else None
+            if not isinstance(message, str):
+                return "unclassified"
+            if message.startswith("API rate limit exceeded"):
+                return "primary_rate_limit"
+            if message.startswith(("You have exceeded a secondary rate limit", "You have triggered an abuse detection mechanism")):
+                return "secondary_rate_limit"
+            if message.removesuffix(".") == "Resource not accessible by integration":
+                return "integration_access_denied"
+            return "unclassified"
 
 
-        def anonymous_denial(host, path):
-            if host == API:
-                conn, response, reason = anonymous_api_get(path, "probe_or_archive_asset", "application/octet-stream")
+        def rate_deadline(response, reason, now):
+            remaining = response.getheader("X-RateLimit-Remaining")
+            reset = response.getheader("X-RateLimit-Reset")
+            retry = response.getheader("Retry-After")
+            if any(value is not None and not re.fullmatch(r"[0-9]{1,12}", value) for value in (remaining, reset, retry)):
+                return None
+            if reason == "primary_rate_limit":
+                if remaining != "0" or reset is None or int(reset) < now:
+                    return None
+            elif reason == "secondary_rate_limit":
+                if retry is None or int(retry) <= 0 or (remaining == "0" and reset is None):
+                    return None
             else:
-                conn, response = request(host, "GET", path, accept="application/octet-stream")
-                reason = None
+                return None
+            # A reset for a nonempty quota need not be reached, unless GitHub has also asked for a longer delay.
+            reset_at = int(reset) if remaining == "0" and reset else 0
+            return max(reset_at, now + int(retry or 0)) + 5
+
+
+        def anonymous_status(host, path, label):
+            conn, response = get(host, path, accept="application/octet-stream")
             try:
-                # A 302 can be a signed asset URL. Do not follow it or print its value.
+                status = response.status
                 location = response.getheader("Location") is not None
-                require(response.status == 404 and not location,
-                        f"Anonymous denial inconclusive: HTTP {response.status}, "
-                        f"location_present={location}, reason={reason or 'unclassified'}")
+                reason = rate_reason(response) if host == API and status in (403, 429) and not location else "unclassified"
+                print(f"anonymous_{label}={status} location_present={location} reason={reason}", flush=True)
+                if status == 404 and not location:
+                    return None
+                if host == API and status in (403, 429) and not location:
+                    deadline = rate_deadline(response, reason, int(time.time()))
+                    if deadline is not None:
+                        return deadline
+                raise Invalid(f"Anonymous {label} did not return a nonredirecting 404")
             finally:
                 conn.close()
 
 
-        def check_anonymous(asset):
-            control = metadata(BASE, label="public_repo_control", auth=False)
-            require(control["full_name"] == REPO and control["private"] is False,
-                    "Anonymous public-repository control failed")
+        def check_privacy(asset):
             ref = urlsplit(asset["browser_download_url"])
             require(ref.scheme == "https" and ref.netloc == "github.com" and
-                    ref.path.startswith("/" + REPO + "/releases/download/") and not ref.query and
-                    not ref.fragment, "Unexpected direct asset URL")
-            anonymous_denial("github.com", ref.path)
-            anonymous_denial(API, f"{BASE}/releases/assets/{asset['id']}")
-            print("anonymous_public_control=200 anonymous_direct=404 anonymous_asset_api=404", flush=True)
+                    ref.path.startswith("/" + REPO + "/releases/download/") and
+                    ref.path.endswith("/" + ARCHIVE) and not ref.query and not ref.fragment, "Unexpected direct asset URL")
+            anonymous_status("github.com", ref.path, "direct")
+            # Honor the last provider reset observed in run 44658441243, then any subsequent
+            # genuine throttle on this exact official anonymous asset API, on this same runner.
+            deadline = 1795147367 + 5
+            budget_end = time.monotonic() + 7800
+            for attempt in range(4):
+                delay = max(0, deadline - int(time.time()))
+                if delay:
+                    require(time.monotonic() + delay <= budget_end, "Anonymous API wait budget exhausted")
+                    print(f"anonymous_asset_api_retry_at_epoch={deadline} wait_seconds={delay}", flush=True)
+                    time.sleep(delay)
+                deadline = anonymous_status(API, f"{BASE}/releases/assets/{ASSET_ID}", "asset_api")
+                if deadline is None:
+                    fixed_asset()
+                    print(f"private_asset_verified={ASSET_ID} release_id={RELEASE_ID}", flush=True)
+                    return
+            raise Invalid("Anonymous API remained rate-limited after the allowed attempts")
 
 
         def download(asset_id, size, expected_hash, destination):
             path = f"{BASE}/releases/assets/{asset_id}"
-            conn, response = request(API, "GET", path, auth=True, accept="application/octet-stream")
+            conn, response = get(API, path, auth=True, accept="application/octet-stream")
             try:
                 if response.status == 302:
                     target = urlsplit(response.getheader("Location", ""))
@@ -349,7 +201,7 @@ jobs:
                             target.path.startswith("/") and not target.fragment, "Unrecognized asset redirect")
                     conn.close()
                     # Signed URL is consumed in memory. Never send the repository token to a CDN.
-                    conn, response = request(target.netloc, "GET", target.path + ("?" + target.query if target.query else ""),
+                    conn, response = get(target.netloc, target.path + ("?" + target.query if target.query else ""),
                                              accept="application/octet-stream")
                 require(response.status == 200, f"Asset retrieval returned {response.status}")
                 found = 0
@@ -358,8 +210,7 @@ jobs:
                     found += len(block)
                     require(found <= size, "Download exceeded expected length")
                     digest.update(block)
-                    if destination is not None:
-                        destination.write(block)
+                    destination.write(block)
                 require(found == size and digest.hexdigest() == expected_hash, "Retrieved asset bytes differ")
             finally:
                 conn.close()
@@ -378,107 +229,26 @@ jobs:
             raise Invalid("Checkpoint provenance was absent")
 
 
-        def source_receipt():
-            query = urlencode({"key": KEY, "ref": "refs/heads/bare-coexist-v2.0.4", "per_page": 100})
-            result = metadata(f"{BASE}/actions/caches?{query}", label="source_cache_rows")
-            entries = [r for r in result["actions_caches"] if r["key"] == KEY]
-            require(result["total_count"] == len(result["actions_caches"]) and len(entries) == 1 and
-                    entries[0]["id"] == CACHE_ID and entries[0]["size_in_bytes"] == CACHE_BYTES and
-                    entries[0]["ref"] == "refs/heads/bare-coexist-v2.0.4", "Original cache receipt differs")
-            require(os.environ.get("MATCHED_CACHE_KEY") == KEY, "Restore action did not report the exact key")
-
-
         def main():
             parser = argparse.ArgumentParser()
-            parser.add_argument("stage", choices=["probe-locate", "read-boundary", "probe-read", "archive-write", "archive-read"])
-            parser.add_argument("--path", type=Path)
+            parser.add_argument("stage", choices=["receive", "privacy"])
             args = parser.parse_args()
             require(os.environ.get("GITHUB_REPOSITORY") == REPO and os.environ.get("GITHUB_ACTOR") == OWNER and
                     os.environ.get("GITHUB_TRIGGERING_ACTOR") == OWNER, "Unexpected repository or actor")
-            start = time.monotonic()
-
-            if args.stage == "probe-locate":
-                release_id = locate_draft()["id"]
-                receipt = asset_info(draft(release_id), SAMPLE, PROBE_BYTES, PROBE_SHA)
-                check_anonymous(receipt)
-                output(release_id=release_id, probe_id=receipt["id"], bytes=PROBE_BYTES, sha256=PROBE_SHA)
-            elif args.stage == "read-boundary":
-                release_id, probe_id = integer("RELEASE_ID"), integer("PROBE_ID")
-                def check_public_control(label):
-                    repo = metadata(BASE, label=label)
-                    require(repo["full_name"] == REPO and repo["private"] is False,
-                            "Authenticated public repository control failed")
-
-                check_public_control("token_repo_control")
-                denials = []
-                for label, path, accept in [
-                    ("draft", f"{BASE}/releases/{release_id}", "application/vnd.github+json"),
-                    ("asset", f"{BASE}/releases/assets/{probe_id}", "application/octet-stream"),
-                ]:
-                    conn, response = request(API, "GET", path, auth=True, accept=accept)
-                    try:
-                        status = response.status
-                        reason = failure_reason(response) if status in (403, 404) else "unchecked"
-                        location = response.getheader("Location") is not None
-                        remaining = response.getheader("X-RateLimit-Remaining")
-                        # A zero or malformed quota, retry hint or explicit throttle is inconclusive.
-                        rate_signal = (status == 429 or response.getheader("Retry-After") is not None or
-                                       (remaining is not None and (not re.fullmatch(r"[0-9]{1,12}", remaining)
-                                                                  or int(remaining) == 0)) or
-                                       reason in {"primary_rate_limit", "primary_rate_limit_public_ip",
-                                                  "secondary_rate_limit"})
-                        explicitly_denied = status == 403 and reason in {
-                            "integration_access_denied", "push_access_required",
-                        }
-                        denials.append(not location and not rate_signal and (status == 404 or explicitly_denied))
-                        print(f"read_only_{label}_status={status} reason={reason} "
-                              f"location_present={location} rate_signal={rate_signal}", flush=True)
-                        require(not rate_signal, "Read boundary stopped before further GETs on a rate signal")
-                    finally:
-                        conn.close()
-                check_public_control("token_repo_control_after")
-                require(all(denials), "The draft or asset did not meet the read boundary")
-                output(read_boundary_verified=probe_id)
-            else:
-                release_id = integer("RELEASE_ID")
-                release = draft(release_id)
-                if args.stage == "probe-read":
-                    asset = asset_info(release, SAMPLE, PROBE_BYTES, PROBE_SHA, integer("PROBE_ID"))
-                    check_anonymous(asset)
-                    download(asset["id"], PROBE_BYTES, PROBE_SHA, None)
-                    output(probe_verified=asset["id"], bytes=PROBE_BYTES, sha256=PROBE_SHA)
-                elif args.stage == "archive-write":
-                    require(integer("PROBE_VERIFIED") == integer("PROBE_ID"), "Separate probe receipt mismatch")
-                    probe_asset = asset_info(release, SAMPLE, PROBE_BYTES, PROBE_SHA, integer("PROBE_ID"))
-                    check_anonymous(probe_asset)
-                    source_receipt()
-                    require(args.path is not None and args.path.is_file() and not args.path.is_symlink()
-                            and args.path.stat().st_size == BYTES, "Unexpected local checkpoint file")
-                    with args.path.open("rb") as stream:
-                        digest = hashlib.sha256()
-                        while block := stream.read(CHUNK):
-                            digest.update(block)
-                        require(digest.hexdigest() == SHA, "Original checkpoint digest differs")
-                        archive_identity(args.path)
-                        stream.seek(0)
-                        write_started = time.monotonic()
-                        asset = upload(release_id, ARCHIVE, stream, BYTES, SHA)
-                    output(asset_id=asset, bytes=BYTES, sha256=SHA, identity=IDENTITY,
-                           cache_id=CACHE_ID, upload_seconds=round(time.monotonic() - write_started, 3))
-                else:
-                    asset = asset_info(release, ARCHIVE, BYTES, SHA, integer("ASSET_ID"))
-                    check_anonymous(asset)
-                    require(args.path is not None and not args.path.is_symlink() and not args.path.exists(),
-                            "Restore destination must be fresh")
-                    started = time.monotonic()
-                    with args.path.open("xb") as stream:
-                        download(asset["id"], BYTES, SHA, stream)
-                    received = round(time.monotonic() - started, 3)
-                    archive_identity(args.path)
-                    draft(release_id)
-                    output(asset_id=asset["id"], bytes=BYTES, sha256=SHA, identity=IDENTITY,
-                           download_seconds=received)
-            output(stage_seconds=round(time.monotonic() - start, 3))
+            asset = fixed_asset()
+            if args.stage == "privacy":
+                check_privacy(asset)
+                return
+            path = Path(os.environ["RUNNER_TEMP"]) / "bare-s2-download.tar.gz"
+            require(not path.is_symlink() and not path.exists(), "Restore destination must be fresh")
+            started = time.monotonic()
+            with path.open("xb") as stream:
+                download(ASSET_ID, BYTES, SHA, stream)
+            elapsed = time.monotonic() - started
+            archive_identity(path)
+            fixed_asset()
+            print(f"asset_id={ASSET_ID} release_id={RELEASE_ID} bytes={BYTES} sha256={SHA} "
+                  f"identity={IDENTITY} download_seconds={elapsed:.3f}", flush=True)
 
 
         if __name__ == "__main__":
@@ -487,109 +257,12 @@ jobs:
             except Invalid as exc:
                 sys.exit(str(exc))
             except Exception as exc:
-                # Transport errors may contain a signed CDN URL. Never stringify them in CI.
                 sys.exit("Transport interrupted: " + type(exc).__name__)
         TRIAL_PY
-    - name: Verify the known draft and deny anonymous access
-      id: transfer
+    - name: Restore the saved external archive on a fresh runner
       env:
         GH_TOKEN: ${{ github.token }}
-      run: python3 -I "$RUNNER_TEMP/draft_transport.py" probe-locate
-  limited:
-    name: Check draft access with an ordinary read-only job
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '1667f574738060a4cda1ad75b5966d4b1cb0aee2' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 7
-    permissions:
-      contents: read
-    needs:
-    - sample
-    steps:
-    - *id001
-    - *transport_tail
-    - name: Check draft access with an ordinary read-only job
-      id: transfer
-      env:
-        RELEASE_ID: ${{ needs.sample.outputs.release_id }}
-        PROBE_ID: ${{ needs.sample.outputs.probe_id }}
-        GH_TOKEN: ${{ github.token }}
-      run: python3 -I "$RUNNER_TEMP/draft_transport.py" read-boundary
-  reader:
-    name: Verify the probe from a separate authorized runner
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '1667f574738060a4cda1ad75b5966d4b1cb0aee2' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 75
-    permissions:
-      contents: write
-    needs:
-    - sample
-    outputs:
-      probe_verified: ${{ steps.transfer.outputs.probe_verified }}
-    steps:
-    - *id001
-    - *transport_tail
-    - name: Verify the probe from a separate authorized runner
-      id: transfer
-      env:
-        RELEASE_ID: ${{ needs.sample.outputs.release_id }}
-        PROBE_ID: ${{ needs.sample.outputs.probe_id }}
-        GH_TOKEN: ${{ github.token }}
-      run: python3 -I "$RUNNER_TEMP/draft_transport.py" probe-read
-  save:
-    name: Save the verified stage-two archive to the draft
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '1667f574738060a4cda1ad75b5966d4b1cb0aee2' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 103
-    permissions:
-      actions: read
-      contents: write
-    needs:
-    - sample
-    - limited
-    - reader
-    outputs:
-      asset_id: ${{ steps.transfer.outputs.asset_id }}
-    cache-mode: read
-    steps:
-    - *id001
-    - *transport_tail
-    - name: Restore only the exact original on the sender
-      id: cache
-      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
-      timeout-minutes: 12
-      with:
-        path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
-        key: bare-coexist-204-44412756135-1-checkpoint-production-s2
-        fail-on-cache-miss: true
-    - name: Save the verified stage-two archive to the draft
-      id: transfer
-      env:
-        RELEASE_ID: ${{ needs.sample.outputs.release_id }}
-        PROBE_ID: ${{ needs.sample.outputs.probe_id }}
-        PROBE_VERIFIED: ${{ needs.reader.outputs.probe_verified }}
-        MATCHED_CACHE_KEY: ${{ steps.cache.outputs.cache-matched-key }}
-        GH_TOKEN: ${{ github.token }}
-      run: python3 -I "$RUNNER_TEMP/draft_transport.py" archive-write --path "$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
-  restore:
-    name: Restore the external archive on a fresh runner
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '1667f574738060a4cda1ad75b5966d4b1cb0aee2' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 238
-    permissions:
-      contents: write
-    needs:
-    - sample
-    - save
-    steps:
-    - *id001
-    - *transport_tail
-    - name: Restore the external archive on a fresh runner
-      id: transfer
-      env:
-        RELEASE_ID: ${{ needs.sample.outputs.release_id }}
-        ASSET_ID: ${{ needs.save.outputs.asset_id }}
-        GH_TOKEN: ${{ github.token }}
-      run: python3 -I "$RUNNER_TEMP/draft_transport.py" archive-read --path "$RUNNER_TEMP/bare-s2-download.tar.gz"
+      run: python3 -I "$RUNNER_TEMP/draft_transport.py" receive
     - name: Validate restored build inputs and target reuse
       timeout-minutes: 140
       run: |
@@ -609,7 +282,7 @@ jobs:
         export PRODUCER_REV=bf70ddbf474f3390a62220a076b8c43347fecc64
         jq -e --arg repo "$GITHUB_REPOSITORY" --arg rev "$PRODUCER_REV" '
           .action == "synchronize" and .number == 9 and
-          .before == "1667f574738060a4cda1ad75b5966d4b1cb0aee2" and
+          .before == "e629a7bbb27ef61fede06ef7b743e2f90aaf8f54" and
           .pull_request.head.ref == "work-bare-27-storage-check" and .pull_request.base.repo.full_name == $repo and
           .pull_request.head.repo.full_name == $repo and
           .pull_request.base.ref == "bare-coexist-v2.0.4" and .pull_request.base.sha == $rev and
@@ -891,3 +564,16 @@ jobs:
         CONTAINER
         [[ -f exchange/checkpoint/reuse-verified ]]
         printf 'Real #25-s2 reuse passed on the recipient runner. All three continuation targets required zero build steps and their recorded outputs were unchanged. Validation and setup took %ss.\n' "$SECONDS" >> "$GITHUB_STEP_SUMMARY"
+  privacy:
+    name: Verify anonymous denial on the saved external archive
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == 'e629a7bbb27ef61fede06ef7b743e2f90aaf8f54' && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 140
+    permissions:
+      contents: write
+    steps:
+    - *prepare_saved_asset_client
+    - name: Verify anonymous denial on the saved external archive
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 -I "$RUNNER_TEMP/draft_transport.py" privacy
