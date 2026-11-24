@@ -104,8 +104,12 @@ class GitHub:
             bits=p.split("/");rid=int(bits[3])
             if bits[-1]=="jobs":return dict(total_count=len(self.jobs),jobs=self.jobs)
             if bits[-1]=="artifacts":return dict(total_count=len(self.artifacts),artifacts=self.artifacts)
-            if rid!=OLD: self.current.rid=rid
-            return self.old if rid==OLD else run(rid)
+            if rid!=OLD:
+                self.current.rid=rid
+                info=run(rid)
+                if len(bits)>5 and bits[-2]=="attempts": info["run_attempt"]=int(bits[-1])
+                return info
+            return self.old
         raise AssertionError("Uncovered service route "+p)
     def asset_info(self,release,name,size,sha,asset_id=None):
         row=self.rows[name]
@@ -147,6 +151,19 @@ class SupersedingTests(unittest.TestCase):
         reserve(h)
         self.assertEqual(h.posts,1)
 
+    def test_receiver_can_reuse_original_claim_without_rearming(self):
+        h=GitHub();cid=reserve(h)
+        h.add(f"{CAMPAIGN}-run{NEW}-a1-seg01-manifest.json",b"received",811)
+        h.request=lambda *a,**kw: self.fail("Receiver attempted a remote write")
+        env,event=context(NEW)
+        env["GITHUB_JOB"]="receive"
+        for n in ("1","2","5"):
+            env["GITHUB_RUN_ATTEMPT"]=n
+            self.assertEqual(retry.verify(h,env,event,HEAD),cid)
+        env["GITHUB_RUN_ID"]=str(NEW+1)
+        with self.assertRaises(ValueError): retry.verify(h,env,event,HEAD)
+        self.assertEqual(h.posts,1)
+
     def test_duplicate_physical_dispatch_race(self):
         h=GitHub();h.barrier=Barrier(2)
         def enter(rid):
@@ -157,13 +174,14 @@ class SupersedingTests(unittest.TestCase):
         self.assertEqual(h.posts,1)
 
     def test_recovery_denied_if_old_run_restarted_or_transferred(self):
-        for change in ("later-attempt","not-complete","receiver-ran","transfer-not-skipped","prior-artifact","prior-part",
+        for change in ("later-attempt","not-complete","receiver-ran","transfer-not-skipped","receipt-emitted","prior-artifact","prior-part",
                        "same-revision-live","new-native-uncommitted","source-changed","foreign-head","old-claim-bytes"):
             h=GitHub()
             if change=="later-attempt":h.old["run_attempt"]=2
             if change=="not-complete":h.old["status"]="in_progress"
             if change=="receiver-ran":h.jobs[1]["conclusion"]="success"
             if change=="transfer-not-skipped":h.jobs[0]["steps"][-2]["conclusion"]="success"
+            if change=="receipt-emitted":h.jobs[0]["steps"][-1]["conclusion"]="success"
             if change=="prior-artifact":h.artifacts=[dict(id=42,name=f"r28-{OLD}-a1-s01-outcome",expired=False)]
             if change=="prior-part":h.add(f"{gate.CAMPAIGN}-run{OLD}-a1-seg01-p00",b"partial",51)
             if change=="same-revision-live":h.live=run(OLD+551)

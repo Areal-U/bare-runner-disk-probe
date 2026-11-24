@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "control"))
 import admission as old
@@ -25,6 +26,7 @@ CLAIM = CAMPAIGN + "-s2-run-claim.json"
 CACHE_KEY = "bare-coexist-204-45285202990-1-checkpoint-production-s2"
 CACHE_ID = 11016400308
 CACHE_VERSION = "0264306e8c9c344d72477fc809ba4e6806bdcb35f30b425cf16709453c4e9acd"
+OLD_RECEIPT = "Record retained parent and receiver manifest"
 OLD_SEND = "Send only the verified generation to the existing owner Draft"
 OLD_BUILD = "Validate parent and advance one required APK edge, then pack bounded zstd"
 OLD_RESERVE = "Check canonical generation and reserve the single producer"
@@ -57,8 +59,8 @@ class CompleteDraft:
         return {**release, "assets": rows}
 
 
-def pinned_run(run, rid, head, workflow):
-    old.require(run["id"] == rid and run["run_attempt"] == 1 and
+def pinned_run(run, rid, head, workflow, attempt=1):
+    old.require(run["id"] == rid and run["run_attempt"] == attempt and
                 run["event"] == "pull_request" and run["path"] == workflow and
                 run["head_sha"] == head and run["head_branch"] == old.BRANCH and
                 all(run[k]["id"] == old.REPO_ID for k in ("repository", "head_repository")) and
@@ -86,10 +88,10 @@ def failed_before_send(helper):
     steps = producer["steps"]
     by_name = {s["name"]: s for s in steps}
     old.require(len(by_name) == len(steps) and
-                all(by_name[k]["status"] == "completed" for k in (OLD_RESERVE, OLD_BUILD, OLD_SEND)) and
+                all(by_name[k]["status"] == "completed" for k in (OLD_RESERVE, OLD_BUILD, OLD_SEND, OLD_RECEIPT)) and
                 by_name[OLD_RESERVE]["conclusion"] == "success" and by_name[OLD_BUILD]["conclusion"] == "failure" and
-                by_name[OLD_SEND]["conclusion"] == "skipped" and
-                by_name[OLD_RESERVE]["number"] < by_name[OLD_BUILD]["number"] < by_name[OLD_SEND]["number"],
+                by_name[OLD_SEND]["conclusion"] == by_name[OLD_RECEIPT]["conclusion"] == "skipped" and
+                by_name[OLD_RESERVE]["number"] < by_name[OLD_BUILD]["number"] < by_name[OLD_SEND]["number"] < by_name[OLD_RECEIPT]["number"],
                 "Earlier attempt may have sent the candidate")
     artifacts = helper.metadata(run_path + "/artifacts?per_page=100")
     old.require(artifacts["total_count"] == 0 and artifacts["artifacts"] == [],
@@ -102,7 +104,7 @@ def old_holder():
             "head": OLD_HEAD, "before": OLD_BEFORE, "parent_s2_sha256": old.S2_SHA}
 
 
-def physical_sources(helper, rid, head, workflow_id):
+def listed_sources(helper, head, workflow_id):
     old.require(type(workflow_id) is int and workflow_id > 0, "Invalid physical workflow ID")
     prefix = (f"{helper.BASE}/actions/workflows/{workflow_id}/runs?"
               f"head_sha={head}&branch={old.BRANCH}&event=pull_request&per_page=100")
@@ -122,9 +124,19 @@ def physical_sources(helper, rid, head, workflow_id):
             break
     else:
         raise ValueError("Too many matching workflow runs")
-    old.require(rid in found and all(run_id == rid or item["status"] == "completed" for run_id,item in found.items()),
-                "Another run of this recovery at the same revision is active")
-    return set(found)
+    return found
+
+
+def physical_sources(helper, rid, head, workflow_id):
+    for delay in (0,2,4):
+        if delay:
+            time.sleep(delay)
+        found = listed_sources(helper, head, workflow_id)
+        old.require(all(run_id == rid or item["status"] == "completed" for run_id,item in found.items()),
+                    "Another run of this recovery at the same revision is active")
+        if rid in found:
+            return set(found)
+    raise ValueError("GitHub has not yet indexed this physical run; no compute")
 
 
 def intact_parent_and_no_candidate(helper, physical):
@@ -148,14 +160,13 @@ def intact_parent_and_no_candidate(helper, physical):
                 "Original canonical claim missing or replaced")
 
 
-def reserve(helper, env, event, checkout):
+def checked_context(helper, env, event, checkout):
     rid = int(env["GITHUB_RUN_ID"])
     head, before = env["TRIAL_SHA"], env["PRIOR_SHA"]
     pr = event["pull_request"]
-    old.require(env["GITHUB_JOB"] == "reserve" and env["GITHUB_RUN_ATTEMPT"] == "1" and
-                rid > OLD_RUN and env["GITHUB_ACTOR"] == env["GITHUB_TRIGGERING_ACTOR"] == OWNER and
+    old.require(rid > OLD_RUN and env["GITHUB_ACTOR"] == env["GITHUB_TRIGGERING_ACTOR"] == OWNER and
                 env["GITHUB_REPOSITORY"] == old.REPO and env["GITHUB_EVENT_NAME"] == "pull_request" and
-                env["GITHUB_REF"] == "refs/pull/9/merge", "Only the fixed first-attempt reserve job may supersede")
+                env["GITHUB_REF"] == "refs/pull/9/merge", "Unexpected recovery revision, repo or actor")
     old.require(re.fullmatch("[0-9a-f]{40}", head) and re.fullmatch("[0-9a-f]{40}", before) and
                 head != before and head == checkout == event["after"] == pr["head"]["sha"] and
                 before == event["before"] and event["action"] == "synchronize" and event["number"] == pr["number"] == 9 and
@@ -165,15 +176,23 @@ def reserve(helper, env, event, checkout):
                     for r in (event["repository"], pr["base"]["repo"], pr["head"]["repo"])), "Not the authorized PR9 revision")
     run = helper.metadata(f"{helper.BASE}/actions/runs/{rid}/attempts/1")
     pinned_run(run, rid, head, WORKFLOW)
+    holder = {**old_holder(), "schema": 2, "campaign": CAMPAIGN, "workflow": WORKFLOW, "run_id": rid, "head": head,
+              "before": before, "producer_job": "produce", "claim_job": "reserve", "parent_s2_cache_id": CACHE_ID,
+              "supersedes_run": OLD_RUN, "supersedes_claim": OLD_CLAIM_ID, "supersedes_job": OLD_JOB,
+              "supersedes_claim_sha256": hashlib.sha256(old.encode(old_holder())).hexdigest()}
+    return run, holder
+
+
+def reserve(helper, env, event, checkout):
+    old.require(env["GITHUB_JOB"] == "reserve" and env["GITHUB_RUN_ATTEMPT"] == "1",
+                "Only the first-attempt reserve job may supersede")
+    run, holder = checked_context(helper, env, event, checkout)
+    rid, head = holder["run_id"], holder["head"]
     old.require(run["status"] == "in_progress" and run["conclusion"] is None, "Replacement run is not active")
     helper = CompleteDraft(helper)
     failed_before_send(helper)
     physical = physical_sources(helper, rid, head, run["workflow_id"])
     intact_parent_and_no_candidate(helper, physical | {OLD_RUN})
-    holder = {**old_holder(), "schema": 2, "campaign": CAMPAIGN, "workflow": WORKFLOW, "run_id": rid, "head": head,
-              "before": before, "producer_job": "produce", "claim_job": "reserve", "parent_s2_cache_id": CACHE_ID,
-              "supersedes_run": OLD_RUN, "supersedes_claim": OLD_CLAIM_ID, "supersedes_job": OLD_JOB,
-              "supersedes_claim_sha256": hashlib.sha256(old.encode(old_holder())).hexdigest()}
     claim_id = old.admit("compute", holder, helper, name=CLAIM)
     print(f"campaign={CAMPAIGN} canonical_run={rid} claim_asset={claim_id} superseded_run={OLD_RUN} "
           f"superseded_job={OLD_JOB} superseded_claim={OLD_CLAIM_ID} remote_send=skipped original_cache_id={CACHE_ID} "
@@ -181,15 +200,40 @@ def reserve(helper, env, event, checkout):
     return claim_id
 
 
+def verify(helper, env, event, checkout):
+    attempt = int(env["GITHUB_RUN_ATTEMPT"])
+    old.require(attempt >= 1 and env["GITHUB_JOB"] == "receive", "Only the restricted receiver may read recovery admission")
+    first, holder = checked_context(helper, env, event, checkout)
+    rid = holder["run_id"]
+    if attempt > 1:
+        current = helper.metadata(f"{helper.BASE}/actions/runs/{rid}/attempts/{attempt}")
+        pinned_run(current, rid, holder["head"], WORKFLOW, attempt=attempt)
+    else:
+        current = first
+    old.require(current["status"] == "in_progress" and current["conclusion"] is None,
+                "Receiver is not running on the bound physical attempt")
+    reader = CompleteDraft(helper)
+    old.require(old.claim_info(reader, old.encode(old_holder()), old.CLAIM) == OLD_CLAIM_ID,
+                "Original canonical claim missing or replaced")
+    # The candidate is expected to exist here. Do not rerun the earlier uniqueness
+    # check, require that the original cache still exists, or create a new claim.
+    claim_id = old.claim_info(reader, old.encode(holder), CLAIM)
+    old.require(claim_id is not None, "No original v2 claim; read-only receipt cannot start computation")
+    print(f"campaign={CAMPAIGN} canonical_run={rid} producer_attempt=1 receiver_attempt={attempt} "
+          f"claim_asset={claim_id} original_claim_asset={OLD_CLAIM_ID} mode=verify", flush=True)
+    return claim_id
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("reserve",))
-    parser.parse_args()
+    parser.add_argument("mode", choices=("reserve","verify"))
+    args = parser.parse_args()
     sys.path.insert(0, os.environ["RUNNER_TEMP"])
     import transfer
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     checkout = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    claim = reserve(transfer, os.environ, event, checkout)
+    operation = reserve if args.mode == "reserve" else verify
+    claim = operation(transfer, os.environ, event, checkout)
     with open(os.environ["GITHUB_OUTPUT"], "a") as out:
         print(f"claim_id={claim}", file=out)
         print(f"source_run={os.environ['GITHUB_RUN_ID']}", file=out)
