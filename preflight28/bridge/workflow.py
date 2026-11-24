@@ -7,8 +7,8 @@ import sys
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0,str(ROOT / "preflight28/transport"))
-from workflow import Readable, OLD
+sys.path.insert(0, str(ROOT))
+from preflight28.transport.workflow import Readable, OLD
 NAME = ".github/workflows/bare-r28-s2-split-bridge.yml"
 LABEL = "r28-preflight-s2-20261125-v1 bridge"
 AUTH = {"GH_TOKEN":"${{ github.token }}"}
