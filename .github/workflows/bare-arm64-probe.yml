@@ -1104,8 +1104,8 @@ jobs:
             fi
             [[ $VERIFY_FRONTIER_ONLY == false ]] || args+=(--verify-only)
             set -o pipefail
-            python3 /exchange/segment_graph.py "${args[@]}" | tee /exchange/checkpoint/frontier-before.log
-          '
+            python3 /exchange/segment_graph.py "${args[@]}"
+          ' | tee exchange/checkpoint/frontier-before.log
         verified=$(tail -n 1 exchange/checkpoint/frontier-before.log | jq -r .parent_frontier_verified)
         [[ $verified == true || $verified == false ]]
         [[ $VERIFY_FRONTIER_ONLY != true || $verified == true ]]
@@ -1545,8 +1545,8 @@ jobs:
           flags=()
           [[ $CHECKPOINT_BACKEND != draft ]] || flags+=(--private-intermediates)
           python3 /exchange/segment_graph.py after "${flags[@]}" --baseline /exchange/checkpoint/segment-before.json \
-            --trial "/exchange/checkpoint/trial-$TRIAL_PHASE.json" --host-quiesced | tee /exchange/checkpoint/frontier-after.log
-        '
+            --trial "/exchange/checkpoint/trial-$TRIAL_PHASE.json" --host-quiesced
+        ' | tee exchange/checkpoint/frontier-after.log
         status=$(tail -n 1 exchange/checkpoint/frontier-after.log | jq -r .frontier_status)
         [[ $status == candidate || $status == no-progress ]]
         echo "status=$status" >> "$GITHUB_OUTPUT"
