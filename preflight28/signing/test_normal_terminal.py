@@ -2,7 +2,7 @@
 """Audit the normal terminal with public inputs only. Does not create a production APK."""
 import argparse
 import ast
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import hashlib
 import json
 import os
@@ -95,6 +95,9 @@ def normal_binding(registration_dir, workflows):
     assert "validate-build" in jobs["bind-private-receiver"]["needs"]
     for n in ("production","slot01"):
         assert "bind-private-receiver" in jobs[n]["needs"] and "claim_asset_id != ''" in jobs[n]["if"]
+    native=yaml.safe_load((workflows/"bare-r28-native-slot.yml").read_text())["jobs"]
+    assert "collection-lease" in native["arm"]["needs"]
+    assert "needs.collection-lease.outputs.latest_start" in native["arm"]["with"]["collector_latest_start"]
     assert gate.RECIPIENT not in (Path(__file__).parent/"produce.sh").read_text()
     clock=datetime(2026,11,25,1,0,0,tzinfo=timezone.utc)
     env=dict(REGISTRATION_ASSET_ID="51",GITHUB_RUN_ID="101",GITHUB_RUN_ATTEMPT="1",GITHUB_SHA=REV,
@@ -105,20 +108,31 @@ def normal_binding(registration_dir, workflows):
     ticket=dict(schema=1,campaign=gate.CAMPAIGN,repository_id=gate.REPO_ID,workflow=gate.WORKFLOW,
                 branch=gate.BASE_REF,head=REV,initial_parent=gate.S2_SHA,release_id=gate.RELEASE_ID,recipient=gate.RECIPIENT,
                 collector_registration_id="Automation_"+"1"*32,issued_at="2026-11-25T00:00:00Z",expires_at="2026-11-26T00:00:00Z")
+    ticket.update(registration_nonce="c"*40, owner_destination_id="libfile_test_owner_slot", collector_ack_asset_id=53)
+    ack={k:ticket[k] for k in ("campaign","branch","head","collector_registration_id",
+                               "owner_destination_id","registration_nonce","recipient")}
+    ack.update(schema=1, state="collector-read-back-owner-reservation",
+               observed_at="2026-11-24T23:45:00Z", valid_until="2026-11-26T00:00:00Z",
+               poll_seconds=3600, pickup_retry_seconds=900)
     class Draft:
         BASE=UPLOAD="example.invalid"
         def __init__(self):
             self.values={}
             self.writes=0
             self.ticket_created="2026-11-25T00:00:00Z"
+            self.ack_created="2026-11-24T23:50:00Z"
         def metadata(self,_):
             return dict(id=int(env["GITHUB_RUN_ID"]),run_attempt=1,head_sha=REV,path=gate.WORKFLOW,event="workflow_dispatch",
                         head_branch=gate.BASE_REF,actor=gate.OWNER,repository=dict(id=gate.REPO_ID),
                         head_repository=dict(id=gate.REPO_ID),created_at="2026-11-25T00:10:00Z")
         def draft(self,_):
             self.values[51]=json.dumps(ticket).encode()
-            return dict(assets=[dict(id=k,size=len(v),name=gate.CAMPAIGN+"-collection-registration.json" if k==51 else gate.CLAIM,
-                                     created_at=self.ticket_created,uploader=gate.OWNER) for k,v in self.values.items()])
+            self.values[53]=json.dumps(ack).encode()
+            names={51:gate.CAMPAIGN+"-collection-registration.json",52:gate.CLAIM,
+                   53:gate.CAMPAIGN+"-collector-ack-"+ticket["registration_nonce"]+".json"}
+            return dict(assets=[dict(id=k,size=len(v),name=names[k],digest="sha256:"+hashlib.sha256(v).hexdigest(),
+                                     created_at=self.ack_created if k==53 else self.ticket_created,
+                                     uploader=gate.OWNER) for k,v in self.values.items()])
         def asset_info(self,release,name,length,digest,asset_id=None):
             found=[a for a in release["assets"] if a["name"]==name]
             assert len(found)==1
@@ -135,17 +149,40 @@ def normal_binding(registration_dir, workflows):
             self.values[52]=kwargs["body"]
             raise ConnectionResetError("simulated reply lost after durable create")
     helper=Draft()
-    def bind():
+    def bind(*,verify_only=False,now=clock):
+        env["GITHUB_JOB"]="collection-lease" if verify_only else "bind-private-receiver"
+        ticket["collector_ack_sha"]=hashlib.sha256(json.dumps(ack).encode()).hexdigest()
         env["REGISTRATION_SHA"]=hashlib.sha256(json.dumps(ticket).encode()).hexdigest()
-        return gate.bind(helper,env,event,clock)
+        return gate.bind(helper,env,event,now,verify_only=verify_only)
+
     helper.ticket_created="2026-11-25T00:11:00Z"
     expect_reject(bind,"prepared after run")
     helper.ticket_created="2026-11-25T00:00:00Z"
-    assert bind()==(52,ticket["collector_registration_id"]) and bind()[0]==52 and helper.writes==1
+    helper.ack_created="2026-11-25T00:11:00Z"
+    expect_reject(bind,"deposited before the original run")
+    helper.ack_created="2026-11-24T23:50:00Z"
+    with patch.dict(ack,owner_destination_id="libfile_different_slot"):
+        expect_reject(bind,"disagrees with owner ticket: owner_destination_id")
+    with patch.dict(ack,valid_until="2026-11-25T04:00:00Z"):
+        expect_reject(bind,"lease does not cover")
+    with patch.dict(ack,registration_nonce="0"*40):
+        expect_reject(bind,"disagrees with owner ticket: registration_nonce")
+    with patch.dict(ticket,collector_ack_asset_id=99):
+        expect_reject(bind,"acknowledgement is unavailable")
+    expect_reject(lambda:bind(verify_only=True),"No first-attempt receipt to recover")
+    assert helper.writes==0
+    end=min(gate.instant(ack["valid_until"]),gate.instant(ticket["expires_at"]))
+    last=end-timedelta(seconds=350*60+2*ack["poll_seconds"]+ack["pickup_retry_seconds"])
+    expected=(52,ticket["collector_registration_id"],int(last.timestamp()))
+    assert bind()==expected and bind()==expected and helper.writes==1
+    assert bind(verify_only=True,now=last)==expected and helper.writes==1
+    expect_reject(lambda:bind(verify_only=True,now=last+timedelta(seconds=1)),"lease does not cover")
     env["GITHUB_RUN_ID"]="102"
     expect_reject(bind,"conflicting canonical claim")
     assert helper.writes==1
-    print("NORMAL_REGISTRATION late-ticket refusal + durable prior ticket + dropped POST reply + duplicate readback + conflicting run, 1 POST")
+    print("NORMAL_REGISTRATION prior matching ACK and destination + lost POST + repeat + latest valid lease passed; "
+          "late ticket, late ACK, absent ACK, wrong slot, wrong nonce, short coverage, expired effective lease, "
+          "verify-only with no prior claim, competing run rejected; 1 POST")
 
 
 if __name__=="__main__":
