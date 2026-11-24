@@ -21,7 +21,7 @@ RECEIPTS = {
     "checkpoint-evidence.json", "checkpoint-continuation.json", "checkpoint-trial-seed.json",
     "checkpoint-trial-restore.json", "checkpoint-producer-provenance.json",
     "checkpoint-source-verification.json", "checkpoint-round28-parent-provenance.json",
-    PROOF, "checkpoint-segment-frontier.json",
+    PROOF, "checkpoint-segment-frontier.json", "checkpoint-round28-trial-provenance.json",
 }
 STATE = re.compile(
     r"(?:\.ninja_(?:deps|log)(?:\.(?:old|recompact|restat))?"
@@ -170,9 +170,9 @@ def archives(parent_path, child_path, parent_sha, child_sha):
     child, proof = archived(child_path, "zstd", child_sha, load_original_proof=True)
     # The previously accepted one-edge trial selects a missing .o, so no existing
     # file is authorized to change except another declared output of its same edge.
-    if (not isinstance(proof, dict) or proof.get("format") != "bare-28-apk-frontier-1"
+    if (not isinstance(proof, dict) or proof.get("format") not in {"bare-28-apk-frontier-1", "bare-28-apk-frontier-2"}
             or proof.get("target") != "chrome_public_apk" or not isinstance(proof.get("outputs"), dict)):
-        raise ValueError("No accepted v1 single-edge proof")
+        raise ValueError("No accepted versioned single-edge proof")
     target = proof["target_path"]
     if target not in proof["outputs"] or target in parent or not target.endswith(".o"):
         raise ValueError("Historical trial did not select a missing object")
