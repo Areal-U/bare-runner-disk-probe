@@ -26,12 +26,15 @@ STOP_MARGIN = GIB
 FAST_MARGIN = 2 * GIB
 STOP_ENTRIES = 10_000
 FAST_ENTRIES = 20_000
+# Leave one complete historically observed late burst, even between cheap polls.
+QUIESCE_BYTES = 512 * MIB
+QUIESCE_ENTRIES = STOP_ENTRIES // 2
 
 
 class GuardError(Exception):
-    def __init__(self, reason, **details):
-        super().__init__(reason)
-        self.record = {'status': reason, **details}
+    def __init__(self, status, **details):
+        super().__init__(status)
+        self.record = {'status': status, **details}
 
 
 def check_size(kind, path):
@@ -157,6 +160,26 @@ def pressure(sample, fs, terminal):
     return 'normal', 30
 
 
+class QuiescenceBudget:
+    """Escalate a graceful stop before a further observed burst would cross a floor."""
+    def __init__(self, sample, fs, out_cap=OUT_CAP, entry_cap=ENTRY_CAP, floor=FLOOR):
+        self.limits = (out_cap, entry_cap, floor)
+        self.tree = sample.copy()
+        self.previous = fs.copy()
+        self.margin = [QUIESCE_BYTES, QUIESCE_ENTRIES, QUIESCE_BYTES, QUIESCE_ENTRIES]
+
+    def risk(self, sample, fs):
+        out_cap, entry_cap, floor = self.limits
+        growth = [sample['estimate'] - self.tree['estimate'], sample['entries'] - self.tree['entries'],
+                  self.previous['free_bytes'] - fs['free_bytes'], self.previous['free_inodes'] - fs['free_inodes']]
+        self.margin = [max(old, new) for old, new in zip(self.margin, growth)]
+        self.tree, self.previous = sample.copy(), fs.copy()
+        remaining = [out_cap - sample['estimate'], entry_cap - sample['entries'],
+                     fs['free_bytes'] - floor, fs['free_inodes'] - INODE_FLOOR]
+        labels = ('archive-estimate', 'archive-entries', 'free-bytes', 'free-inodes')
+        return next((label for label, space, guard in zip(labels, remaining, self.margin) if space <= guard), None)
+
+
 def memory():
     root = Path('/sys/fs/cgroup')
     result = {}
@@ -207,6 +230,7 @@ def monitor(args):
             peak_bytes, peak_entries = sample['estimate'], sample['entries']
             min_free, min_inodes = fs['free_bytes'], fs['free_inodes']
             int_time = None
+            settle = None
             while proc.poll() is None:
                 now = time.monotonic()
                 fs = disk(args.output)
@@ -219,6 +243,8 @@ def monitor(args):
                     peak_entries = max(peak_entries, sample['entries'])
                     emit('scan', **sample, **fs, **memory())
                 level, interval = pressure(sample, fs, args.terminal)
+                if settle is not None:
+                    interval = 5
                 if now - cheap_from >= 5:
                     emit('space', **fs, **memory(), level=level, interval=interval)
                     cheap_from = now
@@ -234,7 +260,11 @@ def monitor(args):
                         except ProcessLookupError:
                             pass
                         int_time = now
-                elif now - int_time >= 120:
+                        settle = QuiescenceBudget(sample, fs)
+                        scan_from = now - 5
+                risk = settle.risk(sample, fs) if settle is not None else None
+                if int_time is not None and (risk or now - int_time >= 120):
+                    emit('kill', reason=risk or 'grace-timeout', elapsed=now-int_time, **fs, **sample)
                     try:
                         os.killpg(proc.pid, signal.SIGKILL)
                     except ProcessLookupError:
