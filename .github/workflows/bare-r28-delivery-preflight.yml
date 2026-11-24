@@ -1,0 +1,133 @@
+name: R28 preflight private test delivery
+run-name: r28-preflight-s2-20261125-v1
+on:
+  pull_request:
+    types: [synchronize]
+    branches: [bare-coexist-v2.0.4]
+    paths:
+      - '.github/workflows/bare-r28-delivery-preflight.yml'
+permissions: {}
+cache-mode: none
+jobs:
+  deliver-test-artifact:
+    name: Create encrypted test-only APK
+    if: >-
+      github.repository == 'Areal-U/bare-runner-disk-probe' &&
+      github.event.sender.id == 292261483 &&
+      github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' &&
+      github.event.pull_request.number == 9 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'work-bare-27-storage-check' &&
+      github.event.action == 'synchronize' &&
+      github.event.before == '3f2fb58eb11a51665af1c573355bd8abef182100' &&
+      github.run_attempt == '1'
+    cache-mode: none
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    env:
+      TRIAL_HEAD: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Prepare standard runner tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v age >/dev/null; then
+            sudo apt-get -qq -o Acquire::Retries=2 update
+            sudo apt-get -qq -o Acquire::Retries=2 --no-install-recommends install age
+          fi
+          age --version
+          java -version
+      - name: Build, check and seal the synthetic no-code APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          trial_dir="$RUNNER_TEMP/bare-r28-delivery-test"
+          mkdir "$trial_dir"
+          cd "$trial_dir"
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:?}}"
+          tools=$(find "$sdk/build-tools" -maxdepth 2 -name aapt2 -type f | sort -V | tail -n 1)
+          export AAPT2="$tools" SIGN_JAR="$(dirname "$tools")/lib/apksigner.jar" ANDROID_JAR="$sdk/platforms/android-35/android.jar"
+          test -x "$AAPT2" && test -s "$SIGN_JAR" && test -s "$ANDROID_JAR"
+          "$AAPT2" version
+          java -jar "$SIGN_JAR" version
+          cat > guard.py <<'R28_FILE'
+          import json, stat, sys
+          from pathlib import Path
+          MIB = 1024**2
+          BYTE_CAPS = {'apk':450*MIB,'cipher':451*MIB}
+          class GuardError(Exception):
+              def __init__(self, reason, **details):
+                  super().__init__(reason)
+                  self.record = {'status': reason, **details}
+
+          def check_size(kind, path):
+              mode = path.lstat()
+              if not stat.S_ISREG(mode.st_mode) or mode.st_size == 0:
+                  raise GuardError('invalid-file', kind=kind, size=mode.st_size)
+              if mode.st_size > BYTE_CAPS[kind]:
+                  raise GuardError('size-exceeded', kind=kind, size=mode.st_size, limit=BYTE_CAPS[kind], retry=False)
+              return {'status': 'within-size-limit', 'kind': kind, 'size': mode.st_size, 'limit': BYTE_CAPS[kind]}
+          if len(sys.argv) != 4 or sys.argv[1] != 'size': sys.exit(66)
+          try:
+              print(json.dumps(check_size(sys.argv[2], Path(sys.argv[3])), sort_keys=True))
+          except GuardError as exc:
+              print(json.dumps(exc.record,sort_keys=True),file=sys.stderr)
+              sys.exit(65 if exc.record['status']=='size-exceeded' else 66)
+          R28_FILE
+          cat > AndroidManifest.xml <<'R28_FILE'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.barebrowser.r28preflight.testonly" android:versionCode="1" android:versionName="1.0-preflight"><uses-sdk android:minSdkVersion="24" android:targetSdkVersion="35"/><application android:label="R28 preflight TEST ONLY" android:hasCode="false"/></manifest>
+          R28_FILE
+          #!/usr/bin/env bash
+          set -euo pipefail
+          umask 077
+          : "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}" "${TRIAL_HEAD:?}" "${AAPT2:?}" "${ANDROID_JAR:?}" "${SIGN_JAR:?}"
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ && "$GITHUB_RUN_ATTEMPT" == 1 && "$TRIAL_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          campaign=r28-preflight-s2-20261125-v1
+          pub=age1ndr7f7txhcjqfxdjzrlf7m7za0sfa7yhzm4gg9404pfl5jtq4geqgcu466
+          "$AAPT2" link --manifest AndroidManifest.xml -I "$ANDROID_JAR" -o unsigned.apk
+          openssl req -new -x509 -newkey rsa:2048 -nodes -sha256 -days 7 -subj '/CN=R28 Preflight Ephemeral CI Test Signer/O=Test Only/' -keyout ci.pem -out ci.crt >/dev/null 2>&1
+          openssl pkcs8 -topk8 -nocrypt -in ci.pem -outform DER -out ci.pk8
+          java -jar "$SIGN_JAR" sign --key ci.pk8 --cert ci.crt --v4-signing-enabled false --out ci-test.apk unsigned.apk
+          java -jar "$SIGN_JAR" verify --verbose --print-certs ci-test.apk | grep -F 'certificate SHA-256 digest:'
+          "$AAPT2" dump badging ci-test.apk | grep -F "package: name='org.barebrowser.r28preflight.testonly' versionCode='1' versionName='1.0-preflight'"
+          python3 guard.py size apk ci-test.apk
+          CI_CERT=$(openssl x509 -in ci.crt -outform DER | sha256sum | cut -d' ' -f1)
+          export CI_CERT
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          p = Path('ci-test.apk')
+          record = dict(operation='r28-preflight-s2-20261125-v1', run_id=int(os.environ['GITHUB_RUN_ID']),
+                        attempt=int(os.environ['GITHUB_RUN_ATTEMPT']), head_sha=os.environ['TRIAL_HEAD'],
+                        ci_cert_sha256=os.environ['CI_CERT'], clear_sha256=hashlib.sha256(p.read_bytes()).hexdigest(),
+                        clear_bytes=p.stat().st_size)
+          Path('receipt.json').write_text(json.dumps(record,sort_keys=True)+'\n')
+          PY
+          tar -cf - ci-test.apk receipt.json | "${AGE:-age}" -r "$pub" -o test-apk.tar.age
+          python3 guard.py size cipher test-apk.tar.age
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          p=Path('test-apk.tar.age')
+          r=json.loads(Path('receipt.json').read_text())
+          r.update(cipher_bytes=p.stat().st_size,cipher_sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+          print('C1_RECEIPT '+json.dumps(r,sort_keys=True))
+          PY
+      - name: Upload only owner-test ciphertext
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: r28-preflight-s2-20261125-v1-delivery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bare-r28-delivery-test/test-apk.tar.age
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+      - name: Publish exact ID for the assigned private receiver
+        shell: bash
+        env:
+          AID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          set -euo pipefail
+          [[ "$AID" =~ ^[1-9][0-9]*$ ]]
+          echo "C1_ARTIFACT id=$AID run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT head_sha=$TRIAL_HEAD"
