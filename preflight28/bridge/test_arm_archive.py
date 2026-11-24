@@ -14,6 +14,27 @@ ADAPTER = ROOT/'preflight28/bridge/check_archive.py'
 ARM = ROOT/'.github/workflows/bare-arm64-probe.yml'
 
 class PrivateArchiveTests(unittest.TestCase):
+    def test_host_owns_the_two_frontier_logs(self):
+        steps = yaml.safe_load(ARM.read_bytes())['jobs']['compile-probe']['steps']
+        for identifier, suffix, line in [('frontier','before','{"parent_frontier_verified":true}'),
+                                         ('frontier_finish','after','{"frontier_status":"candidate"}')]:
+            script = next(s['run'] for s in steps if s.get('id') == identifier)
+            dst = 'exchange/checkpoint/frontier-' + suffix + '.log'
+            self.assertIn("' | tee " + dst, script)
+            self.assertNotIn('tee /' + dst, script)
+            pipeline = script[script.index('docker compose exec'):script.index('\n',script.index("' | tee " + dst))]
+            with tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp)/dst
+                output.parent.mkdir(parents=True)
+                for status in (0,11):
+                    env=dict(os.environ,LINE=line,STATUS=str(status),EXPECTED_KEY='key',TRIAL_PHASE='restore')
+                    # The builder streams its output; the host opens its own log even under umask 077.
+                    command='set -eo pipefail\numask 077\ndocker() { printf "%s\\n" "$LINE"; return "$STATUS"; }\n'+pipeline
+                    proc=subprocess.run(['bash','-c',command],env=env,cwd=tmp,capture_output=True)
+                    self.assertEqual(proc.returncode,status,proc.stderr)
+                    self.assertEqual(output.read_text().strip(),line)
+                    self.assertEqual(output.stat().st_mode & 0o777,0o600)
+
     def test_oversize_is_a_successful_terminal_with_no_upload(self):
         steps = yaml.safe_load(ARM.read_bytes())['jobs']['compile-probe']['steps']
         seal = next(s['run'] for s in steps if s.get('id') == 'apk_seal')
