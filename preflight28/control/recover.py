@@ -108,11 +108,46 @@ def last_private_slot(jobs, receipts, run, sha, artifacts):
     return result
 
 
+def recover_fallback(outcome, jobs, run, read_log, list_cache):
+    pattern = re.compile(r"^Bounded build segment ([1-9]|1[0-2]) /")
+    origins = [(j, int(m[1])) for j in jobs if (m:=pattern.match(j["name"])) and j["run_id"]==run and
+               j["run_attempt"]==1 and any(
+                   x.get("name")=="Record the encrypted APK fallback receipt" and x.get("conclusion")=="success"
+                   for x in j.get("steps",[]))]
+    require(len(origins)<=1, "Multiple original ciphertext cache producers")
+    if not origins:
+        return outcome
+    job,n=origins[0]
+    key=f"bare-coexist-204-apk-v1-{run}-1-s{n}"
+    log=read_log(job["id"])
+    markers=prefix_matches(log,"R28_SEALED_CIPHER")
+    found=re.findall(r"^\S+Z APK artifact upload failed; temporary ciphertext cache ID ([1-9][0-9]*), key "+
+                     re.escape(key)+r", SHA-256 ([0-9a-f]{64}), ([1-9][0-9]*) bytes$",log,re.MULTILINE)
+    require(len(markers)==len(found)==1, "Missing original ciphertext or cache seal")
+    cid,sha,length=found[0]
+    require(markers[0]==dict(run=run,attempt=1,ordinal=n,sha=sha,bytes=int(length)) and
+            0<int(length)<=451*1024**2, "Original cache receipt does not match the ciphertext seal")
+    require(outcome["status"]=="recovery-no-terminal" or (outcome["status"]=="apk" and outcome["ordinal"]==n and
+            outcome["cipher_sha"]==sha and str(outcome["cipher_bytes"])==length),
+            "Original cache receipt conflicts with terminal state")
+    ref="refs/heads/bare-coexist-v2.0.4"
+    rows=[a for a in list_cache(key,ref) if a["key"]==key and a["ref"]==ref]
+    if not rows:
+        return outcome
+    require(len(rows)==1 and rows[0]["id"]==int(cid) and 0<rows[0]["size_in_bytes"]<=int(length)+1024**2,
+            "The original fallback cache entry changed")
+    return dict(outcome,status="apk",ordinal=n,cipher_id=outcome.get("cipher_id",""),cipher_cache=key,cipher_cache_id=cid,
+                cipher_sha=sha,cipher_bytes=length,receipt_source="original-seal-and-cache-id")
+
+
 def salvage(outcome, jobs, artifacts, run, head, read_log):
     pattern = re.compile(r"bare-personal-204-encrypted-" + str(run) + r"-1-s([1-9]|1[0-2])")
     matches = [(a, int(m[1])) for a in artifacts if (m := pattern.fullmatch(a["name"]))]
     require(len(matches) <= 1, "Multiple apparently terminal encrypted artifacts in this run")
     if not matches:
+        if outcome.get("status") == "apk" and outcome.get("cipher_id"):
+            require(outcome.get("cipher_cache"), "Original Artifact no longer listed; consult the registered collector's durable copy")
+            return dict(outcome, cipher_id="", artifact_state="not-listed", receipt_source="original-seal-and-cache-key")
         return outcome
     asset, ordinal = matches[0]
     require(asset["workflow_run"]["id"] == run and asset["workflow_run"]["head_sha"] == head and
@@ -158,7 +193,15 @@ def main():
         receipts.extend(results)
     outcome = follow(receipts, run, sha)
     artifacts = inventory(f"actions/runs/{run}/artifacts", "artifacts")
-    outcome = salvage(outcome, jobs, artifacts, run, sha, lambda j: get(f"actions/jobs/{j}/logs"))
+    from urllib.parse import urlencode
+    def log(job_id):
+        return get(f"actions/jobs/{job_id}/logs")
+    def caches(key,ref):
+        page=json.loads(get("actions/caches?"+urlencode({"key":key,"ref":ref,"per_page":100})))
+        require(page["total_count"]==len(page["actions_caches"]),"Incomplete exact cache inventory")
+        return page["actions_caches"]
+    outcome = recover_fallback(outcome,jobs,run,log,caches)
+    outcome = salvage(outcome, jobs, artifacts, run, sha, log)
     if outcome["status"] == "recovery-no-terminal":
         outcome.update(last_private_slot(jobs, receipts, run, sha, artifacts))
     aid = outcome.get("cipher_id", "")

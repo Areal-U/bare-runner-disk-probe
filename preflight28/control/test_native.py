@@ -9,7 +9,7 @@ import unittest
 import yaml
 
 from admission import S2_SHA
-from recover import follow, salvage, last_private_slot
+from recover import follow, salvage, last_private_slot, recover_fallback
 from recover_private import read_only
 
 HERE = Path(__file__).resolve().parents[2]
@@ -50,6 +50,7 @@ def record(needs,n=1,verify=False,backend="cache"):
 class NativeTests(unittest.TestCase):
     def test_normal_action_entry_and_guard(self):
         self.assertEqual(CALLER["on"]["workflow_dispatch"]["inputs"]["build_segments"]["default"],"12")
+        self.assertEqual(CALLER["on"]["workflow_dispatch"]["inputs"]["compile_minutes"]["default"],"0")
         for n in range(1,14):
             call=CALLER["jobs"][f"slot{n:02}"]
             self.assertEqual(call["with"]["ordinal"],n)
@@ -64,6 +65,7 @@ class NativeTests(unittest.TestCase):
             self.assertIn(k,ARM["on"]["workflow_call"]["inputs"])
         lookup=CALLER["jobs"]["recover-first-attempt"]
         self.assertIn("github.run_attempt != '1'",lookup["if"])
+        self.assertEqual(lookup["needs"],"terminal-12")
         self.assertFalse(any("upload-artifact" in x.get("uses","") for x in lookup["steps"]))
 
     def test_received_candidate_and_nonmatching_parent(self):
@@ -78,8 +80,10 @@ class NativeTests(unittest.TestCase):
         n=inputs(2);n["read"]["result"]="skipped"
         n["arm"]["outputs"]["frontier_status"]="no-progress"
         self.assertEqual(record(n,2)[1]["status"],"no-progress")
-        n["arm"]["result"]="failure";n["arm"]["outputs"]["apk_delivery_status"]="apk-size-exceeded"
+        n["arm"]["outputs"]["apk_delivery_status"]="apk-size-exceeded"
         self.assertEqual(record(n,2)[1]["status"],"apk-size-exceeded")
+        n["arm"]["result"]="failure"
+        self.assertNotEqual(record(n,2)[0].returncode,0)
         n=inputs(13);n["read"]["result"]="skipped"
         self.assertEqual(record(n,13,True)[1]["status"],"limit-verified")
 
@@ -122,6 +126,19 @@ class NativeTests(unittest.TestCase):
         self.assertIn("github.run_attempt != '1'",recovery["if"])
         self.assertFalse(any("publish" in step.get("run","") or "upload" in step.get("uses","") for step in recovery["steps"]))
 
+    def test_incomplete_manifest_reports_observed_partial_state(self):
+        step=CALLER["jobs"]["recover-draft-checkpoint"]["steps"][-1]["run"]
+        def status(verified, partial, aid="", digest=""):
+            return subprocess.run(["bash","-euo","pipefail","-c",step],env={**os.environ,
+                       "R28_SLOT":"4","PARTIAL":partial,"PRIVATE_VERIFIED":verified,"MANIFEST_ID":aid,"DIGEST":digest},
+                       text=True,capture_output=True)
+        for name in ("all_private_bytes_verified_manifest_absent","partial_private_parts"):
+            result=status("false",name)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertIn(name,result.stdout)
+        self.assertNotEqual(status("true","").returncode,0)
+        self.assertEqual(status("true","","701","e"*64).returncode,0)
+
     def test_original_seal_can_be_salvaged_after_verifier_failed(self):
         initial=dict(status="recovery-no-terminal",accepted_parent=S2_SHA)
         art=dict(name="bare-personal-204-encrypted-77-1-s2",id=31,workflow_run={"id":77,"head_sha":REV},digest="sha256:"+"f"*64)
@@ -133,6 +150,42 @@ class NativeTests(unittest.TestCase):
         with self.assertRaises(ValueError): salvage(initial,[job],[art,art],77,REV,log)
         mark["ordinal"]=1
         with self.assertRaises(ValueError): salvage(initial,[job],[art],77,REV,log)
+
+    def test_fallback_cache_without_artifact_or_completed_result_job(self):
+        outcome=dict(status="recovery-no-terminal");sha="a"*64; key="bare-coexist-204-apk-v1-77-1-s1"
+        job=dict(id=700,name="Bounded build segment 1 / nested",run_id=77,run_attempt=1,
+                 steps=[dict(name="Record the encrypted APK fallback receipt",conclusion="success")])
+        mark=json.dumps(dict(run=77,attempt=1,ordinal=1,sha=sha,bytes=100))
+        log=lambda x: ("2026-11-25T12:00:00Z R28_SEALED_CIPHER "+mark+"\n2026-11-25T12:03:00Z APK artifact upload failed; temporary ciphertext cache ID 55, key "+key+", SHA-256 "+sha+", 100 bytes")
+        rows=lambda k,ref:[dict(id=55,key=k,ref=ref,size_in_bytes=123)]
+        saved=recover_fallback(outcome,[job],77,log,rows)
+        self.assertEqual((saved["status"],saved["cipher_cache"],saved["cipher_cache_id"]),("apk",key,"55"))
+        self.assertEqual(salvage(saved,[],[],77,REV,log)["cipher_sha"],sha)
+        self.assertEqual(recover_fallback(outcome,[job],77,log,lambda *_:[]),outcome)
+
+    def test_unlisted_original_artifact_allows_its_verified_fallback(self):
+        receipt=dict(status="apk",ordinal=2,cipher_id="31",cipher_cache="bare-coexist-204-apk-v1-77-1-s2")
+        result=salvage(receipt,[],[],77,REV,lambda _: "")
+        self.assertEqual((result["cipher_id"],result["cipher_cache"]),("", receipt["cipher_cache"]))
+        with self.assertRaises(ValueError): salvage(dict(receipt,cipher_cache=""),[],[],77,REV,lambda _: "")
+
+    def test_next_restore_failure_reports_true_verified_and_pending_parents(self):
+        _,accepted=record(inputs())
+        jobs={f"slot{n:02}":{"result":"skipped","outputs":{}} for n in range(1,14)}
+        jobs["slot01"]={"result":"success","outputs":accepted};jobs["slot02"]["result"]="failure"
+        step=CALLER["jobs"]["terminal-12"]["steps"][0]["run"]
+        proc,_=dispatch(step,{"NEEDS":json.dumps(jobs)})
+        self.assertNotEqual(proc.returncode,0)
+        receipt=json.loads(proc.stdout.split("R28_INTERRUPTED_RECEIPT ")[1])
+        self.assertEqual((receipt["verified_parent"],receipt["pending_parent"]),(S2_SHA,accepted["sha"]))
+        stop=inputs();stop["arm"]["outputs"]["apk_delivery_status"]="apk-size-exceeded"
+        stop["read"]["result"]="skipped"
+        payload=record(stop)[1]
+        jobs["slot01"]={"result":"success","outputs":payload};jobs["slot02"]["result"]="skipped"
+        proc,_=dispatch(step,{"NEEDS":json.dumps(jobs)})
+        self.assertNotEqual(proc.returncode,0)
+        receipt=json.loads(proc.stdout.split("R28_TERMINAL_RECEIPT ")[1])
+        self.assertEqual((receipt["status"],receipt["verified_parent"]),("apk-size-exceeded",S2_SHA))
 
     def test_all_slots_early_apk_late_duplicate_and_reread_only(self):
         receipts=[]

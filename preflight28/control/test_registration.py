@@ -13,18 +13,26 @@ class OwnerDraft:
                            head="a"*40,initial_parent=S2_SHA,release_id=RELEASE_ID,recipient=RECIPIENT,
                            collector_registration_id="Automation_"+"f"*32, issued_at="2026-11-25T01:00:00Z",
                            expires_at="2026-11-28T01:00:00Z")
+        self.ack=dict(schema=1, campaign=CAMPAIGN, branch=BASE_REF,head="a"*40,collector_registration_id="Automation_"+"f"*32,
+                      owner_destination_id="libfile_private_owner",registration_nonce="b"*32,recipient=RECIPIENT,
+                      observed_at="2026-11-25T00:58:00Z",valid_until="2026-11-29T00:00:00Z",state="collector-read-back-owner-reservation",
+                      poll_seconds=3600,pickup_retry_seconds=900)
+        self.ticket.update(registration_nonce=self.ack["registration_nonce"],owner_destination_id=self.ack["owner_destination_id"],
+                           collector_ack_asset_id=812,collector_ack_sha=hashlib.sha256(self.data(812)).hexdigest())
+        self.ack_asset = dict(name=CAMPAIGN+"-collector-ack-"+self.ticket["registration_nonce"]+".json",id=812,
+                              created_at="2026-11-25T00:59:00Z")
         self.asset = dict(name=CAMPAIGN+"-collection-registration.json",id=901,uploader=OWNER,created_at="2026-11-25T01:00:00Z")
         self.origin = dict(id=81,run_attempt=1,head_sha="a"*40,path=WORKFLOW,event="workflow_dispatch",
                            head_branch=BASE_REF,actor=OWNER,repository={"id":REPO_ID},head_repository={"id":REPO_ID},
                            created_at="2026-11-25T01:03:00Z")
-    def data(self): return json.dumps(self.ticket).encode()
+    def data(self,n=901): return json.dumps(self.ticket if n==901 else self.ack).encode()
     def draft(self, rid):
         assert rid == RELEASE_ID
-        return {"assets":[dict(self.asset,size=len(self.data()),digest="sha256:"+hashlib.sha256(self.data()).hexdigest())]}
+        return {"assets":[dict(self.asset,size=len(self.data()),digest="sha256:"+hashlib.sha256(self.data()).hexdigest()),dict(self.ack_asset,size=len(self.data(812)))]}
     def asset_info(self, release, name, size, sha, aid):
-        assert len(self.data()) == size and aid == 901
+        assert len(self.data(aid)) == size and aid in (901,812)
     def metadata(self, path): return self.origin
-    def download(self, aid, size, digest, target): target.write(self.data())
+    def download(self, aid, size, digest, target): target.write(self.data(aid))
 
 
 class TicketTests(unittest.TestCase):
@@ -47,11 +55,25 @@ class TicketTests(unittest.TestCase):
     @patch("registration.admit",return_value=92)
     def test_dispatch_with_defaults_discovers_exact_owner_ticket(self, claim):
         self.env.update(REGISTRATION_ASSET_ID="",REGISTRATION_SHA="")
+        self.event["inputs"]={}
         self.assertEqual(bind(self.d,self.env,self.event,self.now)[0],92)
         self.assertEqual(claim.call_args.args[1]["ticket_asset_id"],901)
         asset=self.d.draft(RELEASE_ID)["assets"][0]
         with patch.object(self.d,"draft",return_value={"assets":[asset,asset]}), self.assertRaises(ValueError):
             bind(self.d,self.env,self.event,self.now)
+    @patch("registration.admit",return_value=123)
+    def test_once_ack_reused_only_while_lease_covers_remaining_local_segment(self, claim):
+        self.env.update(REGISTRATION_ASSET_ID="",REGISTRATION_SHA="",GITHUB_JOB="collection-lease")
+        bind(self.d,self.env,self.event,self.now,verify_only=True)
+        self.assertEqual(claim.call_args.args[0],"recover")
+        self.d.ack["valid_until"]="2026-11-26T04:00:00Z"
+        self.d.ticket["collector_ack_sha"]=hashlib.sha256(self.d.data(812)).hexdigest()
+        with self.assertRaisesRegex(ValueError,"lease"):
+            bind(self.d,self.env,self.event,self.now,verify_only=True)
+        self.d.ack["valid_until"]="2026-11-28T04:00:00Z"
+        with self.assertRaisesRegex(ValueError,"ACK bytes"):
+            bind(self.d,self.env,self.event,self.now,verify_only=True)
+
     @patch("registration.admit")
     def test_ticket_not_prepared_earlier_or_wrong_actor_or_expired(self, claim):
         for target, key, bad in [(self.d.asset,"created_at","2026-11-25T01:04:00Z"),
