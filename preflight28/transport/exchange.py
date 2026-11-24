@@ -18,7 +18,11 @@ PARENT_KEY = "bare-coexist-204-45285202990-1-checkpoint-production-s2"
 INPUT = "a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc"
 PART = 2_000_000_000
 TOTAL = 7 * 1024**3 // 2
-CAMPAIGN = "r28-preflight-s2-20261125-v1"
+V1 = "r28-preflight-s2-20261125-v1"
+V2 = "r28-preflight-s2-20261125-v2"
+CAMPAIGN = os.environ.get("R28_CAMPAIGN", V1)
+if CAMPAIGN not in (V1,V2):
+    raise ValueError("Unknown checkpoint campaign")
 
 
 def demand(yes, why):
@@ -122,6 +126,10 @@ def send():
     graph = (base / "graph-sha.txt").read_text().strip()
     demand(hashed(identity) and identity != INPUT and hashed(graph), "Incomplete graph/producer receipt")
     manifest = {**ctx(), "bytes": size, "identity": identity, "graph_sha": graph, "parts": []}
+    if CAMPAIGN==V2:
+        digest=(base/"trial-provenance-sha.txt").read_text().strip()
+        demand(os.environ["GITHUB_JOB"]=="send" and hashed(digest),"Required private sender or trial proof absent")
+        manifest["trial_provenance_sha"]=digest
     with file.open("rb") as f:
         full = hashlib.sha256()
         for index, offset in enumerate(range(0, size, PART)):
@@ -180,6 +188,8 @@ def receive():
     demand(type(size) == int and 0 < size <= TOTAL and hashed(manifest["sha256"]) and
            hashed(manifest["identity"]) and manifest["identity"] != INPUT and hashed(manifest["graph_sha"]),
            "Unbounded or unbound successor")
+    if CAMPAIGN==V2:
+        demand(hashed(manifest.get("trial_provenance_sha")), "Missing frozen trial input/hash binding")
     parts = manifest["parts"]
     demand(isinstance(parts, list) and len(parts) == (size+PART-1)//PART and
            len(set(p["id"] for p in parts)) == len(parts), "Parts are incomplete or repeated")
