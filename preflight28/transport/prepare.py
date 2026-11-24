@@ -92,6 +92,7 @@ def setup(stage):
     script = once(script, "export EXPECTED_IDENTITY=" + IDENTITY, 'export EXPECTED_IDENTITY="$INPUT_IDENTITY"')
     script = once(script, 'cp "$ci/"*.py "$ci/"*.yml exchange/', '''cp "$ci/"*.py "$ci/"*.yml exchange/
 install -m 644 "$GITHUB_WORKSPACE/preflight28/graph/graph.py" exchange/graph.py
+install -m 644 "$GITHUB_WORKSPACE/preflight28/graph/retained.py" exchange/retained.py
 install -m 644 "$GITHUB_WORKSPACE/preflight28/limits/guard.py" exchange/guard.py''')
     # The 26-minute timeout was for legacy restore-only assertions. The new bounded
     # graph planner and one edge run inside the per-job guard and a 95-minute cap.

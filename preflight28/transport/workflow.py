@@ -23,7 +23,7 @@ def build(before):
     if not re.fullmatch(r"[0-9a-f]{40}", before):
         raise ValueError("Need the exact repository head before this change")
     shared = []
-    for path in ["graph/graph.py", "limits/guard.py", "control/admission.py", "transport/prepare.py",
+    for path in ["graph/graph.py", "graph/retained.py", "limits/guard.py", "control/admission.py", "transport/prepare.py",
                  "transport/build-tail.sh", "transport/stream.py", "transport/exchange.py"]:
         s = (ROOT / "preflight28" / path).read_text()
         label = "REVIEWED_R28_" + path.replace("/", "_").replace(".", "_").replace("-", "_").upper()
