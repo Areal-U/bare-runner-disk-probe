@@ -72,10 +72,45 @@ def stage_tools():
     print("Verified full producer, receiver, private read and anonymous check interfaces")
 
 
+def build_recipe(steps):
+    script = steps["Verify producer provenance, Ninja reuse and fresh compile progress"]
+    start = script.index("# These exact APK graph objects")
+    script = script[:start] + (ROOT / "preflight28/transport/build-tail.sh").read_text()
+    script = once(script, 'set -- "$RUNNER_TEMP/bare-zstd-trial/checkpoint.tar.zst"', 'set -- "$R28_ARCHIVE"')
+    script = once(script, ' && ! -e $RUNNER_TEMP/bare-official &&', ' &&')
+    script = once(script, "export EXPECTED_IDENTITY=" + IDENTITY, 'export EXPECTED_IDENTITY="$INPUT_IDENTITY"')
+    script = once(script, 'cp "$ci/"*.py "$ci/"*.yml exchange/', '''cp "$ci/"*.py "$ci/"*.yml exchange/
+install -m 644 "$GITHUB_WORKSPACE/preflight28/graph/graph.py" exchange/graph.py
+install -m 644 "$GITHUB_WORKSPACE/preflight28/graph/retained.py" exchange/retained.py
+install -m 644 "$GITHUB_WORKSPACE/preflight28/limits/guard.py" exchange/guard.py
+install -m 644 "$GITHUB_WORKSPACE/preflight28/transport/trial_provenance.py" exchange/trial_provenance.py
+install -m 644 "$RUNNER_TEMP/r28-trial-inputs.json" exchange/trial-inputs.json''')
+    # The build UID alone writes exchange/checkpoint. The hosted runner reads
+    # three explicitly exported scalar receipts through a traversable directory.
+    script = once(script, "chmod 777 exchange/checkpoint", """sudo -n chown 1000:1000 exchange/checkpoint
+sudo -n chmod 0755 exchange/checkpoint
+[[ $(stat -c %a exchange/checkpoint) == 755 ]]
+""")
+    # Legacy gzip omitted GN packaging descriptors. Private v2 preserves them.
+    script = once(script, "gn gen out/Bare\ncmp -- /exchange/args.gn", 'if [[ $R28_ROLE == produce ]]; then gn gen out/Bare; fi\ncmp -- /exchange/args.gn')
+    # The 26-minute timeout was for legacy restore-only assertions. The new bounded
+    # graph planner and one edge run inside the per-job guard and a 95-minute cap.
+    i = script.index("zstd -qdc -M128MB")
+    script = script[:i] + once(script[i:], 'zstd -qdc -M128MB -- "$asset" | docker compose exec', '''decode_input() {
+  if [[ $R28_ROLE == produce ]]; then gzip -dc -- "$asset"; else zstd -qdc -M128MB -- "$asset"; fi
+}
+decode_input | docker compose exec''')
+    i = script.index("decode_input |")
+    script = script[:i] + once(script[i:], '-e "CI_REVISION=$PRODUCER_REV"', '''-e "CI_REVISION=$INPUT_REVISION" -e TRIAL_SHA -e R28_ROLE -e JOB_STARTED''')
+    script = script[:i] + once(script[i:], 'timeout --kill-after=2m 26m', 'timeout --kill-after=2m 95m')
+    return script
+
+
 def uid_preflight():
     runner = os.getuid()
-    if runner in (0,1000):
-        raise ValueError("Expected runner identity distinct from builder UID 1000")
+    if runner == 0:
+        raise ValueError("A non-root runner is required to test read denials")
+    writer = 1000 if runner != 1000 else 65534
     # Isolate this synthetic cross-UID fixture; no chmod of private source,
     # existing cache, archive or signer material.
     with tempfile.TemporaryDirectory(prefix="bare28-export-check-",dir="/tmp") as name:
@@ -86,9 +121,9 @@ def uid_preflight():
         script.chmod(0o644)
         folder=path/"builder"
         folder.mkdir(mode=0o755)
-        subprocess.run(["sudo","-n","chown","1000:1000",str(folder)],check=True)
+        subprocess.run(["sudo","-n","chown",f"{writer}:{writer}",str(folder)],check=True)
         try:
-            subprocess.run(["sudo","-n","-u","#1000","python3","-I",str(script),"fixture-write",str(folder)],check=True)
+            subprocess.run(["sudo","-n","-u",f"#{writer}","python3","-I",str(script),"fixture-write",str(folder)],check=True)
             subprocess.run(["python3","-I",str(script),"fixture-read",str(folder)],check=True)
         finally:
             # Restore ownership of the synthetic directory to permit normal
@@ -120,36 +155,7 @@ def setup(stage):
     for action, args in [("validate-archive", []), ("verify-continuation", ["--expected-identity", identity, "--ci-revision", revision])]:
         prefix = [str(check)] if stage == "produce" else [str(ROOT/"preflight28/bridge/check_archive.py"), str(check.with_name("frozen-checkpoint.py"))]
         subprocess.run([sys.executable, "-I", *prefix, action, str(archive), "--production", *args], check=True, env=env)
-    script = steps["Verify producer provenance, Ninja reuse and fresh compile progress"]
-    start = script.index("# These exact APK graph objects")
-    script = script[:start] + (ROOT / "preflight28/transport/build-tail.sh").read_text()
-    script = once(script, 'set -- "$RUNNER_TEMP/bare-zstd-trial/checkpoint.tar.zst"', 'set -- "$R28_ARCHIVE"')
-    script = once(script, ' && ! -e $RUNNER_TEMP/bare-official &&', ' &&')
-    script = once(script, "export EXPECTED_IDENTITY=" + IDENTITY, 'export EXPECTED_IDENTITY="$INPUT_IDENTITY"')
-    script = once(script, 'cp "$ci/"*.py "$ci/"*.yml exchange/', '''cp "$ci/"*.py "$ci/"*.yml exchange/
-install -m 644 "$GITHUB_WORKSPACE/preflight28/graph/graph.py" exchange/graph.py
-install -m 644 "$GITHUB_WORKSPACE/preflight28/graph/retained.py" exchange/retained.py
-install -m 644 "$GITHUB_WORKSPACE/preflight28/limits/guard.py" exchange/guard.py
-install -m 644 "$GITHUB_WORKSPACE/preflight28/transport/trial_provenance.py" exchange/trial_provenance.py
-install -m 644 "$RUNNER_TEMP/r28-trial-inputs.json" exchange/trial-inputs.json''')
-    # The build UID alone writes exchange/checkpoint. The hosted runner reads
-    # three explicitly exported scalar receipts through a traversable directory.
-    script = once(script, "chmod 777 exchange/checkpoint", """sudo -n chown 1000:1000 exchange/checkpoint
-sudo -n chmod 0755 exchange/checkpoint
-[[ $(stat -c %a exchange/checkpoint) == 755 ]]
-""")
-    # Legacy gzip omitted GN packaging descriptors. Private v2 preserves them.
-    script = once(script, "gn gen out/Bare\ncmp -- /exchange/args.gn", 'if [[ $R28_ROLE == produce ]]; then gn gen out/Bare; fi\ncmp -- /exchange/args.gn')
-    # The 26-minute timeout was for legacy restore-only assertions. The new bounded
-    # graph planner and one edge run inside the per-job guard and a 95-minute cap.
-    i = script.index("zstd -qdc -M128MB")
-    script = script[:i] + once(script[i:], 'zstd -qdc -M128MB -- "$asset" | docker compose exec', '''decode_input() {
-  if [[ $R28_ROLE == produce ]]; then gzip -dc -- "$asset"; else zstd -qdc -M128MB -- "$asset"; fi
-}
-decode_input | docker compose exec''')
-    i = script.index("decode_input |")
-    script = script[:i] + once(script[i:], '-e "CI_REVISION=$PRODUCER_REV"', '''-e "CI_REVISION=$INPUT_REVISION" -e TRIAL_SHA -e R28_ROLE -e JOB_STARTED''')
-    script = script[:i] + once(script[i:], 'timeout --kill-after=2m 26m', 'timeout --kill-after=2m 95m')
+    script = build_recipe(steps)
     from trial_provenance import WORKFLOW, encoded, expected
     workflow=ROOT/WORKFLOW
     inputs=expected(ROOT, os.environ["TRIAL_SHA"], script, parse_recipe(workflow.read_bytes()), [READ[:2], ARCHIVE[:2]])
