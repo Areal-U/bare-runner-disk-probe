@@ -1,5 +1,6 @@
 """Exercise the ordinary private-route pack and fixed validation entry points."""
 import gzip
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -13,6 +14,30 @@ ADAPTER = ROOT/'preflight28/bridge/check_archive.py'
 ARM = ROOT/'.github/workflows/bare-arm64-probe.yml'
 
 class PrivateArchiveTests(unittest.TestCase):
+    def test_oversize_is_a_successful_terminal_with_no_upload(self):
+        steps = yaml.safe_load(ARM.read_bytes())['jobs']['compile-probe']['steps']
+        seal = next(s['run'] for s in steps if s.get('id') == 'apk_seal')
+        guard = ROOT/'preflight28/limits/guard.py'
+        for kind, limit in (('apk',450),('cipher',451)):
+            start = 'if docker compose exec -T chromium-builder python3 -I /exchange/guard.py size apk' if kind=='apk' else 'if python3 -I "$RUNNER_TEMP/bare-ci/guard.py" size cipher'
+            branch = seal[seal.index(start):].split('\nfi\n',1)[0]+'\nfi\n'
+            self.assertIn("echo 'terminal=true'",seal[:seal.index(start)])
+            with tempfile.TemporaryDirectory() as tmp:
+                path=Path(tmp)
+                (path/'bare-ci').mkdir()
+                (path/'bare-ci/guard.py').symlink_to(guard)
+                file=path/'payload'
+                with file.open('wb') as f:
+                    f.truncate(limit*1024**2+1)
+                env=dict(os.environ,RUNNER_TEMP=str(path),GITHUB_OUTPUT=str(path/'result'),
+                         delivery=str(path),name=file.name,GUARD=str(guard),FIXTURE=str(file))
+                command='docker() { python3 -I "$GUARD" size apk "$FIXTURE"; }\n'+branch+'exit 91\n'
+                result=subprocess.run(['bash','-euo','pipefail','-c',command],env=env,capture_output=True)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual((path/'result').read_text().splitlines(),['status='+kind+'-size-exceeded','ready=false'])
+                file.unlink()
+                self.assertEqual(subprocess.run(['bash','-euo','pipefail','-c',command],env=env,capture_output=True).returncode,66)
+
     def test_production_pack(self):
         arm = yaml.safe_load(ARM.read_bytes())
         job = arm['jobs']['compile-probe']
