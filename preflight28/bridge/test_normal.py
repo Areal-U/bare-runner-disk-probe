@@ -137,6 +137,9 @@ class TestTransport(unittest.TestCase):
                 self.assertEqual((n.ROOT/"checkpoint.tar.zst").read_bytes(),candidate.read_bytes())
                 n.stop("verify-only");copy_peer(2,"ordinary","limited",["outcome.json"])
                 role("limited",2);n.publish();self.assertEqual(len(api.assets),4)
+                role("ordinary",2);(n.ROOT/"outcome.json").unlink()
+                n.stop("size-exceeded");copy_peer(2,"ordinary","limited",["outcome.json"])
+                role("limited",2);n.publish();self.assertEqual(len(api.assets),4)
                 # Ciphertext-only or missing generation never publishes/restarts other work.
                 with self.assertRaisesRegex(ValueError,"No unique committed"):n.recover()
 

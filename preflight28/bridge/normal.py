@@ -19,6 +19,7 @@ b.ROOT = ROOT
 PARENT = {"sha": b.PARENT_SHA, "identity": b.PARENT_IDENTITY}
 PART = 2_000_000_000
 SCHEMA = "bare-r28-checkpoint-private-v1"
+STOPS = {"apk", "no-progress", "verify-only", "size-exceeded", "failed", "cancelled"}
 # Public only, approved in the R27 procedure. The trial has no access to its private key.
 OWNER_PUBLIC_AGE = "age1t69raxytlqula36e8w0tm6p3ezt49ztwnrtz8k57h6mvpwfguy7sjmr4yx"
 
@@ -111,9 +112,30 @@ def info():
     return rec
 
 
+def list_private(api):
+    # Release metadata may include only the first page. Reuse the fixed client's
+    # release/sentinel validation and enumerate immutable assets for long chains.
+    release=api.draft(b.RELEASE)
+    if len(release["assets"])<30:
+        return release
+    assets=[]
+    for page in range(1,11):
+        batch=api.metadata(f"{api.BASE}/releases/{b.RELEASE}/assets?per_page=100&page={page}")
+        b.require(isinstance(batch,list),"Malformed private release asset listing")
+        assets.extend(batch)
+        if len(batch)<100:
+            break
+    else:
+        raise ValueError("Unbounded private release")
+    by_id={asset["id"]:asset for asset in assets}
+    b.require(len(by_id)==len(assets) and all(a["id"] in by_id and by_id[a["id"]]["name"]==a["name"]
+              for a in release["assets"]), "Inconsistent private asset listing")
+    return {**release,"assets":assets}
+
+
 def get_manifest(mid, expected_sha, expected_key):
     api=b.auth_api()
-    rel=api.draft(b.RELEASE)
+    rel=list_private(api)
     row,=[r for r in rel["assets"] if r["id"]==mid]
     number=int(expected_key.rsplit("-s",1)[1])
     b.require(row["name"] in (stem(number)+"-manifest.json",stem(number)+"-manifest.json-retry1")
@@ -259,7 +281,7 @@ def capacity():
 
 
 def stop(reason):
-    b.require(reason in ("apk","no-progress","verify-only","failed","cancelled"),"Unknown terminal state")
+    b.require(reason in STOPS,"Unknown terminal state")
     with (ROOT/"outcome.json").open("x") as f:
         json.dump({**context(),"status":reason},f,sort_keys=True)
 
@@ -274,7 +296,7 @@ class Section:
 def put(suffix,file,offset,length,digest):
     api=b.auth_api();base=stem()+"-"+suffix
     def find(name):
-        rows=[r for r in api.draft(b.RELEASE)["assets"] if r["name"]==name]
+        rows=[r for r in list_private(api)["assets"] if r["name"]==name]
         b.require(len(rows)<=1,"Asset name collision")
         return rows[0] if rows else None
     for name in (base,base+"-retry1"):
@@ -295,7 +317,7 @@ def put(suffix,file,offset,length,digest):
                 if row:break
             b.require(row,"Private write unresolved. Retry receipt reconciliation without propagating.")
         if row["state"]=="starter" and row["size"]==0:continue
-        obj=api.asset_info(api.draft(b.RELEASE),name,length,digest,row["id"])
+        obj=api.asset_info(list_private(api),name,length,digest,row["id"])
         return {"id":obj["id"],"name":name,"bytes":length,"sha256":digest}
     raise ValueError("Empty residue on both permitted write attempts")
 
@@ -305,7 +327,7 @@ def verify_outputs(mid,sha_manifest):
     b.require(same(m),"Accepted manifest no longer corresponds to selected parent")
     api=b.auth_api()
     full=hashlib.sha256()
-    existing=api.draft(b.RELEASE)
+    existing=list_private(api)
     ids={mid,*[p["id"] for p in m["parts"]]}
     rows=[r for r in existing["assets"] if r["id"] in ids]
     b.require(len(rows)==len(ids),"Private generation lost assets before readback")
@@ -385,7 +407,7 @@ def publish():
     r=json.loads((ROOT/"incoming/outcome.json").read_text())
     b.require(same(r),"Stale user, version, segment or candidate")
     if r["status"]!="candidate":
-        b.require(r["status"] in ("apk","no-progress","verify-only","failed","cancelled"),"Unknown result")
+        b.require(r["status"] in STOPS,"Unknown result")
         b.output(private_readback_verified="false",checkpoint_advanced="false")
         return
     file=ROOT/"incoming/checkpoint.cms"
@@ -420,7 +442,7 @@ def recover():
     # After VM loss only an actually readable committed generation is a recovery
     # source. A surviving CMS archive alone cannot recover its vanished private key.
     api=b.auth_api()
-    release=api.draft(b.RELEASE)
+    release=list_private(api)
     row=existing(release,"manifest.json")
     if not row:
         if recovered_intent(release):
