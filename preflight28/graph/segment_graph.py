@@ -9,7 +9,9 @@ import tempfile
 
 from graph import TARGET, canonical, compare, file_record, fixed_graph, frontier, output_name, run
 
-FORMAT = "bare-apk-segment-frontier-v1"
+from retained import commitment, compare_payload, inventory
+
+FORMAT = "bare-apk-segment-frontier-v2"
 PROOF = "checkpoint-segment-frontier.json"
 BOOTSTRAP = "cold"
 
@@ -82,7 +84,8 @@ def begin(out, baseline, parent_sha, command, *, bootstrap=False, verify_only=Fa
     graph = fixed_graph(out)
     proof = out / PROOF
     if proof.exists():
-        observed = verify_subset(out, command, load(proof), graph)
+        data = load(proof)
+        observed = verify_subset(out, command, data, graph)
         verified = True
     elif bootstrap and not verify_only:
         # Caller permits this only for cold bootstrap or a pinned original
@@ -91,12 +94,15 @@ def begin(out, baseline, parent_sha, command, *, bootstrap=False, verify_only=Fa
         verified = False
     else:
         raise ValueError("successor lacks an independent progress receipt")
-    write_record(baseline, {"format": FORMAT, "target": TARGET, "graph": graph,
+    contents = inventory(out)
+    if verified and commitment(contents) != data["child_content"]:
+        raise ValueError("Independent restore changed retained output contents")
+    write_record(baseline, {"files": contents, "format": FORMAT, "target": TARGET, "graph": graph,
                             "parent_sha256": parent_sha, "before": sorted(observed)})
     return {"parent_frontier_verified": verified, "pending": len(observed)}
 
 
-def successful_witnesses(out, metrics, removed):
+def successful_witnesses(out, metrics, removed, *, need_witness=True, private_intermediates=False):
     # The whole-plan comparison is authoritative. These bounded byte records
     # join actual completed steps with their complete output groups and Ninja log.
     log = out / ".ninja_log"
@@ -112,6 +118,7 @@ def successful_witnesses(out, metrics, removed):
                 except ValueError:
                     continue
     witnesses = []
+    authorized = set()
     with metrics.open(encoding="utf-8") as f:
         for line in f:
             m = json.loads(line)
@@ -120,9 +127,13 @@ def successful_witnesses(out, metrics, removed):
             group = tuple(sorted(output_name(n, out) for n in m["outputs"]))
             if canonical(group) not in removed or not set(group) <= logged:
                 continue
+            authorized.update(group)
+            if not need_witness or len(witnesses) >= 3:
+                continue
             # The checkpoint transport omits the APK subtree and packaged files.
-            if any(n.startswith("apks/") or n.lower().endswith((".apk", ".ap_", ".aab", ".apks"))
-                   for n in group):
+            if "apks/ChromePublic.apk" in group or (not private_intermediates and any(
+                    n.startswith("apks/") or n.lower().endswith((".apk", ".ap_", ".aab", ".apks"))
+                    for n in group)):
                 continue
             try:
                 files = {n: file_record(out, n) for n in group}
@@ -130,15 +141,13 @@ def successful_witnesses(out, metrics, removed):
                 continue
             if files not in witnesses:
                 witnesses.append(files)
-            if len(witnesses) == 3:
-                break
-    if not witnesses:
+    if need_witness and not witnesses:
         raise ValueError("no persistable success matches a removed APK edge")
-    return witnesses
+    return witnesses, authorized
 
 
-def finish(out, baseline, trial, command, *, host_quiesced=False):
-    base = load(baseline)
+def finish(out, baseline, trial, command, *, host_quiesced=False, terminal=False, private_intermediates=False):
+    base = load(baseline, 512 * 1024**2)
     report = load(trial, 128 * 1024**2)
     if (base["format"] != FORMAT or base["target"] != TARGET
             or fixed_graph(out) != base["graph"]):
@@ -147,16 +156,20 @@ def finish(out, baseline, trial, command, *, host_quiesced=False):
             or not (host_quiesced or report.get("container_quiescence_verified") is True)
             or report.get("forced_kill") is not False or report.get("controller_error")
             or report.get("close", {}).get("errors") or report.get("failed_step_count") != 0
-            or report.get("reason") not in {"time-limit","disk-limit","output-limit","output-entry-limit"}):
+            or report.get("reason") not in ({"completed"} if terminal else {"time-limit","disk-limit","output-limit","output-entry-limit"})):
         raise ValueError("incomplete segment has no clean, quiescent controller result")
     before = digests(base["before"])
     after = plan(out, command)
-    if after == before:
+    new_files = inventory(out)
+    if terminal and (after or report.get("artifact_ready") is not True or report.get("returncode") != 0):
+        raise ValueError("Terminal APK is not clean and complete")
+    if after == before and not terminal:
+        compare_payload(base["files"], new_files, set())
         return {"frontier_status": "no-progress", "candidate_progress": False,
                 "parent_dirty": len(before), "child_dirty": len(after)}
-    if not after < before:
+    if (not terminal and not after < before) or not after <= before:
         raise ValueError("full APK frontier regressed")
-    if report.get("ready_for_restore_test") is not True:
+    if not terminal and report.get("ready_for_restore_test") is not True:
         raise ValueError("controller did not authorize interrupted checkpoint")
     phase = report["phase"]
     if phase not in ("seed", "restore"):
@@ -164,11 +177,20 @@ def finish(out, baseline, trial, command, *, host_quiesced=False):
     metrics = trial.parent / ("siso-metrics-" + phase + ".json")
     if Path(report["metrics_path"]) != metrics.absolute():
         raise ValueError("success metrics belong to another invocation")
-    witnesses = successful_witnesses(out, metrics, before - after)
+    witnesses, authorized = successful_witnesses(out, metrics, before - after, need_witness=not terminal,
+                                                  private_intermediates=private_intermediates)
+    replacements = compare_payload(base["files"], new_files, authorized)
+    parent_content = commitment(base.pop("files"))
+    child_content = commitment(new_files)
+    if terminal:
+        return {"frontier_status": "apk-complete", "replacements": replacements,
+                "parent_content": parent_content, "child_content": child_content}
     for files in witnesses:
         if run(out, command, sorted(files), dry=True):
             raise ValueError("completed output group is still dirty")
-    evidence = {**base, "after": sorted(after), "witnesses": witnesses}
+    evidence = {**base, "after": sorted(after), "witnesses": witnesses,
+                "parent_content": parent_content, "child_content": child_content,
+                "replacements": replacements}
     write_record(out / PROOF, evidence)
     return {"frontier_status": "candidate", "candidate_progress": True, "parent_dirty": len(before), "child_dirty": len(after),
             "advanced_edges": len(before - after), "proof_sha256": canonical(evidence)}
@@ -187,11 +209,14 @@ if __name__ == "__main__":
     p.add_argument("--baseline", type=Path, required=True)
     p.add_argument("--trial", type=Path, required=True)
     p.add_argument("--host-quiesced", action="store_true")
+    p.add_argument("--terminal", action="store_true")
+    p.add_argument("--private-intermediates", action="store_true")
     args = parser.parse_args()
     if args.operation == "before":
         result = begin(args.out.resolve(), args.baseline, args.parent_sha, ["autoninja"],
                        bootstrap=args.bootstrap, verify_only=args.verify_only)
     else:
         result = finish(args.out.resolve(), args.baseline, args.trial, ["autoninja"],
-                        host_quiesced=args.host_quiesced)
+                        host_quiesced=args.host_quiesced, terminal=args.terminal,
+                        private_intermediates=args.private_intermediates)
     print(json.dumps(result, sort_keys=True))

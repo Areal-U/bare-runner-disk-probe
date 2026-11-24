@@ -77,6 +77,15 @@ class FrontierTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different APK plan"):
             receive(self.out, self.proof, self.command)
 
+    def test_same_mtime_same_size_inherited_substitution(self):
+        produce(self.out, self.proof, self.command)
+        path = self.out / "obj/a.o"
+        before = path.stat()
+        path.write_bytes(b"X" * before.st_size)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        with self.assertRaisesRegex(ValueError, "retained output contents"):
+            receive(self.out, self.proof, self.command)
+
     def test_depfile_changes_without_output_change(self):
         produce(self.out, self.proof, self.command)
         hashes = [sha(self.out / n) for n in ("obj/b.o", "implicit.dat")]

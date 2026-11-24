@@ -13,8 +13,10 @@ import subprocess
 import tempfile
 import time
 
+from retained import commitment, compare_payload, inventory
+
 TARGET = "chrome_public_apk"
-FORMAT = "bare-28-apk-frontier-1"
+FORMAT = "bare-28-apk-frontier-2"
 END = re.compile(rb"Build Succeeded: (\d+) steps -")
 
 
@@ -184,6 +186,7 @@ def produce(out, proof, command):
     if proof.exists():
         raise ValueError("proof already exists on initial parent")
     graph_id = fixed_graph(out)
+    old_files = inventory(out, proof)
     original = run(out, command, [TARGET], dry=True)
     parent = frontier(original)
     target, group = pick(out, command, original)
@@ -203,7 +206,11 @@ def produce(out, proof, command):
     compare(parent, child, {canonical(group)})
     if graph_id != fixed_graph(out):
         raise ValueError("GN graph changed while measuring")
+    new_files = inventory(out, proof)
+    replaced = compare_payload(old_files, new_files, set(group))
     data = {"format": FORMAT, "target": TARGET, "graph_sha256": graph_id,
+            "parent_content": commitment(old_files), "child_content": commitment(new_files),
+            "replacements": replaced,
             "parent_pending": sorted(parent), "successor_pending": sorted(child),
             "target_path": target, "outputs": records}
     with proof.open("x", encoding="ascii") as stream:
@@ -228,6 +235,8 @@ def receive(out, proof, command):
     if observed != set(data["successor_pending"]):
         raise ValueError("independent restore has a different APK plan")
     compare(set(data["parent_pending"]), observed, {canonical(group)})
+    if commitment(inventory(out, proof)) != data["child_content"]:
+        raise ValueError("Independent restore changed retained output contents")
     return {"parent_dirty": len(data["parent_pending"]), "restored_dirty": len(observed),
             "restored_target": data["target_path"], "proof_sha256": sha(proof)}
 
