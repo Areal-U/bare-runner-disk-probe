@@ -1,0 +1,1270 @@
+name: Bare R28 fixed S2 preflight
+run-name: r28-preflight-s2-20261125-v1 / S2 transport
+'on':
+  pull_request:
+    types:
+    - synchronize
+    branches:
+    - bare-coexist-v2.0.4
+    paths:
+    - .github/workflows/bare-r28-s2-preflight.yml
+permissions: {}
+cache-mode: none
+concurrency:
+  group: r28-preflight-s2-20261125-v1-s2
+  cancel-in-progress: false
+env:
+  EXPECTED_BEFORE: f898d58615cd688ebcf026474c7aedc37a343d7a
+  TRIAL_SHA: ${{ github.event.pull_request.head.sha }}
+defaults:
+  run:
+    shell: bash
+jobs:
+  produce:
+    runs-on: ubuntu-24.04
+    permissions: &id002
+      actions: read
+      contents: write
+    timeout-minutes: 215
+    name: Create one S2 successor and transfer to fixed private Draft
+    cache-mode: read
+    if: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.actor
+      == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe'
+      && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository
+      && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha ==
+      'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == 'f898d58615cd688ebcf026474c7aedc37a343d7a' && github.run_attempt ==
+      '1' }}
+    outputs:
+      manifest_id: ${{ steps.send.outputs.manifest_id }}
+      manifest_sha: ${{ steps.send.outputs.manifest_sha }}
+    steps:
+    - &id003
+      name: Check out the trusted PR head without persisting credentials
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        persist-credentials: false
+    - &id004
+      name: Stage reviewed helpers and pinned owner-Draft access routines
+      run: |
+        set -euo pipefail
+        mkdir -p preflight28/{graph,limits,control,transport}
+        cat > preflight28/graph/graph.py <<'REVIEWED_R28_GRAPH_GRAPH_PY'
+        #!/usr/bin/env python3
+        """Prove forward progress for the pinned APK using the actual Siso planner."""
+        import argparse
+        import contextlib
+        import hashlib
+        import json
+        import os
+        from pathlib import Path
+        import re
+        import shutil
+        import stat
+        import subprocess
+        import tempfile
+        import time
+
+        TARGET = "chrome_public_apk"
+        FORMAT = "bare-28-apk-frontier-1"
+        END = re.compile(rb"Build Succeeded: (\d+) steps -")
+
+
+        def sha(path):
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            return digest.hexdigest()
+
+
+        def canonical(value):
+            return hashlib.sha256(json.dumps(value, ensure_ascii=True, separators=(",", ":"),
+                                             sort_keys=True).encode("ascii")).hexdigest()
+
+
+        def fixed_graph(out):
+            # GN may regenerate the files. Content, paths and pinned inputs must agree.
+            records = [(str(p.relative_to(out)), sha(p)) for p in sorted(out.rglob("*.ninja"))
+                       if p.is_file()]
+            if not records or not (out / "build.ninja").is_file():
+                raise ValueError("missing GN manifest")
+            return canonical(records)
+
+
+        def output_name(value, out):
+            if not isinstance(value, str) or not value or any(ord(c) < 32 for c in value):
+                raise ValueError("invalid Siso output")
+            p = Path(value)
+            if p.is_absolute():
+                p = p.relative_to(out)
+            elif p.parts[:2] == ("out", "Bare"):
+                p = Path(*p.parts[2:])
+            if not p.parts or ".." in p.parts or "\\" in value:
+                raise ValueError("output outside build directory: " + value)
+            return p.as_posix()
+
+
+        def parse_metrics(metrics, count, out, *, actual):
+            edges = {}
+            seen_step = set()
+            summary = False
+            if not metrics.exists() and count == 0:
+                return edges
+            with metrics.open(encoding="utf-8") as stream:
+                for line in stream:
+                    step = json.loads(line)
+                    if "step_id" not in step:
+                        if "build_id" in step:
+                            summary = True
+                        continue
+                    if step["step_id"] in seen_step or step.get("err", False):
+                        raise ValueError("duplicate or failed metric")
+                    seen_step.add(step["step_id"])
+                    raw = step.get("outputs")
+                    if not isinstance(raw, list) or not raw:
+                        raise ValueError("missing declared step output group")
+                    names = tuple(sorted(output_name(n, out) for n in raw))
+                    if names in edges or len(set(names)) != len(names):
+                        raise ValueError("ambiguous edge output group")
+                    if actual and not step.get("is_local", False):
+                        raise ValueError("small preflight edge did not execute locally")
+                    edges[names] = step.get("action", "")
+            if count != len(edges) or (count and not summary):
+                raise ValueError(f"incomplete Siso metrics: {len(edges)} of {count} steps")
+            return edges
+
+
+        @contextlib.contextmanager
+        def preserve_ninja_log(out):
+            # v1.6.5 writes .ninja_log in the output directory even on -n with an
+            # isolated -state_dir/-log_dir. The runner has a single exclusive writer.
+            src = out / ".ninja_log"
+            with tempfile.TemporaryDirectory(prefix=".round28-plan-", dir=out) as name:
+                before = Path(name) / "original"
+                if src.exists() or src.is_symlink():
+                    if not stat.S_ISREG(src.lstat().st_mode):
+                        raise ValueError("unexpected Ninja log file type")
+                    src.rename(before)
+                try:
+                    if before.exists():
+                        shutil.copy2(before, src)
+                    yield
+                finally:
+                    if before.exists():
+                        os.replace(before, src)
+                    else:
+                        src.unlink(missing_ok=True)
+
+
+        def run(out, command, targets, *, dry, noop=False):
+            start = time.monotonic()
+            with tempfile.TemporaryDirectory(prefix="bare28-plan-") as name:
+                tmp = Path(name)
+                metrics = tmp / "metrics.jsonl"
+                args = [*command, "-C", str(out), "-j", "2", "-metrics_json", str(metrics)]
+                if dry:
+                    state = tmp / "state"
+                    state.mkdir()
+                    for basename in (".siso_deps", ".siso_fs_state", ".siso_fs_state.journal"):
+                        path = out / basename
+                        if path.exists():
+                            if not stat.S_ISREG(path.lstat().st_mode):
+                                raise ValueError("unexpected Siso state type")
+                            shutil.copy2(path, state / basename)
+                    args.extend(["-n", "-state_dir", os.path.relpath(state, out),
+                                 "-log_dir", str(tmp / "logs")])
+                with (tmp / "console").open("w+b") as console:
+                    with preserve_ninja_log(out) if (dry or noop) else contextlib.nullcontext():
+                        process = subprocess.run([*args, *targets], stdout=console,
+                                                 stderr=subprocess.STDOUT, timeout=600, check=False)
+                        console.seek(max(0, console.tell() - 8192))
+                        tail = console.read()
+                    counts = END.findall(tail)
+                    if process.returncode or len(counts) != 1 or b"Build Failed" in tail:
+                        raise ValueError("Siso completion/step count unavailable: "
+                                         + tail[-1000:].decode(errors="replace"))
+                edges = parse_metrics(metrics, int(counts[0]), out, actual=not dry)
+            print(json.dumps({"operation": "plan" if dry else "execute",
+                              "target": targets[0], "steps": len(edges),
+                              "seconds": round(time.monotonic() - start, 2)}), flush=True)
+            return edges
+
+
+        def file_record(out, name):
+            path = out / name
+            if path.resolve().parent != path.parent or not stat.S_ISREG(path.lstat().st_mode):
+                raise ValueError("target is not a regular file in the build tree")
+            return [path.stat().st_size, sha(path)]
+
+
+        def frontier(edges):
+            return {canonical(names) for names in edges}
+
+
+        def compare(parent, child, selected):
+            if not child < parent or not selected <= (parent - child) or not selected:
+                raise ValueError("APK frontier regressed or selected edge remains dirty")
+
+
+        def pick(out, command, edges):
+            # A small missing object with no other dirty prerequisites. Prefer an
+            # early scheduled group over an arbitrary source object from another target.
+            ranked = []
+            for index, group in enumerate(edges):
+                for n in group:
+                    if n.startswith("obj/") and n.endswith(".o") and not (out / n).exists():
+                        ranked.append((index, n, group))
+                        break
+            for _, target, group in sorted(ranked)[:32]:
+                plan = run(out, command, [target], dry=True)
+                if set(plan) == {group}:
+                    return target, group
+            raise ValueError("no missing single-step APK ancestor found among initial objects")
+
+
+        def check_selected(out, command, names, expected):
+            if {n: file_record(out, n) for n in names} != expected:
+                raise ValueError("selected edge bytes changed or missing")
+            if run(out, command, list(names), dry=True):
+                raise ValueError("restored selected edge/dependencies require work")
+            if run(out, command, list(names), dry=False, noop=True):
+                raise ValueError("Siso actually executed a supposedly clean step")
+
+
+        def produce(out, proof, command):
+            if proof.exists():
+                raise ValueError("proof already exists on initial parent")
+            graph_id = fixed_graph(out)
+            original = run(out, command, [TARGET], dry=True)
+            parent = frontier(original)
+            target, group = pick(out, command, original)
+            executed = run(out, command, [target], dry=False)
+            if set(executed) != {group}:
+                raise ValueError("target executed different prerequisites or output group")
+            log = (out / ".ninja_log").read_text(encoding="utf-8").splitlines()
+            if not log or log[0].strip() != "# ninja log v5":
+                raise ValueError("missing Ninja v5 success evidence")
+            recorded = {output_name(fields[3], out) for line in log[1:]
+                        if len(fields := line.split("\t")) == 5}
+            if not set(group) <= recorded:
+                raise ValueError("Ninja and Siso disagree about executed outputs")
+            records = {n: file_record(out, n) for n in group}
+            check_selected(out, command, group, records)
+            child = frontier(run(out, command, [TARGET], dry=True))
+            compare(parent, child, {canonical(group)})
+            if graph_id != fixed_graph(out):
+                raise ValueError("GN graph changed while measuring")
+            data = {"format": FORMAT, "target": TARGET, "graph_sha256": graph_id,
+                    "parent_pending": sorted(parent), "successor_pending": sorted(child),
+                    "target_path": target, "outputs": records}
+            with proof.open("x", encoding="ascii") as stream:
+                json.dump(data, stream, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+            return {"parent_dirty": len(parent), "child_dirty": len(child), "new_target": target,
+                    "proof_sha256": sha(proof), "outputs": records}
+
+
+        def receive(out, proof, command):
+            if proof.stat().st_size > 64 * 1024**2:
+                raise ValueError("unbounded graph proof")
+            data = json.loads(proof.read_text(encoding="ascii"))
+            if (data["format"] != FORMAT or data["target"] != TARGET
+                    or data["graph_sha256"] != fixed_graph(out)):
+                raise ValueError("graph provenance changed")
+            records = data["outputs"]
+            group = tuple(sorted(records))
+            if not group or data["target_path"] not in group or any(output_name(n, out) != n for n in group):
+                raise ValueError("invalid recorded group")
+            check_selected(out, command, group, records)
+            observed = frontier(run(out, command, [TARGET], dry=True))
+            if observed != set(data["successor_pending"]):
+                raise ValueError("independent restore has a different APK plan")
+            compare(set(data["parent_pending"]), observed, {canonical(group)})
+            return {"parent_dirty": len(data["parent_pending"]), "restored_dirty": len(observed),
+                    "restored_target": data["target_path"], "proof_sha256": sha(proof)}
+
+
+        if __name__ == "__main__":
+            parser = argparse.ArgumentParser(description=__doc__)
+            parser.add_argument("action", choices=["produce", "receive"])
+            parser.add_argument("--out", type=Path, required=True)
+            parser.add_argument("--proof", type=Path, required=True)
+            args = parser.parse_args()
+            result = {"produce": produce, "receive": receive}[args.action](
+                args.out.resolve(), args.proof, ["autoninja"])
+            print(json.dumps(result, sort_keys=True))
+        REVIEWED_R28_GRAPH_GRAPH_PY
+        cat > preflight28/limits/guard.py <<'REVIEWED_R28_LIMITS_GUARD_PY'
+        #!/usr/bin/env python3
+        """Bounded resource and delivery checks for a single Bare runner segment."""
+        import argparse
+        import concurrent.futures
+        from datetime import datetime
+        import http.client
+        import json
+        import os
+        from pathlib import Path
+        import signal
+        import stat
+        import subprocess
+        import sys
+        import time
+
+        MIB = 1024 ** 2
+        GIB = 1024 ** 3
+        BYTE_CAPS = {'apk': 450 * MIB, 'cipher': 451 * MIB, 'checkpoint': 7 * GIB // 2}
+        FLOOR = 20 * GIB
+        INODE_FLOOR = 20_000
+        OUT_CAP = 18 * GIB
+        ENTRY_CAP = 525_000
+        # R20 grew by 509,147,136 bytes while free space fell by 511,643,648 bytes
+        # within 25.49 seconds. These margins are trial thresholds, not physical bounds.
+        STOP_MARGIN = GIB
+        FAST_MARGIN = 2 * GIB
+        STOP_ENTRIES = 10_000
+        FAST_ENTRIES = 20_000
+
+
+        class GuardError(Exception):
+            def __init__(self, reason, **details):
+                super().__init__(reason)
+                self.record = {'status': reason, **details}
+
+
+        def check_size(kind, path):
+            mode = path.lstat()
+            if not stat.S_ISREG(mode.st_mode) or mode.st_size == 0:
+                raise GuardError('invalid-file', kind=kind, size=mode.st_size)
+            if mode.st_size > BYTE_CAPS[kind]:
+                raise GuardError('size-exceeded', kind=kind, size=mode.st_size, limit=BYTE_CAPS[kind], retry=False)
+            return {'status': 'within-size-limit', 'kind': kind, 'size': mode.st_size, 'limit': BYTE_CAPS[kind]}
+
+
+        def disk(path):
+            fs = os.statvfs(path)
+            return {'device': os.stat(path).st_dev, 'free_bytes': fs.f_bavail * fs.f_frsize, 'free_inodes': fs.f_favail}
+
+
+        def reserve(space, extra_bytes, extra_inodes, floor=FLOOR, inode_floor=INODE_FLOOR):
+            if min(extra_bytes, extra_inodes) < 0 or floor < FLOOR or inode_floor < INODE_FLOOR:
+                raise ValueError('Invalid incremental allocation or safety floor')
+            result = dict(space, future_bytes=extra_bytes, future_inodes=extra_inodes,
+                          byte_floor=floor, inode_floor=inode_floor)
+            if space['free_bytes'] < floor + extra_bytes or space['free_inodes'] < inode_floor + extra_inodes:
+                raise GuardError('insufficient-space', **result)
+            return {'status': 'space-reserved', **result}
+
+
+        def cache_budget(entries, capacity=10 * GIB, safety=128 * MIB):
+            """Deduplicate referenced physical objects; an unsettled write has its own reservation."""
+            distinct = {}
+            for record in entries:
+                identity = record['physical_id']
+                size = record['bytes']
+                if not isinstance(identity, str) or not identity or type(size) is not int or size <= 0:
+                    raise ValueError('Invalid cache object or outstanding reservation')
+                if distinct.setdefault(identity, size) != size:
+                    raise ValueError('Conflicting sizes for the same cache identity')
+            total = sum(distinct.values())
+            headroom = capacity - safety - total
+            record = {'objects': len(distinct), 'peak_bytes': total, 'headroom': headroom}
+            if headroom < 0:
+                raise GuardError('cache-budget-exceeded', **record)
+            return {'status': 'within-cache-budget', **record}
+
+
+        def compile_seconds(job_start, now, job_minutes=350):
+            if not 40 < job_minutes <= 350 or not 0 < job_start <= now:
+                raise ValueError('Invalid job epoch or duration')
+            return max(0, int(job_start + (job_minutes - 40) * 60 - now))
+
+
+        def job_clock(check_run):
+            repo = 'Areal-U/bare-runner-disk-probe'
+            if os.environ['GITHUB_REPOSITORY'] != repo or not os.environ.get('JOB_READ_TOKEN'):
+                raise ValueError('Job clock requires the authorized repository and read credential')
+            run = int(os.environ['GITHUB_RUN_ID'])
+            attempt = int(os.environ['GITHUB_RUN_ATTEMPT'])
+            allowed_sha = {os.environ['GITHUB_SHA']}
+            if os.environ.get('GITHUB_EVENT_NAME') == 'pull_request':
+                event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+                allowed_sha.add(event['pull_request']['head']['sha'])
+            path = f'/repos/{repo}/actions/runs/{run}/attempts/{attempt}/jobs?per_page=100'
+            headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'bare-trial-clock',
+                       'Authorization': 'Bearer ' + os.environ['JOB_READ_TOKEN']}
+            for retry in range(3):
+                conn = http.client.HTTPSConnection('api.github.com', timeout=10)
+                try:
+                    conn.request('GET', path, headers=headers)
+                    response = conn.getresponse()
+                    if response.status != 200:
+                        raise ValueError(f'Job start lookup HTTP {response.status}')
+                    listing = json.load(response)
+                    jobs = listing['jobs']
+                    matches = [j for j in jobs if j['run_id'] == run and j['run_attempt'] == attempt
+                               and j['head_sha'] in allowed_sha and j['status'] == 'in_progress'
+                               and j['check_run_url'] == f'https://api.github.com/repos/{repo}/check-runs/{check_run}']
+                    if len(jobs) != listing['total_count'] or len(matches) != 1:
+                        raise ValueError('No unambiguous active check run clock')
+                    start = datetime.fromisoformat(matches[0]['started_at'].replace('Z', '+00:00'))
+                    if not start.tzinfo or start.timestamp() > time.time():
+                        raise ValueError('Invalid job start')
+                    return int(start.timestamp())
+                except (OSError, ValueError, http.client.HTTPException):
+                    if retry == 2:
+                        raise
+                    time.sleep(2)
+                finally:
+                    conn.close()
+
+
+        def tree(path):
+            wall = time.monotonic()
+            cpu = time.thread_time()
+            logical = allocated = entries = 0
+            pending = [path]
+            while pending:
+                try:
+                    directory = os.scandir(pending.pop())
+                except FileNotFoundError:
+                    continue
+                with directory as contents:
+                    for item in contents:
+                        try:
+                            info = item.stat(follow_symlinks=False)
+                        except FileNotFoundError:
+                            continue
+                        if stat.S_ISDIR(info.st_mode):
+                            pending.append(item.path)
+                        elif stat.S_ISREG(info.st_mode):
+                            logical += info.st_size
+                        allocated += info.st_blocks * 512
+                        entries += 1
+            return {'estimate': max(allocated, logical) + entries * 2048, 'entries': entries,
+                    'scan_seconds': time.monotonic() - wall, 'scan_cpu_seconds': time.thread_time() - cpu}
+
+
+        def pressure(sample, fs, terminal):
+            byte_margin = min(OUT_CAP - sample['estimate'], fs['free_bytes'] - FLOOR)
+            inode_margin = min(ENTRY_CAP - sample['entries'], fs['free_inodes'] - INODE_FLOOR)
+            if byte_margin <= STOP_MARGIN or inode_margin <= STOP_ENTRIES:
+                return 'stop', 5
+            if terminal or byte_margin <= FAST_MARGIN or inode_margin <= FAST_ENTRIES:
+                return 'fast', 5
+            return 'normal', 30
+
+
+        def memory():
+            root = Path('/sys/fs/cgroup')
+            result = {}
+            for item in ('memory.current', 'memory.peak', 'memory.events'):
+                file = root / item
+                if file.is_file():
+                    raw = file.read_text().strip()
+                    result[item] = (dict((x.split()[0], int(x.split()[1])) for x in raw.splitlines())
+                                    if item == 'memory.events' else int(raw))
+            return result
+
+
+        def log_event(f, event, **fields):
+            record = {'event': event, 'time': time.time(), **fields}
+            f.write(json.dumps(record, separators=(',', ':'), sort_keys=True) + '\n')
+            f.flush()
+
+
+        def monitor(args):
+            command = args.cmd[1:] if args.cmd[:1] == ['--'] else args.cmd
+            if not command or not args.output.is_dir():
+                raise ValueError('Missing checked output tree or build command')
+            wall_remaining = compile_seconds(args.job_start, time.time(), args.job_minutes)
+            limit = time.monotonic() + wall_remaining
+            # Run inside the build container so SIGINT reaches Siso and every compiler.
+            state = {'reason': None}
+            def cancel(signum, frame):
+                state['reason'] = 'cancelled'
+            old = {sig: signal.signal(sig, cancel) for sig in (signal.SIGTERM, signal.SIGINT)}
+            proc = None
+            group_alive = False
+            try:
+                with args.jsonl.open('x', encoding='utf-8') as out, concurrent.futures.ThreadPoolExecutor(max_workers=1) as scan:
+                    def emit(label, **fields):
+                        log_event(out, label, **fields)
+                    sample, fs = tree(args.output), disk(args.output)
+                    level, interval = pressure(sample, fs, args.terminal)
+                    mem_before = memory()
+                    emit('start', **sample, **fs, **mem_before, level=level, remaining=wall_remaining, interval=interval)
+                    if level == 'stop' or time.monotonic() >= limit or state['reason']:
+                        raise GuardError('compile-not-started', level=level, remaining=wall_remaining)
+                    proc = subprocess.Popen(command, start_new_session=True)
+                    group_alive = True
+                    scan_from = time.monotonic()
+                    cheap_from = scan_from
+                    future = None
+                    scans = 1
+                    peak_bytes, peak_entries = sample['estimate'], sample['entries']
+                    min_free, min_inodes = fs['free_bytes'], fs['free_inodes']
+                    int_time = None
+                    while proc.poll() is None:
+                        now = time.monotonic()
+                        fs = disk(args.output)
+                        min_free, min_inodes = min(min_free, fs['free_bytes']), min(min_inodes, fs['free_inodes'])
+                        if future is not None and future.done():
+                            sample = future.result()
+                            future = None
+                            scans += 1
+                            peak_bytes = max(peak_bytes, sample['estimate'])
+                            peak_entries = max(peak_entries, sample['entries'])
+                            emit('scan', **sample, **fs, **memory())
+                        level, interval = pressure(sample, fs, args.terminal)
+                        if now - cheap_from >= 5:
+                            emit('space', **fs, **memory(), level=level, interval=interval)
+                            cheap_from = now
+                        if future is None and now - scan_from >= interval:
+                            future = scan.submit(tree, args.output)
+                            scan_from = now
+                        if int_time is None:
+                            if level == 'stop' or now >= limit or state['reason']:
+                                state['reason'] = state['reason'] or ('resource-margin' if level == 'stop' else 'time-budget')
+                                emit('interrupt', reason=state['reason'], **fs, **sample)
+                                try:
+                                    os.killpg(proc.pid, signal.SIGINT)
+                                except ProcessLookupError:
+                                    pass
+                                int_time = now
+                        elif now - int_time >= 120:
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            state['reason'] = 'forced-kill'
+                        time.sleep(0.5)
+                    proc.wait()
+                    if future is not None:
+                        future.result()
+                    try:
+                        os.killpg(proc.pid, 0)
+                    except ProcessLookupError:
+                        group_alive = False
+                    else:
+                        raise GuardError('unsettled-process-group')
+                    final = tree(args.output)
+                    fs = disk(args.output)
+                    peak_bytes = max(peak_bytes, final['estimate'])
+                    peak_entries = max(peak_entries, final['entries'])
+                    min_free, min_inodes = min(min_free, fs['free_bytes']), min(min_inodes, fs['free_inodes'])
+                    mem_after = memory()
+                    oom = (mem_after.get('memory.events', {}).get('oom_kill', 0) >
+                           mem_before.get('memory.events', {}).get('oom_kill', 0))
+                    ok = (not oom and not state['reason'] and proc.returncode == 0 and peak_bytes < OUT_CAP and
+                          peak_entries < ENTRY_CAP and min_free >= FLOOR and min_inodes >= INODE_FLOOR)
+                    emit('settled', ok=ok, reason=state['reason'], returncode=proc.returncode,
+                         scans=scans + 1, peak_estimate=peak_bytes, peak_entries=peak_entries, min_free=min_free,
+                         min_inodes=min_inodes, oom_kill=oom, **fs, **mem_after, **final)
+                    if not ok:
+                        raise GuardError('build-not-eligible', reason=state['reason'], returncode=proc.returncode)
+                    return {'status': 'completed', 'file': str(args.jsonl)}
+            finally:
+                if proc is not None and group_alive:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    proc.wait()
+                for sig, handler in old.items():
+                    signal.signal(sig, handler)
+
+
+        def main():
+            parser = argparse.ArgumentParser(description=__doc__)
+            p = parser.add_subparsers(dest='action', required=True)
+            cache = p.add_parser('cache')
+            cache.add_argument('inventory', type=Path)
+            clock = p.add_parser('job-clock')
+            clock.add_argument('--check-run', type=int, required=True)
+            size = p.add_parser('size')
+            size.add_argument('kind', choices=BYTE_CAPS)
+            size.add_argument('path', type=Path)
+            s = p.add_parser('space')
+            s.add_argument('path', type=Path)
+            s.add_argument('--bytes', dest='future_bytes', type=int, required=True)
+            s.add_argument('--inodes', dest='future_inodes', type=int, required=True)
+            s.add_argument('--floor-bytes', default=FLOOR, type=int)
+            s.add_argument('--floor-inodes', default=INODE_FLOOR, type=int)
+            for name in ('deadline', 'monitor'):
+                a = p.add_parser(name)
+                a.add_argument('--job-start', type=float, required=True)
+                a.add_argument('--job-minutes', type=int, default=350)
+                if name == 'monitor':
+                    a.add_argument('--output', type=Path, required=True)
+                    a.add_argument('--jsonl', type=Path, required=True)
+                    a.add_argument('--terminal', action='store_true')
+                    a.add_argument('cmd', nargs=argparse.REMAINDER)
+            args = parser.parse_args()
+            try:
+                if args.action == 'job-clock':
+                    print(job_clock(args.check_run))
+                    return 0
+                if args.action == 'cache':
+                    result = cache_budget(json.loads(args.inventory.read_text()))
+                elif args.action == 'space':
+                    result = reserve(disk(args.path), args.future_bytes, args.future_inodes, args.floor_bytes, args.floor_inodes)
+                elif args.action == 'size':
+                    result = check_size(args.kind, args.path)
+                elif args.action == 'deadline':
+                    print(compile_seconds(args.job_start, time.time(), args.job_minutes))
+                    return 0
+                else:
+                    result = monitor(args)
+                print(json.dumps(result, sort_keys=True))
+                return 0
+            except GuardError as e:
+                print(json.dumps(e.record, sort_keys=True), file=sys.stderr)
+                return 65 if e.record['status'] == 'size-exceeded' else 66
+            except (OSError, ValueError) as e:
+                print(str(e), file=sys.stderr)
+                return 66
+
+
+        if __name__ == '__main__':
+            sys.exit(main())
+        REVIEWED_R28_LIMITS_GUARD_PY
+        cat > preflight28/control/admission.py <<'REVIEWED_R28_CONTROL_ADMISSION_PY'
+        """Admit exactly one PR9 S2 trial run. Replayed GitHub attempts are readers only."""
+        import argparse
+        import hashlib
+        import http.client
+        import io
+        import json
+        import os
+        from pathlib import Path
+        import re
+        import subprocess
+        import sys
+        import time
+
+        REPO = "Areal-U/bare-runner-disk-probe"
+        REPO_ID = 1450926240
+        BRANCH = "work-bare-27-storage-check"
+        BASE_REF = "bare-coexist-v2.0.4"
+        BASE_SHA = "bf70ddbf474f3390a62220a076b8c43347fecc64"
+        CAMPAIGN = "r28-preflight-s2-20261125-v1"
+        WORKFLOW = ".github/workflows/bare-r28-s2-preflight.yml"
+        CLAIM = CAMPAIGN + "-s2-run-claim.json"
+        S2_SHA = "4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf"
+        RELEASE_ID = 452114666
+
+
+        def require(condition, message):
+            if not condition:
+                raise ValueError(message)
+
+
+        def checked_holder(mode, before, environment, event, api_run, checkout):
+            """Validate immutable event data. A subsequent push must not invalidate retrieval."""
+            rid = int(environment["GITHUB_RUN_ID"])
+            attempt = int(environment["GITHUB_RUN_ATTEMPT"])
+            require(rid > 0 and attempt > 0, "Invalid physical run identity")
+            require(re.fullmatch("[0-9a-f]{40}", before), "Invalid expected prior commit")
+            pr = event["pull_request"]
+            head = pr["head"]["sha"]
+            require(re.fullmatch("[0-9a-f]{40}", head) and head != before and checkout == head,
+                    "Checkout does not match the triggering head")
+            require(environment["GITHUB_REPOSITORY"] == REPO and
+                    environment["GITHUB_EVENT_NAME"] == "pull_request" and
+                    environment["GITHUB_REF"] == "refs/pull/9/merge" and
+                    event["number"] == 9 and pr["number"] == 9 and event["action"] == "synchronize" and
+                    event["before"] == before and event["after"] == head and
+                    pr["head"]["ref"] == BRANCH and pr["base"]["ref"] == BASE_REF and
+                    pr["base"]["sha"] == BASE_SHA, "Not the approved PR9 transition")
+            for repo in (pr["head"]["repo"], pr["base"]["repo"], event["repository"]):
+                require(repo["id"] == REPO_ID and repo["full_name"] == REPO,
+                        "Unexpected repository identity")
+            require(event["sender"]["id"] == 292261483 and event["sender"]["login"] == "Areal-U"
+                    and api_run["actor"]["id"] == 292261483, "Unexpected event actor")
+            require(api_run["id"] == rid and api_run["run_attempt"] == attempt and
+                    api_run["path"] == WORKFLOW and api_run["event"] == "pull_request" and
+                    api_run["head_sha"] == head and api_run["head_branch"] == BRANCH and
+                    api_run["head_repository"]["id"] == REPO_ID and
+                    api_run["repository"]["id"] == REPO_ID and
+                    any(p["number"] == 9 for p in api_run["pull_requests"]),
+                    "GitHub did not confirm this physical trial")
+            if mode == "compute":
+                require(attempt == 1 and environment["GITHUB_JOB"] == "produce",
+                        "Only the first physical producer may compute")
+            else:
+                require(mode == "recover" and environment["GITHUB_JOB"] == "receive",
+                        "Recovery requires the read-only receiver job")
+            return {"schema": 1, "campaign": CAMPAIGN, "workflow": WORKFLOW, "repository_id": REPO_ID,
+                    "pr": 9, "run_id": rid, "producer_attempt": 1, "producer_job": "produce",
+                    "head": head, "before": before, "parent_s2_sha256": S2_SHA}
+
+
+        def encode(holder):
+            return (json.dumps(holder, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+        def claim_info(helper, payload):
+            release = helper.draft(RELEASE_ID)
+            names = [a for a in release["assets"] if a["name"] == CLAIM]
+            if not names:
+                return None
+            digest = hashlib.sha256(payload).hexdigest()
+            asset = helper.asset_info(release, CLAIM, len(payload), digest)
+            retrieved = io.BytesIO()
+            helper.download(asset["id"], len(payload), digest, retrieved)
+            require(retrieved.getvalue() == payload, "Existing claim belongs to another producer")
+            return asset["id"]
+
+
+        def admit(mode, holder, helper, pause=time.sleep):
+            payload = encode(holder)
+            found = claim_info(helper, payload)
+            if found:
+                return found
+            require(mode == "compute", "No first-attempt receipt to recover")
+            # The asset name is unique within this one fixed draft. No replace, cleanup or
+            # alternate filename is allowed for a run claim, even on a lost response.
+            path = f"{helper.BASE}/releases/{RELEASE_ID}/assets?name={CLAIM}"
+            status = None
+            try:
+                connection, response = helper.request(helper.UPLOAD, "POST", path, auth=True, body=payload,
+                                                      length=len(payload), content_type="application/json")
+                try:
+                    status = response.status
+                finally:
+                    connection.close()
+            except (OSError, http.client.HTTPException):
+                pass  # Read back, without assuming the POST failed or duplicating it.
+            for delay in (0, 1, 3, 6):
+                if delay:
+                    pause(delay)
+                found = claim_info(helper, payload)
+                if found:
+                    return found
+            raise ValueError(f"Canonical claim not confirmed (POST {status}); no compute")
+
+
+        def main():
+            parser = argparse.ArgumentParser(description=__doc__)
+            parser.add_argument("mode", choices=("compute", "recover"))
+            parser.add_argument("--before", required=True)
+            parser.add_argument("--helper-dir", type=Path, required=True)
+            args = parser.parse_args()
+            # prepare.py extracts this fixed reviewed implementation from the pinned trial.
+            sys.path.insert(0, str(args.helper_dir.resolve(strict=True)))
+            import transfer
+            event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+            rid = int(os.environ["GITHUB_RUN_ID"])
+            attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
+            run = transfer.metadata(f"{transfer.BASE}/actions/runs/{rid}/attempts/{attempt}")
+            revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+            holder = checked_holder(args.mode, args.before, os.environ, event, run, revision)
+            asset_id = admit(args.mode, holder, transfer)
+            print(f"campaign={CAMPAIGN} canonical_run={rid} producer_attempt=1 "
+                  f"current_attempt={attempt} claim_asset={asset_id} mode={args.mode}")
+
+
+        if __name__ == "__main__":
+            try:
+                main()
+            except (OSError, ValueError, KeyError, http.client.HTTPException) as error:
+                sys.exit(str(error))
+        REVIEWED_R28_CONTROL_ADMISSION_PY
+        cat > preflight28/transport/prepare.py <<'REVIEWED_R28_TRANSPORT_PREPARE_PY'
+        """Reuse the byte-pinned, previously successful PR9 environment and owner-Draft helpers."""
+        import hashlib
+        import json
+        import os
+        from pathlib import Path
+        import subprocess
+        import sys
+
+        READ = ("bare-round26-zstd-six-receiver.yml", "8f74cb7a6c871e77fa6e58232b0f3d863124c74652f132d4e024570839de9c7d", "zstd_read")
+        ARCHIVE = ("bare-round26-private-six-receiver.yml", "43ad71f5360db456917546a10c907e55b71296f2f6c886cf90590d9570540b5a", "archive_restore")
+        ROOT = Path(os.environ.get("GITHUB_WORKSPACE", Path.cwd()))
+        TEMP = Path(os.environ["RUNNER_TEMP"])
+        OLD = "bf70ddbf474f3390a62220a076b8c43347fecc64"
+        IDENTITY = "a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc"
+        S2_SHA = "4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf"
+
+
+        def commands(pin):
+            name, want, job = pin
+            data = (ROOT / ".github" / "workflows" / name).read_bytes()
+            if hashlib.sha256(data).hexdigest() != want:
+                raise ValueError("Reviewed environment recipe does not match " + name)
+            try:
+                import yaml
+                payload = yaml.safe_load(data)
+            except ModuleNotFoundError:
+                # Ruby/Psych is part of the hosted Linux image; no package acquisition.
+                result = subprocess.run(["ruby", "-ryaml", "-rjson", "-e",
+                                         "puts JSON.generate(YAML.safe_load(STDIN.read, aliases: true))"],
+                                        input=data, stdout=subprocess.PIPE, check=True)
+                payload = json.loads(result.stdout)
+            return {step["name"]: step.get("run") for step in payload["jobs"][job]["steps"]}
+
+
+        def shell(script, **env):
+            subprocess.run(["bash", "-euo", "pipefail", "-c", script],
+                           env={**os.environ, **env}, check=True)
+
+
+        def once(script, old, new):
+            if script.count(old) != 1:
+                raise ValueError("Original fixed recipe splice failed: " + old[:50])
+            return script.replace(old, new, 1)
+
+
+        def stage_tools():
+            archive = commands(ARCHIVE)
+            for name in ["Prepare checkpoint_parts.py", "Prepare transfer.py"]:
+                shell(archive[name])
+
+
+        def setup(stage):
+            steps = commands(READ)
+            shell(steps["Acquire all six pinned payloads before the cache and source checkout"])
+            shell(steps["Stage the reviewed fixed-index Ubuntu package verifier"])
+            shell(steps["Prepare the reviewed dual-format reader and metadata checks"], SOURCE_REV=OLD)
+            data = json.loads((TEMP / "r28-child.json").read_text()) if stage == "receive" else {}
+            archive = TEMP / ("r28-child.tar.zst" if stage == "receive" else "bare-official/exchange/checkpoint/checkpoint.tar.gz")
+            sha = data["sha256"] if data else S2_SHA
+            revision = data["source_sha"] if data else OLD
+            identity = data["identity"] if data else IDENTITY
+            if stage == "receive" and revision != os.environ["TRIAL_SHA"]:
+                raise ValueError("Successor was produced by a different PR revision")
+            check = TEMP / "bare-zstd-tools/checkpoint.py"
+            env = {**os.environ, "BARE_R26_TAR_CEILING": str(21 * 1024**3)}
+            if stage == "produce" and archive.stat().st_size != 2753879385:
+                raise ValueError("Wrong immutable parent size")
+            subprocess.run(["sha256sum", "--strict", "--check"], check=True,
+                           input=f"{sha}  {archive}\n", text=True)
+            for action, args in [("validate-archive", []), ("verify-continuation", ["--expected-identity", identity, "--ci-revision", revision])]:
+                subprocess.run([sys.executable, "-I", str(check), action, str(archive), "--production", *args], check=True, env=env)
+            script = steps["Verify producer provenance, Ninja reuse and fresh compile progress"]
+            start = script.index("# These exact APK graph objects")
+            script = script[:start] + (ROOT / "preflight28/transport/build-tail.sh").read_text()
+            script = once(script, 'set -- "$RUNNER_TEMP/bare-zstd-trial/checkpoint.tar.zst"', 'set -- "$R28_ARCHIVE"')
+            script = once(script, ' && ! -e $RUNNER_TEMP/bare-official &&', ' &&')
+            script = once(script, "export EXPECTED_IDENTITY=" + IDENTITY, 'export EXPECTED_IDENTITY="$INPUT_IDENTITY"')
+            script = once(script, 'cp "$ci/"*.py "$ci/"*.yml exchange/', '''cp "$ci/"*.py "$ci/"*.yml exchange/
+        install -m 644 "$GITHUB_WORKSPACE/preflight28/graph/graph.py" exchange/graph.py
+        install -m 644 "$GITHUB_WORKSPACE/preflight28/limits/guard.py" exchange/guard.py''')
+            # The 26-minute timeout was for legacy restore-only assertions. The new bounded
+            # graph planner and one edge run inside the per-job guard and a 95-minute cap.
+            i = script.index("zstd -qdc -M128MB")
+            script = script[:i] + once(script[i:], 'zstd -qdc -M128MB -- "$asset" | docker compose exec', '''decode_input() {
+          if [[ $R28_ROLE == produce ]]; then gzip -dc -- "$asset"; else zstd -qdc -M128MB -- "$asset"; fi
+        }
+        decode_input | docker compose exec''')
+            i = script.index("decode_input |")
+            script = script[:i] + once(script[i:], '-e "CI_REVISION=$PRODUCER_REV"', '''-e "CI_REVISION=$INPUT_REVISION" -e TRIAL_SHA -e R28_ROLE -e JOB_STARTED''')
+            script = script[:i] + once(script[i:], 'timeout --kill-after=2m 26m', 'timeout --kill-after=2m 95m')
+            shell(script, R28_ROLE=stage, R28_ARCHIVE=str(archive), INPUT_REVISION=revision,
+                  INPUT_IDENTITY=identity, ZSTD_SHA=sha, BARE_R26_TAR_CEILING=env["BARE_R26_TAR_CEILING"])
+
+
+        if __name__ == "__main__":
+            cmd, = sys.argv[1:]
+            if cmd == "tools":
+                stage_tools()
+            elif cmd in {"produce", "receive"}:
+                setup(cmd)
+            else:
+                raise SystemExit("Unknown stage")
+        REVIEWED_R28_TRANSPORT_PREPARE_PY
+        cat > preflight28/transport/build-tail.sh <<'REVIEWED_R28_TRANSPORT_BUILD_TAIL_SH'
+        # Runs inside the same validated builder as the existing no-op checks.
+        proof=out/Bare/checkpoint-round28-graph.json
+        if [[ $R28_ROLE == produce ]]; then
+          [[ ! -e "$proof" ]]
+          python3 /exchange/guard.py monitor --output out/Bare --jsonl /exchange/checkpoint/resource-events.jsonl \
+            --job-start "$JOB_STARTED" --job-minutes 215 -- \
+            python3 /exchange/graph.py produce --out out/Bare --proof "$proof"
+          python3 /exchange/checkpoint.py verify-reuse-markers "$record" > /exchange/checkpoint/after-advance.json
+          cmp /exchange/checkpoint/production-before.json /exchange/checkpoint/after-advance.json
+          date +%s > /exchange/checkpoint/pack-start.epoch
+          cp out/Bare/checkpoint-provenance.json out/Bare/checkpoint-round28-parent-provenance.json
+          python3 /exchange/checkpoint.py record-provenance out/Bare/checkpoint-provenance.json \
+            --ci-revision "$TRIAL_SHA" --base-image "$BASE_IMAGE"
+          python3 /exchange/checkpoint.py canonicalize-logs --scale
+          python3 /exchange/checkpoint.py record-inputs out/Bare/checkpoint-inputs.jsonl.gz
+        else
+          python3 - <<'PY'
+        import json, os, hashlib
+        from pathlib import Path
+        base = Path("out/Bare")
+        old = json.loads((base/"checkpoint-round28-parent-provenance.json").read_text())
+        new = json.loads((base/"checkpoint-provenance.json").read_text())
+        assert old["identity_sha256"] == "a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc"
+        assert old["identity"]["ci_revision"] == "bf70ddbf474f3390a62220a076b8c43347fecc64"
+        expected = dict(old["identity"], ci_revision=os.environ["TRIAL_SHA"])
+        assert new["identity"] == expected
+        payload = json.dumps(old["identity"], sort_keys=True, separators=(",", ":")).encode()
+        assert hashlib.sha256(payload).hexdigest() == old["identity_sha256"]
+        PY
+          python3 /exchange/graph.py receive --out out/Bare --proof "$proof"
+        fi
+        python3 /exchange/checkpoint.py check-gn-packaging out/Bare
+        cp out/Bare/checkpoint-provenance.json /exchange/checkpoint/child-provenance.json
+        sha256sum "$proof" | cut -d' ' -f1 > /exchange/checkpoint/graph-sha.txt
+        CONTAINER
+        cd "$RUNNER_TEMP/bare-official"
+        if [[ $R28_ROLE == produce ]]; then
+          tail -n 1 exchange/checkpoint/resource-events.jsonl
+          container=chromium-android-builder
+          volume=$(docker inspect "$container" --format '{{range .Mounts}}{{if eq .Destination "/work"}}{{.Name}}{{end}}{{end}}')
+          [[ -n $volume ]]
+          mapfile -t users < <(docker ps --filter "volume=$volume" --format '{{.Names}}')
+          [[ ${#users[@]} == 1 && ${users[0]} == "$container" ]]
+          docker stop --time 20 "$container"
+          [[ $(docker inspect "$container" --format '{{.State.Running}}') == false ]]
+          docker start "$container"
+          docker compose exec -T chromium-builder true
+          start=$(cat exchange/checkpoint/pack-start.epoch)
+          python3 "$GITHUB_WORKSPACE/preflight28/limits/guard.py" space "$RUNNER_TEMP" --bytes $((7 * 1024**3 / 2)) --inodes 2
+          docker compose exec -T chromium-builder bash -euc '
+            cd /work/chromium/src
+            tar --format=posix --pax-option=delete=atime,delete=ctime --exclude=out/Bare/apks \
+              --exclude="*.[aA][pP][kK]" --exclude="*.[aA][pP]_" --exclude="*.[aA][aA][bB]" \
+              --exclude="*.[aA][pP][kK][sS]" -cf - out/Bare
+          ' | zstd -q -T2 -9 -c | python3 "$GITHUB_WORKSPACE/preflight28/transport/stream.py" "$RUNNER_TEMP/r28-child.tar.zst"
+          file="$RUNNER_TEMP/r28-child.tar.zst"
+          python3 "$GITHUB_WORKSPACE/preflight28/limits/guard.py" size checkpoint "$file"
+          identity=$(jq -er .identity_sha256 exchange/checkpoint/child-provenance.json)
+          revision=$(jq -er .identity.ci_revision exchange/checkpoint/child-provenance.json)
+          [[ $revision == "$TRIAL_SHA" ]]
+          python3 -I "$RUNNER_TEMP/bare-zstd-tools/checkpoint.py" validate-archive "$file" --production
+          python3 -I "$RUNNER_TEMP/bare-zstd-tools/checkpoint.py" verify-continuation "$file" --production \
+             --expected-identity "$identity" --ci-revision "$revision"
+          echo "packed_validated_seconds=$(($(date +%s)-start)) bytes=$(stat -c%s "$file") input_identity=$identity"
+          df -B1 -- "$RUNNER_TEMP"
+          df -Pi -- "$RUNNER_TEMP"
+        else
+          [[ $(cat exchange/checkpoint/graph-sha.txt) == "$(jq -er .graph_sha "$RUNNER_TEMP/r28-child.json")" ]]
+        fi
+        # These containers receive no GitHub credentials. Shut them down before a scoped
+        # writer step receives the token for exactly one fixed owner Draft.
+        docker compose stop --timeout 20
+        [[ -z $(docker compose ps --status running -q) ]]
+        REVIEWED_R28_TRANSPORT_BUILD_TAIL_SH
+        cat > preflight28/transport/stream.py <<'REVIEWED_R28_TRANSPORT_STREAM_PY'
+        """Write a compressed stream without allowing a candidate past its physical cap."""
+        import os
+        from pathlib import Path
+        import sys
+
+        def store(reader, destination, cap):
+            count = 0
+            with destination.open("xb") as output:
+                while block := reader.read(1024**2):
+                    count += len(block)
+                    if count > cap:
+                        raise ValueError("Compressed checkpoint exceeds the fixed limit")
+                    output.write(block)
+                if not count:
+                    raise ValueError("Empty checkpoint")
+                output.flush()
+                os.fsync(output.fileno())
+
+        if __name__ == "__main__":
+            store(sys.stdin.buffer, Path(sys.argv[1]), 7 * 1024**3 // 2)
+        REVIEWED_R28_TRANSPORT_STREAM_PY
+        cat > preflight28/transport/exchange.py <<'REVIEWED_R28_TRANSPORT_EXCHANGE_PY'
+        """Send/receive one bounded zstd checkpoint on the existing owner-only draft."""
+        import hashlib
+        import io
+        import json
+        import os
+        from pathlib import Path
+        import re
+        import sys
+        import time
+        from urllib.parse import quote, urlsplit
+
+        TEMP = Path(os.environ["RUNNER_TEMP"])
+        sys.path.insert(0, str(TEMP))
+        import transfer as api  # materialized from the verified prior PR9 workflow
+
+        PARENT = "4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf"
+        PARENT_KEY = "bare-coexist-204-45285202990-1-checkpoint-production-s2"
+        INPUT = "a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc"
+        PART = 2_000_000_000
+        TOTAL = 7 * 1024**3 // 2
+        CAMPAIGN = "r28-preflight-s2-20261125-v1"
+
+
+        def demand(yes, why):
+            if not yes:
+                raise ValueError(why)
+
+
+        def hashed(value):
+            return bool(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value))
+
+
+        def ctx():
+            run = os.environ["GITHUB_RUN_ID"]
+            sha = os.environ["TRIAL_SHA"]
+            demand(re.fullmatch(r"[1-9][0-9]*", run) and re.fullmatch(r"[0-9a-f]{40}", sha), "Invalid generation")
+            return {"campaign": CAMPAIGN, "source_sha": sha, "producer_run": int(run), "producer_attempt": 1,
+                    "segment": 1, "parent_sha": PARENT, "parent_identity": INPUT, "parent_cache_id": 11016400308,
+                    "parent_key": PARENT_KEY, "format": "tar.zst"}
+
+
+        def prefix():
+            return f'{CAMPAIGN}-run{ctx()["producer_run"]}-a1-seg01-'
+
+
+        def source():
+            query = f"?key={PARENT_KEY}&ref=refs%2Fheads%2Fbare-coexist-v2.0.4&per_page=100"
+            resp = api.metadata(f"{api.BASE}/actions/caches" + query)
+            rows = resp["actions_caches"]
+            demand(resp["total_count"] == len(rows), "Incomplete cache response")
+            exact = [r for r in rows if r["key"] == PARENT_KEY]
+            demand(len(exact) == 1 and exact[0]["ref"] == "refs/heads/bare-coexist-v2.0.4"
+                   and exact[0]["id"] == 11016400308 and exact[0]["size_in_bytes"] == 2742685925,
+                   "Canonical parent is missing or changed")
+            print(f'protected_s2_id=11016400308 outer=2742685925 version={exact[0]["version"]}')
+
+
+        def locate(name):
+            assets = [a for a in api.draft(api.RELEASE_ID)["assets"] if a["name"] == name]
+            demand(len(assets) <= 1, "Multiple identically named assets")
+            return assets[0] if assets else None
+
+
+        class Section:
+            def __init__(self, file, count):
+                self.file = file
+                self.left = count
+
+            def read(self, requested=-1):
+                if requested <= 0:
+                    requested = 1024**2
+                block = self.file.read(min(self.left, requested))
+                self.left -= len(block)
+                return block
+
+
+        def upload(suffix, stream, offset, size, digest):
+            name = prefix() + suffix
+            logical = name
+            # Retry only a known empty starter under a second physical name.
+            # An ambiguous response is reconciled by ID/name/hash before another POST.
+            for index in range(2):
+                name = logical if index == 0 else logical + "-retry1"
+                row = locate(name)
+                if row is None:
+                    stream.seek(offset)
+                    try:
+                        conn, response = api.request(api.UPLOAD, "POST",
+                            f"{api.BASE}/releases/{api.RELEASE_ID}/assets?name=" + quote(name),
+                            auth=True, body=Section(stream, size), length=size, content_type="application/octet-stream")
+                        try:
+                            status = response.status
+                            response.read(65536)
+                        finally:
+                            conn.close()
+                        demand(status in (201, 422, 502), f"Asset upload status {status}")
+                    except (OSError, api.http.client.HTTPException):
+                        pass
+                    for delay in (0, 2, 5):
+                        if delay:
+                            time.sleep(delay)
+                        row = locate(name)
+                        if row:
+                            break
+                    demand(row is not None, "Upload outcome unknown; keep original candidate and reconcile")
+                if row["state"] == "starter" and row["size"] == 0:
+                    continue
+                checked = api.asset_info(api.draft(api.RELEASE_ID), name, size, digest, row["id"])
+                print(f"asset={checked['id']} bytes={size} sha256={digest}", flush=True)
+                return {"name": name, "id": checked["id"], "bytes": size, "sha256": digest}
+            raise ValueError("Both upload attempts have an empty starter")
+
+
+        def send():
+            source()
+            demand(os.environ["GITHUB_RUN_ATTEMPT"] == "1", "Only initial attempt may publish")
+            file = TEMP / "r28-child.tar.zst"
+            size = file.stat().st_size
+            demand(0 < size <= TOTAL, "Total compressed size limit")
+            base = TEMP / "bare-official/exchange/checkpoint"
+            identity = json.loads((base / "child-provenance.json").read_text())["identity_sha256"]
+            graph = (base / "graph-sha.txt").read_text().strip()
+            demand(hashed(identity) and identity != INPUT and hashed(graph), "Incomplete graph/producer receipt")
+            manifest = {**ctx(), "bytes": size, "identity": identity, "graph_sha": graph, "parts": []}
+            with file.open("rb") as f:
+                full = hashlib.sha256()
+                for index, offset in enumerate(range(0, size, PART)):
+                    length = min(size-offset, PART)
+                    digest = hashlib.sha256()
+                    f.seek(offset)
+                    region = Section(f, length)
+                    while block := region.read():
+                        full.update(block)
+                        digest.update(block)
+                    demand(region.left == 0, "Short local candidate")
+                    manifest["parts"].append(upload(f"p{index:02}", f, offset, length, digest.hexdigest()))
+                manifest["sha256"] = full.hexdigest()
+            raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+            receipt = upload("manifest.json", io.BytesIO(raw), 0, len(raw), hashlib.sha256(raw).hexdigest())
+            print("manifest_receipt=" + json.dumps(receipt, sort_keys=True))
+            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                print("manifest_id=" + str(receipt["id"]), file=f)
+                print("manifest_sha=" + receipt["sha256"], file=f)
+
+
+        def anonymous(row):
+            url = urlsplit(row["browser_download_url"])
+            demand(url.scheme == "https" and url.netloc == "github.com" and not url.query and not url.fragment
+                   and url.path.startswith("/" + api.REPO + "/releases/download/"), "Unexpected download URL")
+            paths = [("github.com", url.path, "direct"),
+                     (api.API, f"{api.BASE}/releases/assets/{row['id']}", "api")]
+            for host, path, label in paths:
+                for i in range(4):
+                    until = api.anonymous_status(host, path, label)
+                    if until is None:
+                        break
+                    delay = max(0, until-int(time.time()))
+                    demand(i < 3 and delay <= 3900, "Anonymous access still unconfirmed")
+                    time.sleep(delay)
+
+
+        def receive():
+            source()
+            found = [row for suffix in ("manifest.json", "manifest.json-retry1")
+                     if (row := locate(prefix() + suffix)) and row["state"] == "uploaded"]
+            demand(len(found) == 1, "Canonical completed manifest missing or ambiguous")
+            row = found[0]
+            expected_id = os.environ.get("MANIFEST_ID")
+            expected_hash = os.environ.get("MANIFEST_SHA")
+            demand(not expected_id or str(row["id"]) == expected_id, "Manifest ID differs from job output")
+            digest = row["digest"].removeprefix("sha256:")
+            demand(0 < row["size"] <= 12288 and hashed(digest) and (not expected_hash or digest == expected_hash),
+                   "Manifest digest differs")
+            anonymous(row)
+            raw = io.BytesIO()
+            api.download(row["id"], row["size"], digest, raw)
+            manifest = json.loads(raw.getvalue())
+            demand(all(manifest.get(k) == v for k, v in ctx().items()), "Run, input, segment or source mismatch")
+            size = manifest["bytes"]
+            demand(type(size) == int and 0 < size <= TOTAL and hashed(manifest["sha256"]) and
+                   hashed(manifest["identity"]) and manifest["identity"] != INPUT and hashed(manifest["graph_sha"]),
+                   "Unbounded or unbound successor")
+            parts = manifest["parts"]
+            demand(isinstance(parts, list) and len(parts) == (size+PART-1)//PART and
+                   len(set(p["id"] for p in parts)) == len(parts), "Parts are incomplete or repeated")
+            destination = TEMP / "r28-child.tar.zst"
+            with destination.open("xb") as f:
+                for index, part in enumerate(parts):
+                    wanted = prefix() + f"p{index:02}"
+                    demand(part["name"] in (wanted, wanted + "-retry1") and
+                           part["bytes"] == min(PART, size-index*PART) and hashed(part["sha256"]), "Invalid part")
+                    row = api.asset_info(api.draft(api.RELEASE_ID), part["name"], part["bytes"], part["sha256"], part["id"])
+                    anonymous(row)
+                    api.download(part["id"], part["bytes"], part["sha256"], f)
+                f.flush()
+                os.fsync(f.fileno())
+            demand(destination.stat().st_size == size and api.sha256_file(destination) == manifest["sha256"], "Reassembled content differs")
+            (TEMP / "r28-child.json").write_bytes(raw.getvalue())
+            print(f"independent_draft_read_id={found[0]['id']} archive_bytes={size} sha256={manifest['sha256']}")
+
+
+        if __name__ == "__main__":
+            mode, = sys.argv[1:]
+            {"parent": source, "send": send, "receive": receive}[mode]()
+        REVIEWED_R28_TRANSPORT_EXCHANGE_PY
+        python3 preflight28/transport/prepare.py tools
+    - name: Check canonical generation and reserve the single producer
+      env: &id001
+        GH_TOKEN: ${{ github.token }}
+      timeout-minutes: 3
+      run: python3 preflight28/control/admission.py compute --before "$EXPECTED_BEFORE" --helper-dir "$RUNNER_TEMP"
+    - &id005
+      name: Read the actual service job start and preflight source receipt
+      env:
+        GH_TOKEN: ${{ github.token }}
+        JOB_READ_TOKEN: ${{ github.token }}
+        CHECK_RUN: ${{ job.check_run_id }}
+      timeout-minutes: 3
+      run: |
+        set -euo pipefail
+        if [[ ! $CHECK_RUN =~ ^[1-9][0-9]*$ ]]; then
+          case "$GITHUB_JOB" in
+            produce) name='Create one S2 successor and transfer to fixed private Draft';;
+            receive) name='Recover and verify required edge on an independent runner';;
+            *) exit 1;;
+          esac
+          CHECK_RUN=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" |
+            jq -er --arg name "$name" '[.jobs[]|select(.name==$name and .status=="in_progress")|.check_run_url|split("/")|last]|select(length==1)|first')
+        fi
+        epoch=$(python3 preflight28/limits/guard.py job-clock --check-run "$CHECK_RUN")
+        echo "JOB_STARTED=$epoch" >> "$GITHUB_ENV"
+        python3 preflight28/transport/exchange.py parent
+    - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+      name: Restore the exact S2 parent at its original path
+      id: parent
+      timeout-minutes: 15
+      with:
+        path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+        key: bare-coexist-204-45285202990-1-checkpoint-production-s2
+        fail-on-cache-miss: true
+    - name: Validate parent and advance one required APK edge, then pack bounded zstd
+      timeout-minutes: 195
+      env:
+        MATCH: ${{ steps.parent.outputs.cache-matched-key }}
+        HIT: ${{ steps.parent.outputs.cache-hit }}
+      run: |
+        set -euo pipefail
+        [[ $HIT == true && $MATCH == 'bare-coexist-204-45285202990-1-checkpoint-production-s2' ]]
+        python3 preflight28/transport/prepare.py produce
+    - name: Send only the verified generation to the existing owner Draft
+      id: send
+      timeout-minutes: 6
+      env: *id001
+      run: python3 preflight28/transport/exchange.py send
+    - name: Record retained parent and receiver manifest
+      timeout-minutes: 2
+      env: *id001
+      run: python3 preflight28/transport/exchange.py parent
+  receive:
+    runs-on: ubuntu-24.04
+    permissions: *id002
+    timeout-minutes: 215
+    name: Recover and verify required edge on an independent runner
+    needs: produce
+    cache-mode: none
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number ==
+      9 && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.repository.fork == false && github.repository ==
+      'Areal-U/bare-runner-disk-probe' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name
+      == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha
+      == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == 'f898d58615cd688ebcf026474c7aedc37a343d7a' && (needs.produce.result
+      == 'success' || github.run_attempt != '1') }}
+    steps:
+    - *id003
+    - *id004
+    - name: Check canonical generation and verify its existing claim
+      env: *id001
+      timeout-minutes: 3
+      run: python3 preflight28/control/admission.py recover --before "$EXPECTED_BEFORE" --helper-dir "$RUNNER_TEMP"
+    - *id005
+    - name: Read and authenticate the exact private manifest and successor bytes
+      timeout-minutes: 85
+      env:
+        GH_TOKEN: ${{ github.token }}
+        MANIFEST_ID: ${{ needs.produce.outputs.manifest_id }}
+        MANIFEST_SHA: ${{ needs.produce.outputs.manifest_sha }}
+      run: |
+        set -euo pipefail
+        python3 preflight28/limits/guard.py space "$RUNNER_TEMP" --bytes 3758096384 --inodes 2
+        python3 preflight28/transport/exchange.py receive
+    - name: Rebuild fixed environment and prove full restored APK frontier without new compilation
+      timeout-minutes: 195
+      run: python3 preflight28/transport/prepare.py receive
+    - name: Verify source cache remains intact after read-only acquisition
+      timeout-minutes: 2
+      env: *id001
+      run: python3 preflight28/transport/exchange.py parent
