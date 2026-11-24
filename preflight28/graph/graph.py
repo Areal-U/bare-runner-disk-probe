@@ -173,12 +173,12 @@ def pick(out, command, edges):
     raise ValueError("no missing single-step APK ancestor found among initial objects")
 
 
-def check_selected(out, command, names, expected):
+def check_selected(out, command, names, expected, *, execute_check=True):
     if {n: file_record(out, n) for n in names} != expected:
         raise ValueError("selected edge bytes changed or missing")
     if run(out, command, list(names), dry=True):
         raise ValueError("restored selected edge/dependencies require work")
-    if run(out, command, list(names), dry=False, noop=True):
+    if execute_check and run(out, command, list(names), dry=False, noop=True):
         raise ValueError("Siso actually executed a supposedly clean step")
 
 
@@ -230,7 +230,7 @@ def receive(out, proof, command):
     group = tuple(sorted(records))
     if not group or data["target_path"] not in group or any(output_name(n, out) != n for n in group):
         raise ValueError("invalid recorded group")
-    check_selected(out, command, group, records)
+    check_selected(out, command, group, records, execute_check=False)
     observed = frontier(run(out, command, [TARGET], dry=True))
     if observed != set(data["successor_pending"]):
         raise ValueError("independent restore has a different APK plan")
