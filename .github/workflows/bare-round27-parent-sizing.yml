@@ -1,0 +1,228 @@
+name: Measure round 27 parent sizes
+run-name: Round 28 preparation — measure round 27 parent sizes
+'on':
+  pull_request:
+    types:
+    - synchronize
+    branches:
+    - bare-coexist-v2.0.4
+    paths:
+    - .github/workflows/bare-round27-parent-sizing.yml
+concurrency:
+  group: round27-parent-sizing-pr9
+  cancel-in-progress: false
+permissions: {}
+cache-mode: none
+defaults:
+  run:
+    shell: bash
+jobs:
+  sizing:
+    name: Measure full parent and forward delta on a standard runner
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == '98f86e5ce9fbb449b6f34da47509a72ca4e00363'
+      && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor
+      == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name ==
+      github.repository && github.event.pull_request.base.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref
+      == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 105
+    cache-mode: read
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CI_REV: bf70ddbf474f3390a62220a076b8c43347fecc64
+      SOURCE_KEY: bare-coexist-204-45285202990-1-checkpoint-production-s2
+      BASIS_KEY: bare-coexist-204-45285202990-1-checkpoint-production
+      SOURCE_SHA: 4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf
+      BASIS_SHA: 90ee797279cf6928b57afca883be19c10486a6c7ba46d8c0cb4db6489bc6f512
+      IDENTITY: a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc
+    steps:
+    - name: Prepare the fixed verifier and streaming measurement helper
+      timeout-minutes: 5
+      run: |
+        set -euo pipefail
+        umask 077
+        [[ $RUNNER_ENVIRONMENT == github-hosted && $RUNNER_ARCH == X64 ]]
+        root="$RUNNER_TEMP/parent-sizing"
+        mkdir -m 700 -- "$root"
+        cd "$root"
+        curl --proto '=https' -fsSL --retry 2 --max-time 60 \
+          "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$CI_REV/checkpoint.py" -o checkpoint.py
+        echo '20ca6c2f1ac6862e730ec06575e3cd009673e34a833610b1b7bc9c10fca4683d  checkpoint.py' | sha256sum --strict --check
+        cat > stats.py <<'STATS'
+        import argparse
+        import hashlib
+        import sys
+        from pathlib import Path
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("output", type=Path)
+        parser.add_argument("--copy", action="store_true")
+        args = parser.parse_args()
+        digest = hashlib.sha256()
+        size = 0
+        for block in iter(lambda: sys.stdin.buffer.read(1024 * 1024), b""):
+            digest.update(block)
+            size += len(block)
+            if args.copy:
+                sys.stdout.buffer.write(block)
+        if args.copy:
+            sys.stdout.buffer.flush()
+        if size <= 0:
+            raise ValueError("Empty stream")
+        args.output.write_text(f"{size} {digest.hexdigest()}\n")
+        STATS
+        gzip --version | head -n 1
+        zstd --version
+        df -B1 -- "$root"
+    - name: Verify the fixed S2 cache receipt
+      timeout-minutes: 3
+      env:
+        GH_TOKEN: ${{ github.token }}
+        KEY: bare-coexist-204-45285202990-1-checkpoint-production-s2
+        CACHE_ID: '11016400308'
+        OUTER_BYTES: '2742685925'
+      run: |-
+        set -euo pipefail
+        gh api --method GET "repos/$GITHUB_REPOSITORY/actions/caches" -f key="$KEY" -F per_page=100 \
+        | jq -e --arg key "$KEY" --arg ref refs/heads/bare-coexist-v2.0.4 \
+          --argjson id "$CACHE_ID" --argjson n "$OUTER_BYTES" '
+          .total_count == (.actions_caches | length) and
+          ([.actions_caches[] | select(.key == $key) | [.id, .ref, .size_in_bytes]] == [[$id, $ref, $n]])'
+        echo "Verified $KEY cache ID $CACHE_ID and $OUTER_BYTES stored bytes."
+    - name: Read the exact s2 cache
+      id: s2
+      timeout-minutes: 15
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+      with:
+        path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+        key: bare-coexist-204-45285202990-1-checkpoint-production-s2
+        fail-on-cache-miss: true
+    - name: Verify both tar streams and measure the full S2 level-9 envelope
+      timeout-minutes: 35
+      env:
+        HIT: ${{ steps.s2.outputs.cache-hit }}
+        MATCHED: ${{ steps.s2.outputs.cache-matched-key }}
+      run: |
+        set -euo pipefail
+        umask 077
+        cd "$RUNNER_TEMP/parent-sizing"
+        slot="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
+        [[ $HIT == true && $MATCHED == "$SOURCE_KEY" && -f $slot && ! -L $slot ]]
+        [[ $(stat -c %s -- "$slot") == 2753879385 && ! -e target.gz ]]
+        mv -T -- "$slot" target.gz
+        start=$SECONDS
+        echo "$SOURCE_SHA  target.gz" | sha256sum --strict --check
+        python3 -I checkpoint.py validate-archive target.gz --production
+        python3 -I checkpoint.py verify-continuation target.gz --production --expected-identity "$IDENTITY" --ci-revision "$CI_REV"
+        gzip -dc -- target.gz | python3 -I stats.py target.tar.receipt
+        input_s=$((SECONDS-start))
+        df -B1 -- .
+        start=$SECONDS
+        gzip -dc -- target.gz | zstd -q -T2 -9 -c > checkpoint.tar.zst
+        encode_s=$((SECONDS-start))
+        start=$SECONDS
+        zstd -qdc -M128MB -- checkpoint.tar.zst | python3 -I stats.py decoded.tar.receipt
+        cmp target.tar.receipt decoded.tar.receipt
+        read -r raw_n raw_sha < target.tar.receipt
+        zstd_sha=$(sha256sum -- checkpoint.tar.zst | cut -d' ' -f1)
+        zstd_n=$(stat -c %s -- checkpoint.tar.zst)
+        verify_s=$((SECONDS-start))
+        start=$SECONDS
+        outer=$(printf '%s\n' "$PWD/checkpoint.tar.zst" | tar --posix -cf - --exclude cache.tzst -P \
+          -C "$GITHUB_WORKSPACE" --files-from - --use-compress-program zstdmt | wc -c)
+        wrap_s=$((SECONDS-start))
+        (( outer > 0 && zstd_n > 0 ))
+        free=$(df -B1 --output=avail . | tail -1 | tr -d ' ')
+        printf 'R27_S2_FULL source_bytes=2753879385 source_sha=%s source_cache_bytes=2742685925 input_identity=%s tar_bytes=%s tar_sha=%s zstd_bytes=%s zstd_sha=%s measured_local_cache_envelope_bytes=%s source_verify_seconds=%s zstd_encode_seconds=%s zstd_verify_seconds=%s wrap_seconds=%s runner_free_bytes=%s\n' \
+          "$SOURCE_SHA" "$IDENTITY" "$raw_n" "$raw_sha" "$zstd_n" "$zstd_sha" "$outer" "$input_s" "$encode_s" "$verify_s" "$wrap_s" "$free" | tee -a "$GITHUB_STEP_SUMMARY"
+        rm -- checkpoint.tar.zst
+    - name: Verify the fixed S1 cache receipt
+      timeout-minutes: 3
+      env:
+        GH_TOKEN: ${{ github.token }}
+        KEY: bare-coexist-204-45285202990-1-checkpoint-production
+        CACHE_ID: '11008758795'
+        OUTER_BYTES: '2440554209'
+      run: |-
+        set -euo pipefail
+        gh api --method GET "repos/$GITHUB_REPOSITORY/actions/caches" -f key="$KEY" -F per_page=100 \
+        | jq -e --arg key "$KEY" --arg ref refs/heads/bare-coexist-v2.0.4 \
+          --argjson id "$CACHE_ID" --argjson n "$OUTER_BYTES" '
+          .total_count == (.actions_caches | length) and
+          ([.actions_caches[] | select(.key == $key) | [.id, .ref, .size_in_bytes]] == [[$id, $ref, $n]])'
+        echo "Verified $KEY cache ID $CACHE_ID and $OUTER_BYTES stored bytes."
+    - name: Read the exact s1 cache
+      id: s1
+      timeout-minutes: 15
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+      with:
+        path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+        key: bare-coexist-204-45285202990-1-checkpoint-production
+        fail-on-cache-miss: true
+    - name: Measure and reconstruct the forward S1 to S2 delta
+      timeout-minutes: 30
+      env:
+        HIT: ${{ steps.s1.outputs.cache-hit }}
+        MATCHED: ${{ steps.s1.outputs.cache-matched-key }}
+      run: |
+        set -euo pipefail
+        umask 077
+        cd "$RUNNER_TEMP/parent-sizing"
+        slot="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
+        [[ $HIT == true && $MATCHED == "$BASIS_KEY" && -f $slot && ! -L $slot ]]
+        [[ $(stat -c %s -- "$slot") == 2450677209 ]]
+        echo "$BASIS_SHA  $slot" | sha256sum --strict --check
+        python3 -I checkpoint.py verify-continuation "$slot" --production --expected-identity "$IDENTITY" --ci-revision "$CI_REV"
+        if ! command -v rdiff >/dev/null; then
+          sudo -n apt-get -o Acquire::Retries=2 -qq update
+          sudo -n apt-get -o Acquire::Retries=2 install -y --no-install-recommends rdiff
+        fi
+        dpkg-query -W rdiff
+        start=$SECONDS
+        gzip -dc -- "$slot" | python3 -I stats.py basis.tar.receipt --copy | rdiff --block-size=4096 -- signature - signature
+        signature_s=$((SECONDS-start))
+        start=$SECONDS
+        gzip -dc -- target.gz | rdiff -- delta signature | zstd -q -T2 -3 -c > forward.rdiff.zst
+        make_s=$((SECONDS-start))
+        delta_sha=$(sha256sum forward.rdiff.zst | cut -d' ' -f1)
+        delta_n=$(stat -c %s -- forward.rdiff.zst)
+        raw_delta_n=$(zstd -qdc -- forward.rdiff.zst | wc -c)
+        start=$SECONDS
+        printf '%s\n' "$PWD/forward.rdiff.zst" | tar --posix -cf envelope.tzst --exclude cache.tzst -P \
+          -C "$GITHUB_WORKSPACE" --files-from - --use-compress-program zstdmt
+        outer=$(stat -c %s -- envelope.tzst)
+        wrap_s=$((SECONDS-start))
+        rm -- forward.rdiff.zst
+        read -r basis_n basis_sha < basis.tar.receipt
+        free=$(df -B1 --output=avail . | tail -1 | tr -d ' ')
+        printf 'R27_FORWARD_ENCODING basis_bytes=%s basis_sha=%s delta_raw_bytes=%s delta_zstd_bytes=%s delta_sha=%s measured_local_cache_envelope_bytes=%s runner_free_bytes=%s\n' \
+          "$basis_n" "$basis_sha" "$raw_delta_n" "$delta_n" "$delta_sha" "$outer" "$free"
+        # Both original gzip files exist in Actions independently. Free only the local
+        # restored target after hashing it, before materializing the seekable patch basis.
+        echo "$SOURCE_SHA  target.gz" | sha256sum --strict --check
+        rm -- target.gz
+        free=$(df -B1 --output=avail . | tail -1 | tr -d ' ')
+        if (( free < basis_n + 32 * 1024 * 1024 )); then
+          echo "Independent delta apply has insufficient local free space: need $basis_n B, available $free B." >&2
+          exit 1
+        fi
+        start=$SECONDS
+        gzip -dc -- "$slot" > basis.tar
+        [[ $(stat -c %s basis.tar) == "$basis_n" ]]
+        echo "$basis_sha  basis.tar" | sha256sum --strict --check
+        expand_s=$((SECONDS-start))
+        start=$SECONDS
+        tar -xOf envelope.tzst -P --use-compress-program zstdmt \
+          | python3 -I stats.py received.delta.receipt --copy | zstd -qdc \
+          | rdiff -- patch basis.tar | python3 -I stats.py rebuilt.tar.receipt --copy \
+          | gzip -n -1 -c | python3 -I stats.py rebuilt.gzip.receipt
+        cmp target.tar.receipt rebuilt.tar.receipt
+        [[ $(cat received.delta.receipt) == "$delta_n $delta_sha" ]]
+        [[ $(cat rebuilt.gzip.receipt) == "2753879385 $SOURCE_SHA" ]]
+        apply_s=$((SECONDS-start))
+        read -r raw_n raw_sha < rebuilt.tar.receipt
+        printf 'R27_FORWARD_VERIFIED basis_cache_id=11008758795 basis_gzip_sha=%s target_cache_id=11016400308 target_gzip_sha=%s verified_raw_bytes=%s verified_raw_sha=%s delta_zstd_bytes=%s delta_sha=%s measured_local_cache_envelope_bytes=%s signature_seconds=%s delta_encode_seconds=%s wrap_seconds=%s expand_basis_seconds=%s unwrap_apply_recompress_verify_seconds=%s\n' \
+          "$BASIS_SHA" "$SOURCE_SHA" "$raw_n" "$raw_sha" "$delta_n" "$delta_sha" "$outer" "$signature_s" "$make_s" "$wrap_s" "$expand_s" "$apply_s" | tee -a "$GITHUB_STEP_SUMMARY"
+        df -B1 -- .
