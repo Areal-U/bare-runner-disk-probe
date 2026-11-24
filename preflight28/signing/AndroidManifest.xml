@@ -1,0 +1,1 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.barebrowser.r28preflight.testonly" android:versionCode="1" android:versionName="1.0-preflight"><uses-sdk android:minSdkVersion="24" android:targetSdkVersion="35"/><application android:label="R28 preflight TEST ONLY" android:hasCode="false"/></manifest>
