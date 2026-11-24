@@ -1,0 +1,247 @@
+name: Check six fixed Ubuntu binaries
+run-name: Round 28 preparation — six Ubuntu packages only
+'on':
+  pull_request:
+    types:
+    - synchronize
+    branches:
+    - bare-coexist-v2.0.4
+    paths:
+    - .github/workflows/bare-six-ubuntu-package-probe.yml
+permissions: {}
+cache-mode: none
+concurrency:
+  group: bare-six-ubuntu-package-probe-pr9
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+jobs:
+  read_six:
+    name: Verify six public Ubuntu binaries against signed snapshot indexes
+    runs-on: ubuntu-24.04
+    permissions: {}
+    cache-mode: none
+    timeout-minutes: 20
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 9 && github.event.before == 'bd972e25992eea4b7e2e9db07794b7339b6dbd97'
+      && github.event.repository.private == false && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe' && github.actor
+      == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.pull_request.user.login == 'Areal-U' && github.event.pull_request.head.repo.full_name ==
+      github.repository && github.event.pull_request.base.repo.full_name == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref
+      == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64'
+    steps:
+    - name: Check Ubuntu signatures and the six binary payloads
+      run: |
+        python3 -I - <<'SIX_UBUNTU_PACKAGES'
+        """Read only six known Ubuntu binaries, validating against the signed November 12 snapshot."""
+        from concurrent.futures import ThreadPoolExecutor
+        import email.parser
+        import hashlib
+        import http.client
+        import json
+        import lzma
+        from pathlib import Path
+        import re
+        import subprocess
+        from tempfile import TemporaryDirectory
+        from urllib.parse import urlencode, quote, unquote, urljoin, urlsplit
+
+        SNAP = "https://snapshot.ubuntu.com/ubuntu/20261112T093000Z/"
+        API = "https://api.launchpad.net/devel/ubuntu/+archive/primary"
+        F = {
+            "pool/main/g/glibc/libc6-i386_2.35-0ubuntu3.15_amd64.deb": ("libc6-i386","2.35-0ubuntu3.15","amd64"),
+            "pool/main/g/glibc/libc6_2.35-0ubuntu3.15_i386.deb": ("libc6","2.35-0ubuntu3.15","i386"),
+            "pool/main/l/linux/linux-libc-dev_5.15.0-203.213_i386.deb": ("linux-libc-dev","5.15.0-203.213","i386"),
+            "pool/main/libc/libcpanel-json-xs-perl/libcpanel-json-xs-perl_4.27-1ubuntu0.2_amd64.deb": ("libcpanel-json-xs-perl","4.27-1ubuntu0.2","amd64"),
+            "pool/main/r/ruby3.0/libruby3.0_3.0.2-7ubuntu2.13_amd64.deb": ("libruby3.0","3.0.2-7ubuntu2.13","amd64"),
+            "pool/main/r/ruby3.0/ruby3.0_3.0.2-7ubuntu2.13_amd64.deb": ("ruby3.0","3.0.2-7ubuntu2.13","amd64"),
+        }
+        DENIED_PATH = "pool/main/l/linux/linux-libc-dev_5.15.0-203.213_i386.deb"
+
+        def url_ok(url, kind, filename=None):
+            parsed = urlsplit(url)
+            if (parsed.scheme != "https" or parsed.username or parsed.password or parsed.port or parsed.fragment
+                    or parsed.hostname != parsed.netloc or ".." in unquote(parsed.path).split("/")):
+                return False
+            host, path = parsed.hostname, unquote(parsed.path)
+            if kind == "index":
+                return host == "snapshot.ubuntu.com" and url.startswith(SNAP+"dists/") and not parsed.query
+            if kind == "meta":
+                return host=="api.launchpad.net" and (path=="/devel/ubuntu/+archive/primary" or re.fullmatch(r"/devel/ubuntu/\+archive/primary/\+binarypub/[0-9]+",path))
+            if filename is None or path.rsplit("/",1)[-1]!=filename or parsed.query:
+                return False
+            if kind=="original":
+                return host=="snapshot.ubuntu.com" and url.startswith(SNAP+"pool/") and url != SNAP+DENIED_PATH
+            if host in {"launchpad.net","api.launchpad.net"}:
+                return ("/+files/" in path and (path.startswith("/ubuntu/") or path.startswith("/devel/ubuntu/")))
+            return host=="launchpadlibrarian.net" and re.fullmatch(r"/[0-9]+/[^/]+",path) is not None
+
+        def get(url, kind, limit, filename=None):
+            for i in range(5):
+                if not url_ok(url,kind,filename):
+                    raise ValueError("Unrecognized URL scope for "+kind)
+                p=urlsplit(url)
+                conn=http.client.HTTPSConnection(p.hostname,timeout=40)
+                try:
+                    conn.request("GET",p.path+("?"+p.query if p.query else ""),headers={"User-Agent":"Bare-checkpoint-official-package-probe/1.0"})
+                    response=conn.getresponse()
+                    if 300 <= response.status < 400:
+                        location=response.getheader("Location")
+                        if kind!="binary" or not location:
+                            return response.status,b"",p.hostname
+                        url=urljoin(url,location)
+                        continue
+                    if response.status != 200:
+                        return response.status,b"",p.hostname
+                    body=response.read(limit+1)
+                    if len(body)>limit:
+                        raise ValueError("Bound exceeded for "+kind)
+                    return 200,body,p.hostname
+                finally:
+                    conn.close()
+            raise ValueError("Excess redirects for "+kind)
+
+        def signed_records(root):
+            records={}
+            for pocket in ("jammy-updates","jammy-security","jammy","jammy-backports"):
+                url=SNAP+"dists/"+pocket+"/"
+                status,data,_=get(url+"InRelease","index",5_000_000)
+                if status!=200:
+                    raise ValueError(f"Fixed InRelease {pocket} HTTP {status}")
+                signed=root/(pocket+".InRelease"); clear=root/(pocket+".Release")
+                signed.write_bytes(data)
+                subprocess.run(["gpgv","--keyring","/usr/share/keyrings/ubuntu-archive-keyring.gpg","--output",str(clear),str(signed)],check=True,stdout=subprocess.DEVNULL)
+                release=email.parser.Parser().parsestr(clear.read_text())
+                if release["Codename"]!="jammy" or release["Suite"]!=pocket:
+                    raise ValueError("Wrong signed distribution")
+                entries={name:(sha,int(sz)) for sha,sz,name in (line.split() for line in release["SHA256"].splitlines() if line.strip())}
+                for arch in ("amd64","i386"):
+                    name=f"main/binary-{arch}/Packages.xz"
+                    sha,size=entries[name]
+                    if not 0<size<30_000_000:
+                        raise ValueError("Unexpected Packages size")
+                    status,packed,_=get(url+name,"index",size)
+                    if status!=200 or len(packed)!=size or hashlib.sha256(packed).hexdigest()!=sha:
+                        raise ValueError(f"Fixed Packages failed {pocket}/{arch} HTTP {status}")
+                    # All information entering this parser is already bound to a trusted InRelease.
+                    text=lzma.decompress(packed,memlimit=128*1024**2).decode()
+                    for st in text.split("\n\n"):
+                        found=re.search(r"^Filename: (\S+)$",st,re.M)
+                        if not found or found[1] not in F:
+                            continue
+                        rec=email.parser.Parser().parsestr(st); path=found[1]
+                        if tuple(rec[k] for k in ("Package","Version","Architecture"))!=F[path]:
+                            raise ValueError("Conflicting package metadata for "+path)
+                        item=(int(rec["Size"]),rec["SHA256"])
+                        if not 0<item[0]<=25_000_000 or not re.fullmatch(r"[0-9a-f]{64}",item[1]) or path in records and item!=records[path]:
+                            raise ValueError("Conflicting signed content receipt")
+                        if path not in records:
+                            print(json.dumps({"signed_index_receipt":path,"package":F[path][0],"version":F[path][1],"arch":F[path][2],
+                                              "bytes":item[0],"sha256":item[1],"inrelease_url":url+"InRelease",
+                                              "inrelease_sha256":hashlib.sha256(data).hexdigest(),"index_url":url+name,"index_sha256":sha},sort_keys=True),flush=True)
+                        records[path]=item
+                if records.keys()==F.keys():
+                    break
+            if records.keys()!=F.keys():
+                raise ValueError("Fixed signed records missing: "+str(sorted(F.keys()-records.keys())))
+            return records
+
+        def launchpad_urls(path, record):
+            name,version,arch=F[path]
+            arch_ref="https://api.launchpad.net/devel/ubuntu/jammy/"+arch
+            params={"ws.op":"getPublishedBinaries","binary_name":name,"version":version,
+                    "distro_arch_series":arch_ref,"exact_match":"true","ws.size":"50"}
+            st,b,_=get(API+"?"+urlencode(params),"meta",2_000_000)
+            if st in (401,403): raise PermissionError(f"Launchpad publication metadata HTTP {st}")
+            if st!=200:
+                return [],[f"Launchpad publication lookup HTTP {st}"]
+            page=json.loads(b);seen=set();notes=[]; urls=[]
+            if page.get("next_collection_link"):
+                raise ValueError("Unexpected number of exact matching publication records")
+            for row in page["entries"]:
+                if (row["archive_link"],row["binary_package_name"],row["binary_package_version"],row["distro_arch_series_link"])!=(API,name,version,arch_ref):
+                    raise ValueError("Unexpected Launchpad publication identity")
+                link=row["self_link"]
+                if not url_ok(link,"meta") or link==API:
+                    raise ValueError("Unexpected Launchpad publication link")
+                pub_id=link.rsplit("/",1)[-1]
+                st,b,_=get(API+"?"+urlencode({"ws.op":"getBinaryPackageDetails","binary_id":pub_id}),"meta",500_000)
+                advertised=[]
+                if st in (401,403): raise PermissionError(f"Launchpad package details HTTP {st}")
+                if st==200:
+                    detail=json.loads(b)
+                    if (str(detail["id"]),detail["binary_package_name"],detail["binary_package_version"])!=(pub_id,name,version):
+                        raise ValueError("Conflicting Launchpad publication detail")
+                    advertised.extend(f["url"] for f in detail["files"] if f.get("filename")==Path(path).name and f.get("size")==record[0])
+                else:
+                    notes.append(f"public package details HTTP {st}")
+                if not advertised:
+                    st,b,_=get(link+"?ws.op=binaryFileUrls","meta",200_000)
+                    if st in (401,403): raise PermissionError(f"Launchpad file metadata HTTP {st}")
+                    if st==200:
+                        advertised=json.loads(b)
+                    else:
+                        notes.append(f"public file metadata HTTP {st}")
+                for u in advertised:
+                    if isinstance(u,str) and url_ok(u,"binary",Path(path).name) and u not in seen:
+                        urls.append(u);seen.add(u)
+            notes.append(f"publication records={len(page['entries'])}, advertised file links={len(urls)}")
+            return urls,notes
+
+        def resolve(path, record, root):
+            filename=Path(path).name
+            denied_launchpad=False
+            try:
+                urls,notes=launchpad_urls(path,record)
+            except PermissionError as exc:
+                denied_launchpad=True
+                urls,notes=[],[str(exc)]
+            except (OSError,ValueError,KeyError,TypeError,AttributeError,http.client.HTTPException) as exc:
+                # Optional metadata cannot prevent the independent public filename lookup.
+                # No unvalidated URL from that failed metadata response will be requested.
+                urls,notes=[],["Optional publication metadata unavailable: "+type(exc).__name__]
+            canonical="https://launchpad.net/ubuntu/+archive/primary/+files/"+quote(filename,safe="+~.:-")
+            if canonical not in urls:
+                urls.append(canonical)
+            candidates=[(url,"binary") for url in urls]
+            if path!=DENIED_PATH:
+                candidates.append((SNAP+quote(path,safe="/+~.:-"),"original"))
+            for url,kind in candidates:
+                if kind=="binary" and denied_launchpad:
+                    continue
+                try:
+                    status,data,host=get(url,kind,record[0],filename)
+                except (OSError,ValueError,http.client.HTTPException) as exc:
+                    notes.append(f"{kind} unavailable {type(exc).__name__}")
+                    continue
+                notes.append(f"{kind} {host} HTTP {status}")
+                if status!=200:
+                    if status in (401,403):
+                        # Do not try other Launchpad forms of a denied Launchpad download.
+                        if kind=="binary":
+                            denied_launchpad=True
+                    continue
+                if (len(data),hashlib.sha256(data).hexdigest())!=record:
+                    raise ValueError("Public object digest or size differs for "+path)
+                dest=root/filename;dest.write_bytes(data)
+                for field,want in zip(("Package","Version","Architecture"),F[path]):
+                    actual=subprocess.check_output(["dpkg-deb","-f",str(dest),field],text=True).strip()
+                    if actual!=want: raise ValueError("Wrong binary control metadata for "+path)
+                return {"path":path,"verified":True,"route":kind,"source":host,"url":url,"bytes":record[0],"sha256":record[1],"notes":notes}
+            return {"path":path,"verified":False,"notes":notes}
+
+        def main():
+            with TemporaryDirectory(prefix="six-fixed-ubuntu-") as t:
+                root=Path(t)
+                records=signed_records(root)
+                print("Signed fixed snapshot metadata obtained for exactly six binaries; total bytes",sum(r[0] for r in records.values()),flush=True)
+                def check(path):
+                    try: return resolve(path,records[path],root)
+                    except (OSError,ValueError,http.client.HTTPException,subprocess.CalledProcessError,KeyError) as exc:
+                        return {"path":path,"verified":False,"error":str(exc)}
+                with ThreadPoolExecutor(max_workers=3) as pool:
+                    results=list(pool.map(check,F))
+                for result in results: print(json.dumps(result,sort_keys=True),flush=True)
+                if not all(r["verified"] for r in results): raise SystemExit("Six-file receipt incomplete")
+        if __name__=="__main__":
+            main()
+        SIX_UBUNTU_PACKAGES
