@@ -1,0 +1,300 @@
+name: Bare 2.0.4 verified segment (native cache route)
+'on':
+  workflow_call:
+    inputs:
+      backend:
+        type: string
+        default: cache
+      parent_manifest_id:
+        type: string
+        default: ''
+      parent_manifest_sha:
+        type: string
+        default: ''
+      ordinal:
+        required: true
+        type: number
+      verify_only:
+        required: true
+        type: boolean
+      parent_key:
+        required: true
+        type: string
+      parent_sha:
+        required: true
+        type: string
+      parent_identity:
+        required: true
+        type: string
+      parent_producer:
+        required: true
+        type: string
+      apk_recipient:
+        required: true
+        type: string
+      minutes:
+        required: true
+        type: number
+    outputs:
+      status:
+        value: ${{ jobs.result.outputs.status }}
+      manifest_id:
+        value: ${{ jobs.result.outputs.manifest_id }}
+      manifest_sha:
+        value: ${{ jobs.result.outputs.manifest_sha }}
+      archive_bytes:
+        value: ${{ jobs.result.outputs.archive_bytes }}
+      key:
+        value: ${{ jobs.result.outputs.key }}
+      sha:
+        value: ${{ jobs.result.outputs.sha }}
+      identity:
+        value: ${{ jobs.result.outputs.identity }}
+      producer_sha:
+        value: ${{ jobs.result.outputs.producer_sha }}
+      ordinal:
+        value: ${{ jobs.result.outputs.ordinal }}
+      accepted_parent:
+        value: ${{ jobs.result.outputs.accepted_parent }}
+      cipher_id:
+        value: ${{ jobs.result.outputs.cipher_id }}
+      cipher_cache:
+        value: ${{ jobs.result.outputs.cipher_cache }}
+      cipher_sha:
+        value: ${{ jobs.result.outputs.cipher_sha }}
+      cipher_bytes:
+        value: ${{ jobs.result.outputs.cipher_bytes }}
+permissions: {}
+jobs:
+  arm:
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-arm64-probe.yml
+    with:
+      backend: ${{ inputs.backend }}
+      parent_manifest_id: ${{ inputs.parent_manifest_id }}
+      parent_manifest_sha: ${{ inputs.parent_manifest_sha }}
+      probe: checkpoint-production
+      coexist_cold: false
+      segment_ordinal: ${{ inputs.ordinal }}
+      verify_frontier_only: ${{ inputs.verify_only }}
+      expected_parent_producer: ${{ inputs.parent_producer }}
+      expected_checkpoint_key: ${{ inputs.parent_key }}
+      expected_checkpoint_sha: ${{ inputs.parent_sha }}
+      expected_checkpoint_identity: ${{ inputs.parent_identity }}
+      expected_base_image: ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+      apk_recipient: ${{ inputs.apk_recipient }}
+      apk_output_gib: 18
+      apk_jobs: 2
+      compile_minutes: ${{ inputs.minutes }}
+      retain_existing_caches: false
+    name: Authenticate parent on this runner, then run the permitted operation
+    if: ${{ github.run_attempt == '1' || inputs.verify_only }}
+  read:
+    name: Receive the generated checkpoint at its immutable segment key
+    needs: arm
+    if: ${{ !cancelled() && !inputs.verify_only && inputs.backend == 'cache' && needs.arm.result == 'success' && needs.arm.outputs.checkpoint_saved == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    outputs:
+      checkpoint_key: ${{ steps.verified.outputs.key }}
+      checkpoint_sha: ${{ steps.verified.outputs.sha }}
+      checkpoint_identity: ${{ steps.verified.outputs.identity }}
+    defaults: &id001
+      run:
+        shell: bash
+    env:
+      KEY_SUFFIX: ${{ format('-s{0}', inputs.ordinal) }}
+      EXPECTED_KEY: ${{ needs.arm.outputs.checkpoint_key }}
+      EXPECTED_SHA: ${{ needs.arm.outputs.checkpoint_sha }}
+      EXPECTED_IDENTITY: ${{ needs.arm.outputs.checkpoint_identity }}
+    steps:
+    - name: Validate the successor identity and load its exact verifier
+      timeout-minutes: 4
+      run: |
+        [[ $GITHUB_EVENT_NAME == workflow_dispatch && $RUNNER_ENVIRONMENT == github-hosted && $RUNNER_ARCH == X64 ]]
+        [[ $EXPECTED_KEY =~ ^bare-coexist-204-${GITHUB_RUN_ID}-1-checkpoint-production${KEY_SUFFIX}$ ]]
+        [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_IDENTITY =~ ^[0-9a-f]{64}$ ]]
+        curl --fail --location --retry 2 --max-time 60 \
+          "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/checkpoint.py" \
+          --output "$RUNNER_TEMP/checkpoint.py"
+    - name: Restore only the exact successor key
+      id: successor
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+      with:
+        path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+        key: ${{ env.EXPECTED_KEY }}
+        fail-on-cache-miss: true
+    - name: Verify the restored successor bytes and newly completed outputs
+      id: verified
+      timeout-minutes: 25
+      env:
+        CACHE_HIT: ${{ steps.successor.outputs.cache-hit }}
+        MATCHED_KEY: ${{ steps.successor.outputs.cache-matched-key }}
+      run: |
+        [[ $CACHE_HIT == true && $MATCHED_KEY == "$EXPECTED_KEY" ]]
+        archive="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
+        [[ -f $archive && ! -L $archive ]]
+        actual_sha=$(sha256sum -- "$archive")
+        actual_sha=${actual_sha%% *}
+        [[ $actual_sha == "$EXPECTED_SHA" ]]
+        python3 "$RUNNER_TEMP/checkpoint.py" validate-archive "$archive" --production
+        python3 "$RUNNER_TEMP/checkpoint.py" verify-continuation "$archive" \
+          --expected-identity "$EXPECTED_IDENTITY" --ci-revision "$GITHUB_SHA" --production
+        printf 'key=%s\nsha=%s\nidentity=%s\n' "$MATCHED_KEY" "$actual_sha" "$EXPECTED_IDENTITY" >> "$GITHUB_OUTPUT"
+        printf 'Verified successor cache %s\n' "$EXPECTED_KEY"
+        {
+          printf 'Verified checkpoint: `%s`\n\n' "$EXPECTED_KEY"
+          printf -- '- SHA-256: `%s`\n' "$EXPECTED_SHA"
+          printf -- '- Input identity: `%s`\n' "$EXPECTED_IDENTITY"
+        } >> "$GITHUB_STEP_SUMMARY"
+  apk:
+    name: Read back the completed encrypted APK for this segment
+    needs: arm
+    if: ${{ !cancelled() && !inputs.verify_only && needs.arm.result == 'success' && (needs.arm.outputs.apk_artifact_id != '' || needs.arm.outputs.apk_cache_key
+      != '') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    defaults: *id001
+    env:
+      ARTIFACT_ID: ${{ needs.arm.outputs.apk_artifact_id }}
+      EXPECTED_CACHE: ${{ needs.arm.outputs.apk_cache_key }}
+      EXPECTED_SHA: ${{ needs.arm.outputs.apk_encrypted_sha }}
+      EXPECTED_BYTES: ${{ needs.arm.outputs.apk_encrypted_bytes }}
+    steps:
+    - name: Download the exact encrypted APK artifact
+      if: ${{ env.ARTIFACT_ID != '' }}
+      continue-on-error: true
+      id: exact_artifact
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 10
+      with:
+        artifact-ids: ${{ env.ARTIFACT_ID }}
+        path: ${{ runner.temp }}/bare-apk-artifact
+        merge-multiple: true
+    - name: Restore the exact encrypted APK fallback cache
+      if: ${{ !cancelled() && env.EXPECTED_CACHE != '' }}
+      continue-on-error: true
+      id: apk_cached
+      timeout-minutes: 12
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+      with:
+        path: ${{ runner.temp }}/bare-apk-delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age
+        key: ${{ env.EXPECTED_CACHE }}
+        fail-on-cache-miss: true
+    - name: Verify the exact encrypted APK bytes
+      timeout-minutes: 2
+      env:
+        ARTIFACT_OK: ${{ steps.exact_artifact.outcome }}
+        CACHE_HIT: ${{ steps.apk_cached.outputs.cache-hit }}
+        CACHE_MATCH: ${{ steps.apk_cached.outputs.cache-matched-key }}
+      run: |
+        [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_BYTES =~ ^[1-9][0-9]*$ ]]
+        (( EXPECTED_BYTES > 0 && EXPECTED_BYTES <= 451 * 1024**2 ))
+        sources=()
+        if [[ -n $ARTIFACT_ID && $ARTIFACT_OK == success ]]; then sources+=(bare-apk-artifact); fi
+        if [[ -n $EXPECTED_CACHE && $CACHE_HIT == true && $CACHE_MATCH == "$EXPECTED_CACHE" ]]; then sources+=(bare-apk-delivery); fi
+        (( ${#sources[@]} > 0 ))
+        for source in "${sources[@]}"; do
+          file="$RUNNER_TEMP/$source/Bare-Personal-2.0.4-arm64-v8a.tar.age"
+          [[ -f $file && ! -L $file && $(stat -c %s -- "$file") == "$EXPECTED_BYTES" ]]
+          [[ $(head -n 1 -- "$file") == age-encryption.org/v1 ]]
+          printf '%s  %s\n' "$EXPECTED_SHA" "$file" | sha256sum --check --strict
+        done
+  result:
+    name: Record the independently verified segment outcome
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    needs:
+    - arm
+    - read
+    - apk
+    if: ${{ !cancelled() }}
+    outputs:
+      status: ${{ steps.record.outputs.status }}
+      manifest_id: ${{ steps.record.outputs.manifest_id }}
+      manifest_sha: ${{ steps.record.outputs.manifest_sha }}
+      archive_bytes: ${{ steps.record.outputs.archive_bytes }}
+      key: ${{ steps.record.outputs.key }}
+      sha: ${{ steps.record.outputs.sha }}
+      identity: ${{ steps.record.outputs.identity }}
+      producer_sha: ${{ steps.record.outputs.producer_sha }}
+      ordinal: ${{ steps.record.outputs.ordinal }}
+      accepted_parent: ${{ steps.record.outputs.accepted_parent }}
+      cipher_id: ${{ steps.record.outputs.cipher_id }}
+      cipher_cache: ${{ steps.record.outputs.cipher_cache }}
+      cipher_sha: ${{ steps.record.outputs.cipher_sha }}
+      cipher_bytes: ${{ steps.record.outputs.cipher_bytes }}
+    steps:
+    - id: record
+      env:
+        BACKEND: ${{ inputs.backend }}
+        SLOT_NEEDS: ${{ toJSON(needs) }}
+        ORDINAL: ${{ inputs.ordinal }}
+        PARENT_SHA: ${{ inputs.parent_sha }}
+        VERIFY_ONLY: ${{ toJSON(inputs.verify_only) }}
+      shell: python
+      run: |
+        import json, os, re
+        n = json.loads(os.environ["SLOT_NEEDS"])
+        a, read, apk = (n[k] for k in ("arm","read","apk"))
+        o = a["outputs"]
+        ordinal = int(os.environ["ORDINAL"])
+        parent = os.environ["PARENT_SHA"]
+        digest = lambda x: bool(re.fullmatch("[a-f0-9]{64}",x))
+        def checked(ok, why):
+            if not ok:
+                raise SystemExit(why)
+        checked(1 <= ordinal <= 13 and digest(parent), "Invalid lineage")
+        status = o.get("apk_delivery_status", "")
+        result = {"ordinal":ordinal, "accepted_parent":parent,
+                  "producer_sha":os.environ["GITHUB_SHA"]}
+        checked(o.get("producer_sha") == os.environ["GITHUB_SHA"] and o.get("checkpoint_ordinal") == str(ordinal), "Unbound producer/segment")
+        if ordinal > 1:
+            checked(o.get("parent_frontier_verified") == "true", "Unverified previous frontier")
+        if status in {"apk-size-exceeded","cipher-size-exceeded"}:
+            result["status"] = status
+        else:
+            checked(a["result"] == "success", "Worker failed; retain the independently verified parent")
+            checked(o["producer_sha"] == os.environ["GITHUB_SHA"] and o["checkpoint_ordinal"] == str(ordinal), "Producer/segment mismatch")
+            if ordinal > 1:
+                checked(o.get("parent_frontier_verified") == "true", "Restored parent's APK frontier did not pass")
+            if os.environ["VERIFY_ONLY"] == "true":
+                checked(read["result"] == apk["result"] == "skipped", "Verification-only run emitted a new object")
+                result.update(status="limit-verified", sha=parent)
+            elif apk["result"] == "success":
+                checked(read["result"] == "skipped" and status == "sealed", "Conflicting delivery branches")
+                checked(digest(o["apk_encrypted_sha"]) and 0 < int(o["apk_encrypted_bytes"]) <= 451 * 1024**2, "Invalid encrypted bytes")
+                aid, cache = o.get("apk_artifact_id",""), o.get("apk_cache_key","")
+                checked((not aid or re.fullmatch("[1-9][0-9]*", aid)) and (not cache or cache == "bare-coexist-204-apk-v1-"+os.environ["GITHUB_RUN_ID"]+"-1-s"+str(ordinal)) and (aid or cache), "Invalid delivery receipt")
+                result.update(status="apk", cipher_id=aid, cipher_cache=cache, cipher_sha=o["apk_encrypted_sha"], cipher_bytes=o["apk_encrypted_bytes"])
+            elif o.get("frontier_status") == "no-progress":
+                checked(read["result"] == apk["result"] == "skipped", "A stopped generation must not create an output")
+                result["status"] = "no-progress"
+            elif os.environ["BACKEND"] == "draft":
+                key = f'bare-coexist-204-{os.environ["GITHUB_RUN_ID"]}-1-checkpoint-production-s{ordinal}'
+                checked(read["result"] == apk["result"] == "skipped" and o.get("private_readback_verified") == "true" and
+                        o.get("checkpoint_saved") == "true" and o.get("frontier_status") == "candidate" and
+                        o.get("checkpoint_key") == key, "Missing independent private receipt")
+                aid, manifest = o.get("checkpoint_manifest_id",""), o.get("checkpoint_manifest_sha","")
+                archive, identity, length = o.get("checkpoint_sha",""), o.get("checkpoint_identity",""), o.get("checkpoint_bytes","")
+                checked(re.fullmatch("[1-9][0-9]*",aid) and all(digest(x) for x in (manifest,archive,identity)) and
+                        archive != parent and length.isdecimal() and 0 < int(length) <= 7*1024**3//2, "Invalid private successor receipt")
+                result.update(status="candidate", key=key, sha=archive, identity=identity, manifest_id=aid, manifest_sha=manifest, archive_bytes=length)
+            elif read["result"] == "success":
+                saved = read["outputs"]
+                key = f'bare-coexist-204-{os.environ["GITHUB_RUN_ID"]}-1-checkpoint-production-s{ordinal}'
+                checked(saved["checkpoint_key"] == o["checkpoint_key"] == key and
+                        all(saved[k] == o[k] and digest(o[k]) for k in ("checkpoint_sha","checkpoint_identity")), "Unverified successor")
+                if o.get("checkpoint_advanced") == "true":
+                    checked(saved["checkpoint_sha"] != parent, "Unchanged successor")
+                    result.update(status="candidate", key=key, sha=o["checkpoint_sha"], identity=o["checkpoint_identity"])
+                else:
+                    result["status"] = "no-progress"
+            else:
+                raise SystemExit("No verified checkpoint or APK receipt")
+        for k,v in result.items():
+            with open(os.environ["GITHUB_OUTPUT"],"a") as f:
+                print(f"{k}={v}",file=f)
+        print("R28_SEGMENT_RECEIPT " + json.dumps(result,sort_keys=True))

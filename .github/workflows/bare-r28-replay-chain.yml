@@ -1,0 +1,295 @@
+name: Finite checkpoint chain (explicit reusable caller only)
+permissions:
+  actions: read
+  contents: read
+'on':
+  workflow_call:
+    inputs:
+      source_run_id:
+        required: true
+        type: number
+        description: Physical S2 trial run to re-read
+      source_head_sha:
+        required: true
+        type: string
+        description: Immutable PR9 producer commit
+      source_receiver_attempt:
+        default: 1
+        type: number
+        description: Generation attempt of the successful independent receiver
+    outputs:
+      status:
+        value: ${{ jobs.first_attempt_result.outputs.status || jobs.recover_saved.outputs.status
+          }}
+      receipt:
+        value: ${{ jobs.first_attempt_result.outputs.receipt || jobs.recover_saved.outputs.receipt
+          }}
+jobs:
+  slot01:
+    if: ${{ !cancelled() && github.run_attempt == '1' }}
+    uses: ./.github/workflows/bare-r28-replay-worker.yml
+    with:
+      mode: verify-and-compute
+      ordinal: 1
+      parent: actions-cache:11016400308:4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf
+      source_run_id: ${{ inputs.source_run_id }}
+      source_head_sha: ${{ inputs.source_head_sha }}
+      source_receiver_attempt: ${{ inputs.source_receiver_attempt }}
+  slot02:
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.slot01.result == 'success'
+      && needs.slot01.outputs.status == 'candidate' && needs.slot01.outputs.receipt
+      != '' && needs.slot01.outputs.receipt != needs.slot01.outputs.accepted_parent
+      && needs.slot01.outputs.owner_run == github.run_id && needs.slot01.outputs.owner_attempt
+      == '1' && needs.slot01.outputs.ordinal == '1' && needs.slot01.outputs.accepted_parent
+      == 'actions-cache:11016400308:4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf'
+      }}
+    uses: ./.github/workflows/bare-r28-replay-worker.yml
+    with:
+      mode: verify-and-compute
+      ordinal: 2
+      parent: ${{ needs.slot01.outputs.receipt }}
+      source_run_id: ${{ inputs.source_run_id }}
+      source_head_sha: ${{ inputs.source_head_sha }}
+      source_receiver_attempt: ${{ inputs.source_receiver_attempt }}
+    needs:
+    - slot01
+  slot03:
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.slot02.result == 'success'
+      && needs.slot02.outputs.status == 'candidate' && needs.slot02.outputs.receipt
+      != '' && needs.slot02.outputs.receipt != needs.slot02.outputs.accepted_parent
+      && needs.slot02.outputs.owner_run == github.run_id && needs.slot02.outputs.owner_attempt
+      == '1' && needs.slot02.outputs.ordinal == '2' && needs.slot02.outputs.accepted_parent
+      == needs.slot01.outputs.receipt }}
+    uses: ./.github/workflows/bare-r28-replay-worker.yml
+    with:
+      mode: verify-and-compute
+      ordinal: 3
+      parent: ${{ needs.slot02.outputs.receipt }}
+      source_run_id: ${{ inputs.source_run_id }}
+      source_head_sha: ${{ inputs.source_head_sha }}
+      source_receiver_attempt: ${{ inputs.source_receiver_attempt }}
+    needs:
+    - slot01
+    - slot02
+  slot04:
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.slot03.result == 'success'
+      && needs.slot03.outputs.status == 'candidate' && needs.slot03.outputs.receipt
+      != '' && needs.slot03.outputs.receipt != needs.slot03.outputs.accepted_parent
+      && needs.slot03.outputs.owner_run == github.run_id && needs.slot03.outputs.owner_attempt
+      == '1' && needs.slot03.outputs.ordinal == '3' && needs.slot03.outputs.accepted_parent
+      == needs.slot02.outputs.receipt }}
+    uses: ./.github/workflows/bare-r28-replay-worker.yml
+    with:
+      mode: verify-and-compute
+      ordinal: 4
+      parent: ${{ needs.slot03.outputs.receipt }}
+      source_run_id: ${{ inputs.source_run_id }}
+      source_head_sha: ${{ inputs.source_head_sha }}
+      source_receiver_attempt: ${{ inputs.source_receiver_attempt }}
+    needs:
+    - slot02
+    - slot03
+  slot05:
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.slot04.result == 'success'
+      && needs.slot04.outputs.status == 'candidate' && needs.slot04.outputs.receipt
+      != '' && needs.slot04.outputs.receipt != needs.slot04.outputs.accepted_parent
+      && needs.slot04.outputs.owner_run == github.run_id && needs.slot04.outputs.owner_attempt
+      == '1' && needs.slot04.outputs.ordinal == '4' && needs.slot04.outputs.accepted_parent
+      == needs.slot03.outputs.receipt }}
+    uses: ./.github/workflows/bare-r28-replay-worker.yml
+    with:
+      mode: verify-and-compute
+      ordinal: 5
+      parent: ${{ needs.slot04.outputs.receipt }}
+      source_run_id: ${{ inputs.source_run_id }}
+      source_head_sha: ${{ inputs.source_head_sha }}
+      source_receiver_attempt: ${{ inputs.source_receiver_attempt }}
+    needs:
+    - slot03
+    - slot04
+  slot06:
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.slot05.result == 'success'
+      && needs.slot05.outputs.status == 'candidate' && needs.slot05.outputs.receipt
+      != '' && needs.slot05.outputs.receipt != needs.slot05.outputs.accepted_parent
+      && needs.slot05.outputs.owner_run == github.run_id && needs.slot05.outputs.owner_attempt
+      == '1' && needs.slot05.outputs.ordinal == '5' && needs.slot05.outputs.accepted_parent
+      == needs.slot04.outputs.receipt }}
+    uses: ./.github/workflows/bare-r28-replay-worker.yml
+    with:
+      mode: verify-and-compute
+      ordinal: 6
+      parent: ${{ needs.slot05.outputs.receipt }}
+      source_run_id: ${{ inputs.source_run_id }}
+      source_head_sha: ${{ inputs.source_head_sha }}
+      source_receiver_attempt: ${{ inputs.source_receiver_attempt }}
+    needs:
+    - slot04
+    - slot05
+  slot07:
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.slot06.result == 'success'
+      && needs.slot06.outputs.status == 'candidate' && needs.slot06.outputs.receipt
+      != '' && needs.slot06.outputs.receipt != needs.slot06.outputs.accepted_parent
+      && needs.slot06.outputs.owner_run == github.run_id && needs.slot06.outputs.owner_attempt
+      == '1' && needs.slot06.outputs.ordinal == '6' && needs.slot06.outputs.accepted_parent
+      == needs.slot05.outputs.receipt }}
+    uses: ./.github/workflows/bare-r28-replay-worker.yml
+    with:
+      mode: verify-and-compute
+      ordinal: 7
+      parent: ${{ needs.slot06.outputs.receipt }}
+      source_run_id: ${{ inputs.source_run_id }}
+      source_head_sha: ${{ inputs.source_head_sha }}
+      source_receiver_attempt: ${{ inputs.source_receiver_attempt }}
+    needs:
+    - slot05
+    - slot06
+  slot08:
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.slot07.result == 'success'
+      && needs.slot07.outputs.status == 'candidate' && needs.slot07.outputs.receipt
+      != '' && needs.slot07.outputs.receipt != needs.slot07.outputs.accepted_parent
+      && needs.slot07.outputs.owner_run == github.run_id && needs.slot07.outputs.owner_attempt
+      == '1' && needs.slot07.outputs.ordinal == '7' && needs.slot07.outputs.accepted_parent
+      == needs.slot06.outputs.receipt }}
+    uses: ./.github/workflows/bare-r28-replay-worker.yml
+    with:
+      mode: verify-and-compute
+      ordinal: 8
+      parent: ${{ needs.slot07.outputs.receipt }}
+      source_run_id: ${{ inputs.source_run_id }}
+      source_head_sha: ${{ inputs.source_head_sha }}
+      source_receiver_attempt: ${{ inputs.source_receiver_attempt }}
+    needs:
+    - slot06
+    - slot07
+  slot09:
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.slot08.result == 'success'
+      && needs.slot08.outputs.status == 'candidate' && needs.slot08.outputs.receipt
+      != '' && needs.slot08.outputs.receipt != needs.slot08.outputs.accepted_parent
+      && needs.slot08.outputs.owner_run == github.run_id && needs.slot08.outputs.owner_attempt
+      == '1' && needs.slot08.outputs.ordinal == '8' && needs.slot08.outputs.accepted_parent
+      == needs.slot07.outputs.receipt }}
+    uses: ./.github/workflows/bare-r28-replay-worker.yml
+    with:
+      mode: verify-and-compute
+      ordinal: 9
+      parent: ${{ needs.slot08.outputs.receipt }}
+      source_run_id: ${{ inputs.source_run_id }}
+      source_head_sha: ${{ inputs.source_head_sha }}
+      source_receiver_attempt: ${{ inputs.source_receiver_attempt }}
+    needs:
+    - slot07
+    - slot08
+  slot10:
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.slot09.result == 'success'
+      && needs.slot09.outputs.status == 'candidate' && needs.slot09.outputs.receipt
+      != '' && needs.slot09.outputs.receipt != needs.slot09.outputs.accepted_parent
+      && needs.slot09.outputs.owner_run == github.run_id && needs.slot09.outputs.owner_attempt
+      == '1' && needs.slot09.outputs.ordinal == '9' && needs.slot09.outputs.accepted_parent
+      == needs.slot08.outputs.receipt }}
+    uses: ./.github/workflows/bare-r28-replay-worker.yml
+    with:
+      mode: verify-and-compute
+      ordinal: 10
+      parent: ${{ needs.slot09.outputs.receipt }}
+      source_run_id: ${{ inputs.source_run_id }}
+      source_head_sha: ${{ inputs.source_head_sha }}
+      source_receiver_attempt: ${{ inputs.source_receiver_attempt }}
+    needs:
+    - slot08
+    - slot09
+  slot11:
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.slot10.result == 'success'
+      && needs.slot10.outputs.status == 'candidate' && needs.slot10.outputs.receipt
+      != '' && needs.slot10.outputs.receipt != needs.slot10.outputs.accepted_parent
+      && needs.slot10.outputs.owner_run == github.run_id && needs.slot10.outputs.owner_attempt
+      == '1' && needs.slot10.outputs.ordinal == '10' && needs.slot10.outputs.accepted_parent
+      == needs.slot09.outputs.receipt }}
+    uses: ./.github/workflows/bare-r28-replay-worker.yml
+    with:
+      mode: verify-and-compute
+      ordinal: 11
+      parent: ${{ needs.slot10.outputs.receipt }}
+      source_run_id: ${{ inputs.source_run_id }}
+      source_head_sha: ${{ inputs.source_head_sha }}
+      source_receiver_attempt: ${{ inputs.source_receiver_attempt }}
+    needs:
+    - slot09
+    - slot10
+  slot12:
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.slot11.result == 'success'
+      && needs.slot11.outputs.status == 'candidate' && needs.slot11.outputs.receipt
+      != '' && needs.slot11.outputs.receipt != needs.slot11.outputs.accepted_parent
+      && needs.slot11.outputs.owner_run == github.run_id && needs.slot11.outputs.owner_attempt
+      == '1' && needs.slot11.outputs.ordinal == '11' && needs.slot11.outputs.accepted_parent
+      == needs.slot10.outputs.receipt }}
+    uses: ./.github/workflows/bare-r28-replay-worker.yml
+    with:
+      mode: verify-and-compute
+      ordinal: 12
+      parent: ${{ needs.slot11.outputs.receipt }}
+      source_run_id: ${{ inputs.source_run_id }}
+      source_head_sha: ${{ inputs.source_head_sha }}
+      source_receiver_attempt: ${{ inputs.source_receiver_attempt }}
+    needs:
+    - slot10
+    - slot11
+  last_receipt:
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.slot12.result == 'success'
+      && needs.slot12.outputs.status == 'candidate' && needs.slot12.outputs.receipt
+      != '' && needs.slot12.outputs.receipt != needs.slot12.outputs.accepted_parent
+      && needs.slot12.outputs.owner_run == github.run_id && needs.slot12.outputs.owner_attempt
+      == '1' && needs.slot12.outputs.ordinal == '12' && needs.slot12.outputs.accepted_parent
+      == needs.slot11.outputs.receipt }}
+    uses: ./.github/workflows/bare-r28-replay-worker.yml
+    with:
+      mode: verify-only
+      ordinal: 13
+      parent: ${{ needs.slot12.outputs.receipt }}
+      source_run_id: ${{ inputs.source_run_id }}
+      source_head_sha: ${{ inputs.source_head_sha }}
+      source_receiver_attempt: ${{ inputs.source_receiver_attempt }}
+    needs:
+    - slot11
+    - slot12
+  first_attempt_result:
+    if: ${{ !cancelled() && github.run_attempt == '1' }}
+    needs:
+    - slot01
+    - slot02
+    - slot03
+    - slot04
+    - slot05
+    - slot06
+    - slot07
+    - slot08
+    - slot09
+    - slot10
+    - slot11
+    - slot12
+    - last_receipt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      status: ${{ steps.result.outputs.status }}
+      receipt: ${{ steps.result.outputs.receipt }}
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        persist-credentials: false
+    - id: result
+      env:
+        CHAIN_NEEDS: ${{ toJSON(needs) }}
+      run: python3 preflight28/control/chain.py result --limit 12
+  recover_saved:
+    if: ${{ !cancelled() && github.run_attempt != '1' }}
+    uses: ./.github/workflows/bare-r28-replay-worker.yml
+    with:
+      mode: recover-only
+      ordinal: 0
+      parent: ''
+      source_run_id: ${{ inputs.source_run_id }}
+      source_head_sha: ${{ inputs.source_head_sha }}
+      source_receiver_attempt: ${{ inputs.source_receiver_attempt }}
+

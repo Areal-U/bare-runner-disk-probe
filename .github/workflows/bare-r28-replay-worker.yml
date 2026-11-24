@@ -1,0 +1,67 @@
+name: Read verified S2 preflight evidence
+'on':
+  workflow_call:
+    inputs:
+      mode:
+        required: true
+        type: string
+      ordinal:
+        required: true
+        type: number
+      parent:
+        required: true
+        type: string
+      source_run_id:
+        required: true
+        type: number
+        description: Physical S2 trial run to re-read
+      source_head_sha:
+        required: true
+        type: string
+        description: Immutable PR9 producer commit
+      source_receiver_attempt:
+        default: 1
+        type: number
+        description: Generation attempt of the successful independent receiver
+    outputs:
+      status:
+        value: ${{ jobs.verify.outputs.status }}
+      receipt:
+        value: ${{ jobs.verify.outputs.receipt }}
+      accepted_parent:
+        value: ${{ jobs.verify.outputs.accepted_parent }}
+      ordinal:
+        value: ${{ jobs.verify.outputs.ordinal }}
+      owner_attempt:
+        value: ${{ jobs.verify.outputs.owner_attempt }}
+      owner_run:
+        value: ${{ jobs.verify.outputs.owner_run }}
+permissions:
+  actions: read
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    outputs:
+      status: ${{ steps.evidence.outputs.status }}
+      receipt: ${{ steps.evidence.outputs.receipt }}
+      accepted_parent: ${{ steps.evidence.outputs.accepted_parent }}
+      ordinal: ${{ steps.evidence.outputs.ordinal }}
+      owner_attempt: ${{ steps.evidence.outputs.owner_attempt }}
+      owner_run: ${{ steps.evidence.outputs.owner_run }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - id: evidence
+        name: Authenticate the existing producing and receiving jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_HEAD_SHA: ${{ inputs.source_head_sha }}
+          SOURCE_RECEIVER_ATTEMPT: ${{ inputs.source_receiver_attempt }}
+          MODE: ${{ inputs.mode }}
+          ORDINAL: ${{ inputs.ordinal }}
+          PARENT: ${{ inputs.parent }}
+        run: python3 preflight28/control/replay_worker.py --mode "$MODE" --ordinal "$ORDINAL" --parent "$PARENT"
