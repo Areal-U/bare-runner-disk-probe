@@ -14,7 +14,7 @@ concurrency:
   group: r28-preflight-s2-20261125-v1-s2
   cancel-in-progress: false
 env:
-  EXPECTED_BEFORE: f898d58615cd688ebcf026474c7aedc37a343d7a
+  EXPECTED_BEFORE: b9553267cbb4f1645db9d2d40c4d85eb68c26d5d
   TRIAL_SHA: ${{ github.event.pull_request.head.sha }}
 defaults:
   run:
@@ -32,7 +32,7 @@ jobs:
       == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.repository.fork == false && github.repository == 'Areal-U/bare-runner-disk-probe'
       && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository
       && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha ==
-      'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == 'f898d58615cd688ebcf026474c7aedc37a343d7a' && github.run_attempt ==
+      'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == 'b9553267cbb4f1645db9d2d40c4d85eb68c26d5d' && github.run_attempt ==
       '1' }}
     outputs:
       manifest_id: ${{ steps.send.outputs.manifest_id }}
@@ -45,10 +45,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha }}
         persist-credentials: false
     - &id004
-      name: Stage reviewed helpers and pinned owner-Draft access routines
+      name: Stage graph/graph.py
       run: |
         set -euo pipefail
-        mkdir -p preflight28/{graph,limits,control,transport}
+        mkdir -p preflight28/graph
         cat > preflight28/graph/graph.py <<'REVIEWED_R28_GRAPH_GRAPH_PY'
         #!/usr/bin/env python3
         """Prove forward progress for the pinned APK using the actual Siso planner."""
@@ -294,6 +294,11 @@ jobs:
                 args.out.resolve(), args.proof, ["autoninja"])
             print(json.dumps(result, sort_keys=True))
         REVIEWED_R28_GRAPH_GRAPH_PY
+    - &id005
+      name: Stage limits/guard.py
+      run: |
+        set -euo pipefail
+        mkdir -p preflight28/limits
         cat > preflight28/limits/guard.py <<'REVIEWED_R28_LIMITS_GUARD_PY'
         #!/usr/bin/env python3
         """Bounded resource and delivery checks for a single Bare runner segment."""
@@ -628,6 +633,11 @@ jobs:
         if __name__ == '__main__':
             sys.exit(main())
         REVIEWED_R28_LIMITS_GUARD_PY
+    - &id006
+      name: Stage control/admission.py
+      run: |
+        set -euo pipefail
+        mkdir -p preflight28/control
         cat > preflight28/control/admission.py <<'REVIEWED_R28_CONTROL_ADMISSION_PY'
         """Admit exactly one PR9 S2 trial run. Replayed GitHub attempts are readers only."""
         import argparse
@@ -770,6 +780,11 @@ jobs:
             except (OSError, ValueError, KeyError, http.client.HTTPException) as error:
                 sys.exit(str(error))
         REVIEWED_R28_CONTROL_ADMISSION_PY
+    - &id007
+      name: Stage transport/prepare.py
+      run: |
+        set -euo pipefail
+        mkdir -p preflight28/transport
         cat > preflight28/transport/prepare.py <<'REVIEWED_R28_TRANSPORT_PREPARE_PY'
         """Reuse the byte-pinned, previously successful PR9 environment and owner-Draft helpers."""
         import hashlib
@@ -780,7 +795,7 @@ jobs:
         import sys
 
         READ = ("bare-round26-zstd-six-receiver.yml", "8f74cb7a6c871e77fa6e58232b0f3d863124c74652f132d4e024570839de9c7d", "zstd_read")
-        ARCHIVE = ("bare-round26-private-six-receiver.yml", "43ad71f5360db456917546a10c907e55b71296f2f6c886cf90590d9570540b5a", "archive_restore")
+        ARCHIVE = ("bare-round26-transport-check.yml", "39ee444aaf7a9c9d7ee92706b29b8b801077ac001aba2a1bb32a9d90aa017f57", "archive_send")
         ROOT = Path(os.environ.get("GITHUB_WORKSPACE", Path.cwd()))
         TEMP = Path(os.environ["RUNNER_TEMP"])
         OLD = "bf70ddbf474f3390a62220a076b8c43347fecc64"
@@ -820,6 +835,21 @@ jobs:
             archive = commands(ARCHIVE)
             for name in ["Prepare checkpoint_parts.py", "Prepare transfer.py"]:
                 shell(archive[name])
+            import importlib
+            import inspect
+            sys.path.insert(0, str(TEMP))
+            helper = importlib.import_module("transfer")
+            if (not Path(helper.__file__).resolve().samefile(TEMP / "transfer.py")
+                    or helper.UPLOAD != "uploads.github.com" or helper.API != "api.github.com"
+                    or helper.RELEASE_ID != 452114666 or helper.BASE != "/repos/Areal-U/bare-runner-disk-probe"):
+                raise ValueError("Owner helper does not match the pinned writer/reader contract")
+            for name, args in {"draft": (helper.RELEASE_ID,), "asset_info": ({}, "x", 1, "0"*64, 1),
+                               "download": (1, 1, "0"*64, None), "anonymous_status": (helper.API, "/", "api"),
+                               "metadata": ("/",), "sha256_file": (TEMP / "transfer.py",)}.items():
+                inspect.signature(getattr(helper, name)).bind(*args)
+            inspect.signature(helper.request).bind(helper.UPLOAD, "POST", "/test", auth=True,
+                                                   body=b"", length=0, content_type="application/octet-stream")
+            print("Verified full producer, receiver, private read and anonymous check interfaces")
 
 
         def setup(stage):
@@ -874,6 +904,11 @@ jobs:
             else:
                 raise SystemExit("Unknown stage")
         REVIEWED_R28_TRANSPORT_PREPARE_PY
+    - &id008
+      name: Stage transport/build-tail.sh
+      run: |
+        set -euo pipefail
+        mkdir -p preflight28/transport
         cat > preflight28/transport/build-tail.sh <<'REVIEWED_R28_TRANSPORT_BUILD_TAIL_SH'
         # Runs inside the same validated builder as the existing no-op checks.
         proof=out/Bare/checkpoint-round28-graph.json
@@ -949,6 +984,11 @@ jobs:
         docker compose stop --timeout 20
         [[ -z $(docker compose ps --status running -q) ]]
         REVIEWED_R28_TRANSPORT_BUILD_TAIL_SH
+    - &id009
+      name: Stage transport/stream.py
+      run: |
+        set -euo pipefail
+        mkdir -p preflight28/transport
         cat > preflight28/transport/stream.py <<'REVIEWED_R28_TRANSPORT_STREAM_PY'
         """Write a compressed stream without allowing a candidate past its physical cap."""
         import os
@@ -971,6 +1011,11 @@ jobs:
         if __name__ == "__main__":
             store(sys.stdin.buffer, Path(sys.argv[1]), 7 * 1024**3 // 2)
         REVIEWED_R28_TRANSPORT_STREAM_PY
+    - &id010
+      name: Stage transport/exchange.py
+      run: |
+        set -euo pipefail
+        mkdir -p preflight28/transport
         cat > preflight28/transport/exchange.py <<'REVIEWED_R28_TRANSPORT_EXCHANGE_PY'
         """Send/receive one bounded zstd checkpoint on the existing owner-only draft."""
         import hashlib
@@ -1177,13 +1222,15 @@ jobs:
             mode, = sys.argv[1:]
             {"parent": source, "send": send, "receive": receive}[mode]()
         REVIEWED_R28_TRANSPORT_EXCHANGE_PY
-        python3 preflight28/transport/prepare.py tools
+    - &id011
+      name: Load byte-verified existing owner-Draft helpers
+      run: python3 preflight28/transport/prepare.py tools
     - name: Check canonical generation and reserve the single producer
       env: &id001
         GH_TOKEN: ${{ github.token }}
       timeout-minutes: 3
       run: python3 preflight28/control/admission.py compute --before "$EXPECTED_BEFORE" --helper-dir "$RUNNER_TEMP"
-    - &id005
+    - &id012
       name: Read the actual service job start and preflight source receipt
       env:
         GH_TOKEN: ${{ github.token }}
@@ -1241,16 +1288,23 @@ jobs:
       9 && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.event.repository.fork == false && github.repository ==
       'Areal-U/bare-runner-disk-probe' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name
       == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4' && github.event.pull_request.base.sha
-      == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == 'f898d58615cd688ebcf026474c7aedc37a343d7a' && (needs.produce.result
+      == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == 'b9553267cbb4f1645db9d2d40c4d85eb68c26d5d' && (needs.produce.result
       == 'success' || github.run_attempt != '1') }}
     steps:
     - *id003
     - *id004
+    - *id005
+    - *id006
+    - *id007
+    - *id008
+    - *id009
+    - *id010
+    - *id011
     - name: Check canonical generation and verify its existing claim
       env: *id001
       timeout-minutes: 3
       run: python3 preflight28/control/admission.py recover --before "$EXPECTED_BEFORE" --helper-dir "$RUNNER_TEMP"
-    - *id005
+    - *id012
     - name: Read and authenticate the exact private manifest and successor bytes
       timeout-minutes: 85
       env:
