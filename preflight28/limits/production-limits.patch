@@ -1,0 +1,385 @@
+--- a/build_trial.py
++++ b/build_trial.py
+@@ -45,7 +45,7 @@
+ LARGE_OUTPUT_LIMIT = 6 * 1024 ** 3
+ LARGE_OUTPUT_ENTRY_LIMIT = 300_000
+ LARGE_MIN_FREE_BYTES = 20 * 1024 ** 3
+-PRODUCTION_TIME_LIMIT = 180 * 60
++PRODUCTION_TIME_LIMIT = 310 * 60  # absolute upper bound before the mandatory direct-route closure
+ PRODUCTION_DEFAULT_OUTPUT_LIMIT = 11 * 1024 ** 3
+ PRODUCTION_OUTPUT_LIMIT = 18 * 1024 ** 3
+ PRODUCTION_OUTPUT_ENTRY_LIMIT = 525_000
+@@ -163,6 +163,12 @@
+         progress["step_counter"] = int(match[1])
+         progress["graph_total"] = int(match[2])
+         description = match[4].decode("utf-8", errors="replace")
++        if re.search(r"(?:^|[ /_.:-])(?:DEX|R8|D8|LINK|SOLINK)(?:[ /_.:-]|$)", description, re.I):
++            active = progress.setdefault("terminal_actions", set())
++            if match[3] == b"S":
++                active.add(description)
++            else:
++                active.discard(description)
+         if match[3] == b"S" and description.startswith(("LINK ", "SOLINK ")):
+             progress["link_action"] = description
+             progress["link_started"] = time.monotonic()
+@@ -452,6 +458,16 @@
+     last_console_progress = started
+     progress = {}
+     try:
++        guard = None
++        deadline = None
++        if production:
++            import runpy
++            guard = runpy.run_path(str(Path(__file__).with_name("guard.py")))
++            if epoch := os.environ.get("COMPILE_STOP_EPOCH"):
++                remaining = int(epoch) - time.time()
++                if remaining > PRODUCTION_TIME_LIMIT:
++                    raise ValueError("Compile deadline exceeds one runner job")
++                deadline = time.monotonic() + remaining
+         if phase not in {"seed", "restore"} or seconds <= 0 or sample_seconds <= 0:
+             raise ValueError("Invalid trial phase or time budget")
+         if sum((scale, large, production)) > 1:
+@@ -495,6 +511,12 @@
+                 result["resources_before"]["free_inodes"] < PRODUCTION_MIN_FREE_INODES):
+             result["reason"] = "preflight-disk-limit"
+             return result
++        if production:
++            level, _ = guard['pressure']({'estimate': snapshot['archive_input_estimate_bytes'],
++                                          'entries': snapshot['entries']}, guard['disk'](source_root), False)
++            if level == 'stop' or (deadline is not None and time.monotonic() >= deadline):
++                result['reason'] = 'preflight-resource-or-time'
++                return result
+         log_path.parent.mkdir(parents=True, exist_ok=True)
+         arguments = command if command is not None else [
+             "autoninja", "-C", str(BUILD_DIR), "-j", str(jobs),
+@@ -511,6 +533,11 @@
+             selector.register(process.stdout, selectors.EVENT_READ)
+             interrupted_at = None
+             last_sample = 0
++            last_guard_sample = snapshot
++            last_resource_poll = 0
++            level = 'normal'
++            if production:
++                sample_seconds = 30
+             leader_exited_at = None
+             while True:
+                 now = time.monotonic()
+@@ -519,11 +546,22 @@
+                     reason = None
+                     if received_signals:
+                         reason = "controller-interrupted"
+-                    elif now - started >= seconds:
++                    elif now - started >= seconds or (deadline is not None and now >= deadline):
+                         reason = "time-limit"
+-                    elif now - last_sample >= sample_seconds:
++                    if not reason and production and now - last_resource_poll >= 0.5:
++                        last_resource_poll = now
++                        fs = guard['disk'](source_root)
++                        level, sample_seconds = guard['pressure'](
++                            {'estimate': last_guard_sample['archive_input_estimate_bytes'],
++                             'entries': last_guard_sample['entries']}, fs, bool(progress.get('terminal_actions')))
++                        if level == 'stop':
++                            reason = 'disk-limit' if fs['free_bytes']-min_free_bytes <= guard['STOP_MARGIN'] or fs['free_inodes']-PRODUCTION_MIN_FREE_INODES <= guard['STOP_ENTRIES'] else 'output-limit'
++                    if not reason and now - last_sample >= sample_seconds:
+                         sample = tree_snapshot(output, include_paths=False)
+                         sample.pop("paths")
++                        last_guard_sample = sample
++                        if production:
++                            result['monitor_interval_seconds'] = sample_seconds
+                         free = shutil.disk_usage(source_root).free
+                         result["last_sample"] = {**sample, "free_bytes": free}
+                         if production:
+@@ -710,11 +748,13 @@
+     if args.jobs == 1 and not args.production:
+         parser.error("--jobs 1 requires --production")
+     time_limit, output_limit, entry_limit, disk_floor = trial_limits(args.scale, args.large, args.production)
+-    seconds = args.seconds if args.seconds is not None else (time_limit if expanded else 180)
++    seconds = args.seconds if args.seconds is not None else (180 * 60 if args.production else time_limit if expanded else 180)
+     default_output = PRODUCTION_DEFAULT_OUTPUT_LIMIT if args.production else output_limit
+     max_output_bytes = args.max_output_bytes if args.max_output_bytes is not None else default_output
+     max_output_entries = args.max_output_entries if args.max_output_entries is not None else entry_limit
+     min_free_bytes = args.min_free_bytes if args.min_free_bytes is not None else disk_floor
++    if args.production and seconds > 180 * 60 and not os.environ.get("COMPILE_STOP_EPOCH"):
++        parser.error("Extended compile time requires a verified absolute job deadline")
+     if not 1 <= seconds <= time_limit:
+         parser.error(f"--seconds must be between 1 and {time_limit}")
+     if not 1 <= max_output_bytes <= output_limit or min_free_bytes < disk_floor:
+--- a/.github/workflows/bare-arm64-probe.yml
++++ b/.github/workflows/bare-arm64-probe.yml
+@@ -58,6 +58,8 @@
+         value: ${{ jobs.compile-probe.outputs.apk_artifact_id }}
+       apk_cache_key:
+         value: ${{ jobs.compile-probe.outputs.apk_cache_key }}
++      apk_delivery_status:
++        value: ${{ jobs.compile-probe.outputs.apk_delivery_status }}
+       apk_encrypted_sha:
+         value: ${{ jobs.compile-probe.outputs.apk_encrypted_sha }}
+       apk_encrypted_bytes:
+@@ -89,8 +91,9 @@
+       base_image: ${{ steps.prepare.outputs.base_image }}
+       checkpoint_saved: ${{ inputs.probe == 'checkpoint-production' && steps.checkpoint-proof.outputs.verified || inputs.probe != 'checkpoint-production' && steps.saved-receipt.outputs.saved || '' }}
+       checkpoint_advanced: ${{ steps.pack-checkpoint.outputs.checkpoint_advanced }}
+-      apk_artifact_id: ${{ steps.apk_upload.outcome == 'success' && steps.apk_upload.outputs.artifact-id || '' }}
++      apk_artifact_id: ${{ steps.seal_receipt.outputs.id }}
+       apk_cache_key: ${{ steps.apk_fallback_receipt.outputs.key }}
++      apk_delivery_status: ${{ steps.apk_seal.outputs.status }}
+       apk_encrypted_sha: ${{ steps.apk_seal.outputs.sha }}
+       apk_encrypted_bytes: ${{ steps.apk_seal.outputs.bytes }}
+     env:
+@@ -162,7 +165,7 @@
+           [[ $APK_OUTPUT_GIB == 4 && $APK_JOBS == 1 && $COMPILE_MINUTES == 25 ]]
+         else
+           [[ $APK_OUTPUT_GIB == 18 && ( $APK_JOBS == 1 || $APK_JOBS == 2 ) ]]
+-          [[ $COMPILE_MINUTES == 180 || $COMPILE_MINUTES == 25 ]]
++          [[ $COMPILE_MINUTES == 0 || $COMPILE_MINUTES == 180 || $COMPILE_MINUTES == 25 ]]
+         fi
+         [[ $REPAIR_LEGACY_INPUT_PATHS == false ]]
+         predecessor_rev=''
+@@ -200,8 +203,9 @@
+       timeout-minutes: 5
+       run: |
+         mkdir -p "$RUNNER_TEMP/bare-ci"
+-        for file in checkpoint.py build_trial.py coexist_inputs.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
++        for file in checkpoint.py build_trial.py coexist_inputs.py guard.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+           source=$file
++          [[ $file != guard.py ]] || source=preflight28/limits/guard.py
+           [[ $file != *.yml ]] || source=".github/workflows/$file"
+           curl --fail --location --retry 2 --max-time 60 \
+             "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/$source" \
+@@ -216,6 +220,13 @@
+               --output "$RUNNER_TEMP/bare-ci/predecessor-workflows/$file"
+           done
+         fi
++    - name: Establish the production job clock
++      if: ${{ inputs.probe == 'checkpoint-production' }}
++      timeout-minutes: 2
++      env:
++        JOB_READ_TOKEN: ${{ github.token }}
++        MY_CHECK: ${{ job.check_run_id }}
++      run: python3 -I "$RUNNER_TEMP/bare-ci/guard.py" job-clock --check-run "$MY_CHECK" > "$RUNNER_TEMP/bare-probe-start"
+     - name: Prepare encrypted APK recovery
+       if: ${{ inputs.probe == 'checkpoint-production' }}
+       timeout-minutes: 5
+@@ -673,7 +684,7 @@
+           inodes=$(df -Pi /work | awk 'NR == 2 { print $4 }')
+           [[ $free =~ ^[0-9]+$ && $inodes =~ ^[0-9]+$ ]]
+           # Leave 20 GiB free and 3 GiB for allocated blocks/metadata at the 19 GiB tar limit.
+-          (( free >= 42 * 1024**3 && inodes >= 570000 ))
++          python3 -I /exchange/guard.py space /work --bytes "$((22*1024**3))" --inodes 550000
+         fi
+         rm -rf --one-file-system -- out/Bare
+         tar -xzf /exchange/checkpoint/checkpoint-input.tar.gz
+@@ -836,7 +847,7 @@
+     - name: Run the real APK target within its time and output budgets
+       id: trial
+       if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
+-      timeout-minutes: ${{ inputs.probe == 'checkpoint-production' && 188 || inputs.probe == 'checkpoint-large' && 95 || inputs.probe == 'checkpoint-scale' && 65 || 12 }}
++      timeout-minutes: ${{ inputs.probe == 'checkpoint-production' && 316 || inputs.probe == 'checkpoint-large' && 95 || inputs.probe == 'checkpoint-scale' && 65 || 12 }}
+       env:
+         APK_JOBS: ${{ inputs.apk_jobs }}
+       run: |
+@@ -846,7 +857,7 @@
+         latest_start=55
+         [[ $PROBE_MODE != checkpoint-large ]] || latest_start=60
+         [[ $PROBE_MODE != checkpoint-production ]] || latest_start=65
+-        if (( elapsed > latest_start * 60 )); then
++        if [[ $PROBE_MODE != checkpoint-production ]] && (( elapsed > latest_start * 60 )); then
+           echo 'Not enough time reserved for stop, hashing, packing, upload and diagnostics.' >&2
+           exit 1
+         fi
+@@ -855,6 +866,7 @@
+         trial_timeout=9m
+         kill_after=2m
+         compile_seconds=0
++        deadline_epoch=
+         if [[ $PROBE_MODE == checkpoint-scale ]]; then
+           trial_timeout=63m
+           kill_after=1m
+@@ -862,11 +874,13 @@
+           trial_timeout=93m
+           kill_after=1m
+         elif [[ $PROBE_MODE == checkpoint-production ]]; then
+-          # Allow time for quiescence, validation, packing, transfer, and the hard job deadline.
+-          compile_seconds=$(( (350 - 80 - 17 - 8) * 60 - elapsed ))
++          # This workflow still uses the old gzip/cache path. Its 105-minute closure
++          # remains until the direct Draft path is integrated and measured separately.
++          deadline_epoch=$(( $(cat "$RUNNER_TEMP/bare-probe-start") + (350 - 105) * 60 ))
++          compile_seconds=$(( deadline_epoch - $(date +%s) ))
+           (( compile_seconds > 0 ))
+           requested_seconds=$((COMPILE_MINUTES * 60))
+-          if (( compile_seconds > requested_seconds )); then
++          if (( requested_seconds > 0 && compile_seconds > requested_seconds )); then
+             compile_seconds=$requested_seconds
+           fi
+           printf 'APK compilation budget: %s seconds\n' "$compile_seconds"
+@@ -881,7 +895,7 @@
+         fi
+         echo "phase=$phase" >> "$GITHUB_OUTPUT"
+         docker compose exec -T -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 \
+-          -e "TRIAL_PHASE=$phase" -e "PROBE_MODE=$PROBE_MODE" -e "COMPILE_SECONDS=$compile_seconds" \
++          -e "TRIAL_PHASE=$phase" -e "PROBE_MODE=$PROBE_MODE" -e "COMPILE_SECONDS=$compile_seconds" -e "COMPILE_STOP_EPOCH=$deadline_epoch" \
+           -e "APK_OUTPUT_GIB=$APK_OUTPUT_GIB" -e "APK_JOBS=$APK_JOBS" chromium-builder \
+           timeout --kill-after="$kill_after" "$trial_timeout" bash -seu <<'CONTAINER'
+         set -o pipefail
+@@ -972,6 +986,13 @@
+         [[ ! -e $final_dir && ! -L $final_dir ]]
+         mkdir -m 700 "$final_dir"
+         [[ $APK_RECIPIENT =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$ ]]
++        if docker compose exec -T chromium-builder python3 -I /exchange/guard.py size apk /work/chromium/src/out/Bare/apks/ChromePublic.apk; then
++          :
++        else
++          status=$?
++          if (( status == 65 )); then echo 'status=apk-size-exceeded' >> "$GITHUB_OUTPUT"; fi
++          exit "$status"
++        fi
+         docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CHROMIUM_REV=$CHROMIUM_REV" \
+           -e "CI_REVISION=$GITHUB_SHA" -e "TRIAL_PHASE=$TRIAL_PHASE" chromium-builder bash -seu <<'CONTAINER' \
+           | age -r "$APK_RECIPIENT" -o "$delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age"
+@@ -1088,7 +1109,13 @@
+         name=Bare-Personal-2.0.4-arm64-v8a.tar.age
+         [[ $(head -n 1 -- "$delivery/$name") == age-encryption.org/v1 ]]
+         encrypted_bytes=$(stat -c %s -- "$delivery/$name")
+-        (( encrypted_bytes > 0 && encrypted_bytes <= 451 * 1024 * 1024 ))
++        if python3 -I "$RUNNER_TEMP/bare-ci/guard.py" size cipher "$delivery/$name"; then
++          echo 'status=sealed' >> "$GITHUB_OUTPUT"
++        else
++          status=$?
++          if (( status == 65 )); then echo 'status=cipher-size-exceeded' >> "$GITHUB_OUTPUT"; fi
++          exit "$status"
++        fi
+         sha=$(sha256sum -- "$delivery/$name" | cut -d ' ' -f 1)
+         mv -T -- "$delivery/$name" "$final_dir/$name"
+         echo "sha=$sha" >> "$GITHUB_OUTPUT"
+@@ -1106,19 +1133,40 @@
+         if-no-files-found: error
+         retention-days: 3
+         compression-level: 0
+-    - name: Record the encrypted APK receipt
+-      if: ${{ steps.apk_upload.outcome == 'success' }}
+-      env:
+-        ENCRYPTED_ID: ${{ steps.apk_upload.outputs.artifact-id }}
++    - name: Resolve the exact encrypted artifact after the upload attempt
++      id: seal_receipt
++      if: ${{ !cancelled() && steps.apk_seal.outputs.ready == 'true' }}
++      timeout-minutes: 2
++      env:
++        GH_TOKEN: ${{ github.token }}
++        RETURNED_ID: ${{ steps.apk_upload.outputs.artifact-id }}
+         ENCRYPTED_SHA: ${{ steps.apk_seal.outputs.sha }}
+         ENCRYPTED_BYTES: ${{ steps.apk_seal.outputs.bytes }}
+       run: |
+-        [[ $ENCRYPTED_ID =~ ^[1-9][0-9]*$ && $ENCRYPTED_SHA =~ ^[0-9a-f]{64}$ && $ENCRYPTED_BYTES =~ ^[1-9][0-9]*$ ]]
+-        printf 'Encrypted APK artifact ID %s, SHA-256 %s, %s bytes\n' \
+-          "$ENCRYPTED_ID" "$ENCRYPTED_SHA" "$ENCRYPTED_BYTES" | tee -a "$GITHUB_STEP_SUMMARY"
++        set -euo pipefail
++        [[ $ENCRYPTED_SHA =~ ^[0-9a-f]{64}$ && $ENCRYPTED_BYTES =~ ^[1-9][0-9]*$ ]]
++        name=bare-personal-204-encrypted-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT
++        id=
++        if [[ $RETURNED_ID =~ ^[1-9][0-9]*$ ]]; then
++          id=$RETURNED_ID
++        else
++          if ! listing=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=$name&per_page=100"); then
++            echo 'Artifact receipt lookup inconclusive; try to preserve the same ciphertext.'
++            exit 0
++          fi
++          id=$(jq -er --arg name "$name" '
++            select(.total_count == (.artifacts|length)) |
++            [.artifacts[]|select(.name==$name and .expired==false)|.id]|unique|
++            if length == 1 then .[0]|tostring elif length == 0 then "" else error("multiple artifact receipts") end' <<<"$listing")
++        fi
++        if [[ -n $id ]]; then
++          [[ $id =~ ^[1-9][0-9]*$ ]]
++          echo "id=$id" >> "$GITHUB_OUTPUT"
++          echo "Candidate artifact $id, ciphertext $ENCRYPTED_SHA ($ENCRYPTED_BYTES B)." >> "$GITHUB_STEP_SUMMARY"
++        fi
+     - name: Check temporary recovery capacity for the encrypted APK
+       id: apk_fallback_budget
+-      if: ${{ always() && steps.apk_seal.outputs.ready == 'true' && steps.apk_upload.outcome != 'success' }}
++      if: ${{ always() && steps.apk_seal.outputs.ready == 'true' && steps.seal_receipt.outcome == 'success' && steps.seal_receipt.outputs.id == '' }}
+       timeout-minutes: 3
+       env:
+         CACHE_READ_TOKEN: ${{ github.token }}
+--- a/.github/workflows/bare-checkpoint-transfer.yml
++++ b/.github/workflows/bare-checkpoint-transfer.yml
+@@ -31,9 +31,9 @@
+         description: Maximum compilation minutes for this segment
+         type: choice
+         default: '180'
+-        options: ['180', '25']
++        options: ['180', '25', '0']
+       build_segments:
+-        description: Maximum sequential build segments (2 requires a verified parent, 180 minutes and two jobs)
++        description: Maximum sequential build segments (2 requires a verified parent, 180 minutes or a job deadline, and two jobs)
+         type: choice
+         default: '1'
+         options: ['1', '2']
+@@ -74,8 +74,8 @@
+       run: |
+         [[ $SEGMENTS == 1 || $SEGMENTS == 2 ]]
+         if [[ $SEGMENTS == 2 ]]; then
+-          [[ $MINUTES == 180 && $JOBS == 2 && $OUTPUT_GIB == 18 && $RETAIN == false ]] || {
+-            echo 'Two segments require 180 minutes, two jobs, 18 GiB and normal cache settings.' >&2
++          [[ ( $MINUTES == 180 || $MINUTES == 0 ) && $JOBS == 2 && $OUTPUT_GIB == 18 && $RETAIN == false ]] || {
++            echo 'Two segments require 180 minutes or the job deadline, two jobs, 18 GiB and normal cache settings.' >&2
+             exit 1
+           }
+           [[ $PARENT_KEY =~ ^bare-coexist-204-[0-9]+-[0-9]+-checkpoint-production(-s2)?$ &&
+@@ -174,14 +174,17 @@
+     steps: &apk_readback_steps
+     - name: Download the exact encrypted APK artifact
+       if: ${{ env.ARTIFACT_ID != '' }}
++      continue-on-error: true
++      id: exact_artifact
+       uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+       timeout-minutes: 10
+       with:
+         artifact-ids: ${{ env.ARTIFACT_ID }}
+-        path: ${{ runner.temp }}/bare-apk-delivery
++        path: ${{ runner.temp }}/bare-apk-artifact
+         merge-multiple: true
+     - name: Restore the exact encrypted APK fallback cache
+-      if: ${{ env.ARTIFACT_ID == '' && env.EXPECTED_CACHE != '' }}
++      if: ${{ !cancelled() && env.EXPECTED_CACHE != '' }}
++      continue-on-error: true
+       id: apk_cached
+       timeout-minutes: 12
+       uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+@@ -192,17 +195,22 @@
+     - name: Verify the exact encrypted APK bytes
+       timeout-minutes: 2
+       env:
++        ARTIFACT_OK: ${{ steps.exact_artifact.outcome }}
+         CACHE_HIT: ${{ steps.apk_cached.outputs.cache-hit }}
+         CACHE_MATCH: ${{ steps.apk_cached.outputs.cache-matched-key }}
+       run: |
+         [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_BYTES =~ ^[1-9][0-9]*$ ]]
+-        if [[ -n $EXPECTED_CACHE ]]; then
+-          [[ $CACHE_HIT == true && $CACHE_MATCH == "$EXPECTED_CACHE" ]]
+-        fi
+-        file="$RUNNER_TEMP/bare-apk-delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age"
+-        [[ -f $file && ! -L $file && $(stat -c %s -- "$file") == "$EXPECTED_BYTES" ]]
+-        [[ $(head -n 1 -- "$file") == age-encryption.org/v1 ]]
+-        printf '%s  %s\n' "$EXPECTED_SHA" "$file" | sha256sum --check --strict
++        (( EXPECTED_BYTES > 0 && EXPECTED_BYTES <= 451 * 1024**2 ))
++        sources=()
++        if [[ -n $ARTIFACT_ID && $ARTIFACT_OK == success ]]; then sources+=(bare-apk-artifact); fi
++        if [[ -n $EXPECTED_CACHE && $CACHE_HIT == true && $CACHE_MATCH == "$EXPECTED_CACHE" ]]; then sources+=(bare-apk-delivery); fi
++        (( ${#sources[@]} > 0 ))
++        for source in "${sources[@]}"; do
++          file="$RUNNER_TEMP/$source/Bare-Personal-2.0.4-arm64-v8a.tar.age"
++          [[ -f $file && ! -L $file && $(stat -c %s -- "$file") == "$EXPECTED_BYTES" ]]
++          [[ $(head -n 1 -- "$file") == age-encryption.org/v1 ]]
++          printf '%s  %s\n' "$EXPECTED_SHA" "$file" | sha256sum --check --strict
++        done
+   production-next:
+     needs: [production, readback]
+     if: >-
+@@ -229,7 +237,7 @@
+       apk_recipient: ${{ inputs.apk_recipient }}
+       apk_output_gib: 18
+       apk_jobs: 2
+-      compile_minutes: 180
++      compile_minutes: ${{ fromJSON(inputs.compile_minutes) }}
+       retain_existing_caches: false
+   readback-next:
+     name: Read back the second continuation on a fresh runner
