@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 READ = ("bare-round26-zstd-six-receiver.yml", "8f74cb7a6c871e77fa6e58232b0f3d863124c74652f132d4e024570839de9c7d", "zstd_read")
 ARCHIVE = ("bare-round26-transport-check.yml", "39ee444aaf7a9c9d7ee92706b29b8b801077ac001aba2a1bb32a9d90aa017f57", "archive_send")
@@ -15,11 +16,7 @@ IDENTITY = "a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc"
 S2_SHA = "4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf"
 
 
-def commands(pin):
-    name, want, job = pin
-    data = (ROOT / ".github" / "workflows" / name).read_bytes()
-    if hashlib.sha256(data).hexdigest() != want:
-        raise ValueError("Reviewed environment recipe does not match " + name)
+def parse_recipe(data):
     try:
         import yaml
         payload = yaml.safe_load(data)
@@ -29,12 +26,23 @@ def commands(pin):
                                  "puts JSON.generate(YAML.safe_load(STDIN.read, aliases: true))"],
                                 input=data, stdout=subprocess.PIPE, check=True)
         payload = json.loads(result.stdout)
-    return {step["name"]: step.get("run") for step in payload["jobs"][job]["steps"]}
+    return payload
 
 
-def shell(script, **env):
-    subprocess.run(["bash", "-euo", "pipefail", "-c", script],
-                   env={**os.environ, **env}, check=True)
+def commands(pin):
+    name, want, job = pin
+    data = (ROOT / ".github" / "workflows" / name).read_bytes()
+    if hashlib.sha256(data).hexdigest() != want:
+        raise ValueError("Reviewed environment recipe does not match " + name)
+    return {step["name"]: step.get("run") for step in parse_recipe(data)["jobs"][job]["steps"]}
+
+
+def shell(script, *, label="fixed setup step", **env):
+    # Preserve command input semantics while keeping the entire embedded CI and
+    # transport program out of exceptions. No command body or token in failures.
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], env={**os.environ, **env})
+    if result.returncode:
+        raise SystemExit(f"{label} failed (exit {result.returncode}); inspect the preceding stage diagnostic")
 
 
 def once(script, old, new):
@@ -64,11 +72,38 @@ def stage_tools():
     print("Verified full producer, receiver, private read and anonymous check interfaces")
 
 
+def uid_preflight():
+    runner = os.getuid()
+    if runner in (0,1000):
+        raise ValueError("Expected runner identity distinct from builder UID 1000")
+    # Isolate this synthetic cross-UID fixture; no chmod of private source,
+    # existing cache, archive or signer material.
+    with tempfile.TemporaryDirectory(prefix="bare28-export-check-",dir="/tmp") as name:
+        path=Path(name)
+        path.chmod(0o755)
+        script=path/"fixture.py"
+        script.write_bytes((ROOT/"preflight28/transport/trial_provenance.py").read_bytes())
+        script.chmod(0o644)
+        folder=path/"builder"
+        folder.mkdir(mode=0o755)
+        subprocess.run(["sudo","-n","chown","1000:1000",str(folder)],check=True)
+        try:
+            subprocess.run(["sudo","-n","-u","#1000","python3","-I",str(script),"fixture-write",str(folder)],check=True)
+            subprocess.run(["python3","-I",str(script),"fixture-read",str(folder)],check=True)
+        finally:
+            # Restore ownership of the synthetic directory to permit normal
+            # TemporaryDirectory cleanup. No other object is touched.
+            subprocess.run(["sudo","-n","chown",f"{runner}:{os.getgid()}",str(folder)],check=True)
+
+
 def setup(stage):
+    uid_preflight()
     steps = commands(READ)
     shell(steps["Acquire all six pinned payloads before the cache and source checkout"])
     shell(steps["Stage the reviewed fixed-index Ubuntu package verifier"])
-    shell(steps["Prepare the reviewed dual-format reader and metadata checks"], SOURCE_REV=OLD)
+    dual = steps["Prepare the reviewed dual-format reader and metadata checks"]
+    dual = once(dual, "cat > \"$RUNNER_TEMP/dual-reader.patch\"", 'install -m 0644 checkpoint.py frozen-checkpoint.py\ncat > "$RUNNER_TEMP/dual-reader.patch"')
+    shell(dual, SOURCE_REV=OLD, label="stage dual reader")
     data = json.loads((TEMP / "r28-child.json").read_text()) if stage == "receive" else {}
     archive = TEMP / ("r28-child.tar.zst" if stage == "receive" else "bare-official/exchange/checkpoint/checkpoint.tar.gz")
     sha = data["sha256"] if data else S2_SHA
@@ -83,7 +118,8 @@ def setup(stage):
     subprocess.run(["sha256sum", "--strict", "--check"], check=True,
                    input=f"{sha}  {archive}\n", text=True)
     for action, args in [("validate-archive", []), ("verify-continuation", ["--expected-identity", identity, "--ci-revision", revision])]:
-        subprocess.run([sys.executable, "-I", str(check), action, str(archive), "--production", *args], check=True, env=env)
+        prefix = [str(check)] if stage == "produce" else [str(ROOT/"preflight28/bridge/check_archive.py"), str(check.with_name("frozen-checkpoint.py"))]
+        subprocess.run([sys.executable, "-I", *prefix, action, str(archive), "--production", *args], check=True, env=env)
     script = steps["Verify producer provenance, Ninja reuse and fresh compile progress"]
     start = script.index("# These exact APK graph objects")
     script = script[:start] + (ROOT / "preflight28/transport/build-tail.sh").read_text()
@@ -93,7 +129,17 @@ def setup(stage):
     script = once(script, 'cp "$ci/"*.py "$ci/"*.yml exchange/', '''cp "$ci/"*.py "$ci/"*.yml exchange/
 install -m 644 "$GITHUB_WORKSPACE/preflight28/graph/graph.py" exchange/graph.py
 install -m 644 "$GITHUB_WORKSPACE/preflight28/graph/retained.py" exchange/retained.py
-install -m 644 "$GITHUB_WORKSPACE/preflight28/limits/guard.py" exchange/guard.py''')
+install -m 644 "$GITHUB_WORKSPACE/preflight28/limits/guard.py" exchange/guard.py
+install -m 644 "$GITHUB_WORKSPACE/preflight28/transport/trial_provenance.py" exchange/trial_provenance.py
+install -m 644 "$RUNNER_TEMP/r28-trial-inputs.json" exchange/trial-inputs.json''')
+    # The build UID alone writes exchange/checkpoint. The hosted runner reads
+    # three explicitly exported scalar receipts through a traversable directory.
+    script = once(script, "chmod 777 exchange/checkpoint", """sudo -n chown 1000:1000 exchange/checkpoint
+sudo -n chmod 0755 exchange/checkpoint
+[[ $(stat -c %a exchange/checkpoint) == 755 ]]
+""")
+    # Legacy gzip omitted GN packaging descriptors. Private v2 preserves them.
+    script = once(script, "gn gen out/Bare\ncmp -- /exchange/args.gn", 'if [[ $R28_ROLE == produce ]]; then gn gen out/Bare; fi\ncmp -- /exchange/args.gn')
     # The 26-minute timeout was for legacy restore-only assertions. The new bounded
     # graph planner and one edge run inside the per-job guard and a 95-minute cap.
     i = script.index("zstd -qdc -M128MB")
@@ -104,7 +150,11 @@ decode_input | docker compose exec''')
     i = script.index("decode_input |")
     script = script[:i] + once(script[i:], '-e "CI_REVISION=$PRODUCER_REV"', '''-e "CI_REVISION=$INPUT_REVISION" -e TRIAL_SHA -e R28_ROLE -e JOB_STARTED''')
     script = script[:i] + once(script[i:], 'timeout --kill-after=2m 26m', 'timeout --kill-after=2m 95m')
-    shell(script, R28_ROLE=stage, R28_ARCHIVE=str(archive), INPUT_REVISION=revision,
+    from trial_provenance import WORKFLOW, encoded, expected
+    workflow=ROOT/WORKFLOW
+    inputs=expected(ROOT, os.environ["TRIAL_SHA"], script, parse_recipe(workflow.read_bytes()), [READ[:2], ARCHIVE[:2]])
+    (TEMP/"r28-trial-inputs.json").write_bytes(encoded(inputs))
+    shell(script, label="S2 "+stage, R28_ROLE=stage, R28_ARCHIVE=str(archive), INPUT_REVISION=revision,
           INPUT_IDENTITY=identity, ZSTD_SHA=sha, BARE_R26_TAR_CEILING=env["BARE_R26_TAR_CEILING"])
 
 

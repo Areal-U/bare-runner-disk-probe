@@ -30,12 +30,12 @@ PY
   python3 /exchange/graph.py receive --out out/Bare --proof "$proof"
 fi
 python3 /exchange/checkpoint.py check-gn-packaging out/Bare
-cp out/Bare/checkpoint-provenance.json /exchange/checkpoint/child-provenance.json
-sha256sum "$proof" | cut -d' ' -f1 > /exchange/checkpoint/graph-sha.txt
+python3 /exchange/trial_provenance.py "$R28_ROLE"
 CONTAINER
 cd "$RUNNER_TEMP/bare-official"
 if [[ $R28_ROLE == produce ]]; then
-  tail -n 1 exchange/checkpoint/resource-events.jsonl
+  echo "stage=producer-quiesce"
+  docker compose exec -T chromium-builder tail -n 1 /exchange/checkpoint/resource-events.jsonl
   container=chromium-android-builder
   volume=$(docker inspect "$container" --format '{{range .Mounts}}{{if eq .Destination "/work"}}{{.Name}}{{end}}{{end}}')
   [[ -n $volume ]]
@@ -45,26 +45,34 @@ if [[ $R28_ROLE == produce ]]; then
   [[ $(docker inspect "$container" --format '{{.State.Running}}') == false ]]
   docker start "$container"
   docker compose exec -T chromium-builder true
-  start=$(cat exchange/checkpoint/pack-start.epoch)
+  start=$(docker compose exec -T chromium-builder cat /exchange/checkpoint/pack-start.epoch)
+  for name in child-provenance.json graph-sha.txt trial-provenance-sha.txt; do
+    [[ -f exchange/checkpoint/$name && ! -L exchange/checkpoint/$name && -r exchange/checkpoint/$name ]]
+    [[ $(stat -c %a "exchange/checkpoint/$name") == 644 ]]
+  done
+  echo "stage=private-pack receipt_access=verified"
   python3 "$GITHUB_WORKSPACE/preflight28/limits/guard.py" space "$RUNNER_TEMP" --bytes $((7 * 1024**3 / 2)) --inodes 2
   docker compose exec -T chromium-builder bash -euc '
     cd /work/chromium/src
-    tar --format=posix --pax-option=delete=atime,delete=ctime --exclude=out/Bare/apks \
-      --exclude="*.[aA][pP][kK]" --exclude="*.[aA][pP]_" --exclude="*.[aA][aA][bB]" \
-      --exclude="*.[aA][pP][kK][sS]" -cf - out/Bare
+    [[ ! -e out/Bare/apks/ChromePublic.apk && ! -L out/Bare/apks/ChromePublic.apk ]]
+    tar --format=posix --pax-option=delete=atime,delete=ctime -cf - out/Bare
   ' | zstd -q -T2 -9 -c | python3 "$GITHUB_WORKSPACE/preflight28/transport/stream.py" "$RUNNER_TEMP/r28-child.tar.zst"
   file="$RUNNER_TEMP/r28-child.tar.zst"
   python3 "$GITHUB_WORKSPACE/preflight28/limits/guard.py" size checkpoint "$file"
   identity=$(jq -er .identity_sha256 exchange/checkpoint/child-provenance.json)
   revision=$(jq -er .identity.ci_revision exchange/checkpoint/child-provenance.json)
   [[ $revision == "$TRIAL_SHA" ]]
-  python3 -I "$RUNNER_TEMP/bare-zstd-tools/checkpoint.py" validate-archive "$file" --production
-  python3 -I "$RUNNER_TEMP/bare-zstd-tools/checkpoint.py" verify-continuation "$file" --production \
+  echo "stage=private-archive-validate"
+  verify=("$GITHUB_WORKSPACE/preflight28/bridge/check_archive.py" "$RUNNER_TEMP/bare-zstd-tools/frozen-checkpoint.py")
+  python3 -I "${verify[@]}" validate-archive "$file" --production
+  python3 -I "${verify[@]}" verify-continuation "$file" --production \
      --expected-identity "$identity" --ci-revision "$revision"
   echo "packed_validated_seconds=$(($(date +%s)-start)) bytes=$(stat -c%s "$file") input_identity=$identity"
   df -B1 -- "$RUNNER_TEMP"
   df -Pi -- "$RUNNER_TEMP"
 else
+  echo "stage=independent-trial-provenance"
+  [[ $(cat exchange/checkpoint/trial-provenance-sha.txt) == "$(jq -er .trial_provenance_sha "$RUNNER_TEMP/r28-child.json")" ]]
   [[ $(cat exchange/checkpoint/graph-sha.txt) == "$(jq -er .graph_sha "$RUNNER_TEMP/r28-child.json")" ]]
 fi
 # These containers receive no GitHub credentials. Shut them down before a scoped
