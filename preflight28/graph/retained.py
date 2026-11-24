@@ -180,9 +180,14 @@ def archives(parent_path, child_path, parent_sha, child_sha):
         if (not isinstance(item,list) or len(item) != 2 or name not in child
                 or not child[name].startswith("f:") or child[name].split(":")[2:] != [str(item[0]), item[1]]):
             raise ValueError("Historical output group does not match archived bytes")
+    child_content = commitment(child)
+    if proof["format"] == "bare-28-apk-frontier-2" and proof.get("child_content") != child_content:
+        raise ValueError("Archive differs from complete producer quiescent content commitment")
+    # Original gzip can omit GN descriptors. Its physical members must survive;
+    # v2 additionally authenticates the reconstructed and newly built files.
     replacements = compare_payload(parent, child, set(proof["outputs"]))
     return {"parent_sha":parent_sha, "child_sha":child_sha, "parent_content":commitment(parent),
-            "child_content":commitment(child), "matched_before":len(parent)-len(replacements),
+            "child_content":child_content, "matched_before":len(parent)-len(replacements),
             "replaced":replacements, "new_files":len(child)-len(parent)}
 
 

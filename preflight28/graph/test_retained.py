@@ -56,6 +56,15 @@ class ArchiveTest(unittest.TestCase):
             with patch.object(retained,"S2",psha):
                 row = retained.archives(parent,child,psha,csha)
                 self.assertEqual((row["matched_before"],row["replaced"],row["new_files"]),(4,[],1))
+                proof.update(format="bare-28-apk-frontier-2",child_content=row["child_content"])
+                child2,sha2=self.write(root,"child2",bodies,proof)
+                self.assertEqual(retained.archives(parent,child2,psha,sha2)["matched_before"],4)
+                bodies["obj/unknown"]=b"uncommitted addition"
+                extra,extra_sha=self.write(root,"extra",bodies,proof)
+                with self.assertRaisesRegex(ValueError,"complete producer"):
+                    retained.archives(parent,extra,psha,extra_sha)
+                del bodies["obj/unknown"]
+                proof["format"]="bare-28-apk-frontier-1"
                 bodies["obj/a"] = b"X"
                 bad, bsha = self.write(root,"bad",bodies,proof)
                 with self.assertRaisesRegex(ValueError,"Unaccounted retained"):
