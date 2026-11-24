@@ -59,7 +59,7 @@ class NormalSegmentTest(unittest.TestCase):
         metrics = self.report.parent / "siso-metrics-restore.json"
         subprocess.run([*self.command, "-C", str(self.out), "-metrics_json", str(metrics),
                         "obj/b.o", "obj/c.o"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.report.write_text(json.dumps({"target":"chrome_public_apk", "phase":"restore",
+        self.report.write_text(json.dumps({"target":"chrome_public_apk", "phase":"restore","reason":"time-limit",
                           "container_quiescence_verified":True, "ready_for_restore_test":True,
                           "failed_step_count":0, "forced_kill":False,"metrics_path":str(metrics)}))
         evidence = finish(self.out, self.baseline, self.report, self.command)
@@ -90,6 +90,19 @@ class NormalSegmentTest(unittest.TestCase):
         Path("included.h").write_text("changed")
         with self.assertRaisesRegex(ValueError, "dirty"):
             self.receive("invalid-deps.json")
+
+    def test_clean_interruption_without_progress_has_no_child(self):
+        begin(self.out, self.baseline, self.parent, self.command, bootstrap=True)
+        report = {"target":"chrome_public_apk", "phase":"restore", "reason":"time-limit",
+                  "ready_for_restore_test":False, "failed_step_count":0, "forced_kill":False}
+        self.report.write_text(json.dumps(report))
+        self.assertEqual(finish(self.out, self.baseline, self.report, self.command,
+                                host_quiesced=True)["frontier_status"], "no-progress")
+        self.assertFalse((self.out/PROOF).exists())
+        report["reason"] = "oom-kill"
+        self.report.write_text(json.dumps(report))
+        with self.assertRaises(ValueError):
+            finish(self.out, self.baseline, self.report, self.command, host_quiesced=True)
 
     def test_missing_proof_cannot_bootstrap_recovery(self):
         with self.assertRaisesRegex(ValueError, "lacks"):

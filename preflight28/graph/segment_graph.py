@@ -137,20 +137,27 @@ def successful_witnesses(out, metrics, removed):
     return witnesses
 
 
-def finish(out, baseline, trial, command):
+def finish(out, baseline, trial, command, *, host_quiesced=False):
     base = load(baseline)
     report = load(trial, 128 * 1024**2)
     if (base["format"] != FORMAT or base["target"] != TARGET
             or fixed_graph(out) != base["graph"]):
         raise ValueError("fixed graph changed in this segment")
-    if (report.get("target") != TARGET or report.get("container_quiescence_verified") is not True
-            or report.get("ready_for_restore_test") is not True or report.get("forced_kill") is not False
-            or report.get("failed_step_count") != 0):
+    if (report.get("target") != TARGET
+            or not (host_quiesced or report.get("container_quiescence_verified") is True)
+            or report.get("forced_kill") is not False or report.get("controller_error")
+            or report.get("close", {}).get("errors") or report.get("failed_step_count") != 0
+            or report.get("reason") not in {"time-limit","disk-limit","output-limit","output-entry-limit"}):
         raise ValueError("incomplete segment has no clean, quiescent controller result")
     before = digests(base["before"])
     after = plan(out, command)
+    if after == before:
+        return {"frontier_status": "no-progress", "candidate_progress": False,
+                "parent_dirty": len(before), "child_dirty": len(after)}
     if not after < before:
-        raise ValueError("full APK frontier did not strictly advance")
+        raise ValueError("full APK frontier regressed")
+    if report.get("ready_for_restore_test") is not True:
+        raise ValueError("controller did not authorize interrupted checkpoint")
     phase = report["phase"]
     if phase not in ("seed", "restore"):
         raise ValueError("unexpected controller phase")
@@ -163,7 +170,7 @@ def finish(out, baseline, trial, command):
             raise ValueError("completed output group is still dirty")
     evidence = {**base, "after": sorted(after), "witnesses": witnesses}
     write_record(out / PROOF, evidence)
-    return {"candidate_progress": True, "parent_dirty": len(before), "child_dirty": len(after),
+    return {"frontier_status": "candidate", "candidate_progress": True, "parent_dirty": len(before), "child_dirty": len(after),
             "advanced_edges": len(before - after), "proof_sha256": canonical(evidence)}
 
 
@@ -179,10 +186,12 @@ if __name__ == "__main__":
     p = sub.add_parser("after")
     p.add_argument("--baseline", type=Path, required=True)
     p.add_argument("--trial", type=Path, required=True)
+    p.add_argument("--host-quiesced", action="store_true")
     args = parser.parse_args()
     if args.operation == "before":
         result = begin(args.out.resolve(), args.baseline, args.parent_sha, ["autoninja"],
                        bootstrap=args.bootstrap, verify_only=args.verify_only)
     else:
-        result = finish(args.out.resolve(), args.baseline, args.trial, ["autoninja"])
+        result = finish(args.out.resolve(), args.baseline, args.trial, ["autoninja"],
+                        host_quiesced=args.host_quiesced)
     print(json.dumps(result, sort_keys=True))
