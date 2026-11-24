@@ -45,7 +45,7 @@ LARGE_TIME_LIMIT = 5400
 LARGE_OUTPUT_LIMIT = 6 * 1024 ** 3
 LARGE_OUTPUT_ENTRY_LIMIT = 300_000
 LARGE_MIN_FREE_BYTES = 20 * 1024 ** 3
-PRODUCTION_TIME_LIMIT = 180 * 60
+PRODUCTION_TIME_LIMIT = 310 * 60  # absolute upper bound before the mandatory direct-route closure
 PRODUCTION_DEFAULT_OUTPUT_LIMIT = 11 * 1024 ** 3
 PRODUCTION_OUTPUT_LIMIT = 18 * 1024 ** 3
 PRODUCTION_OUTPUT_ENTRY_LIMIT = 525_000
@@ -163,6 +163,12 @@ def update_siso_status(progress, chunk):
         progress["step_counter"] = int(match[1])
         progress["graph_total"] = int(match[2])
         description = match[4].decode("utf-8", errors="replace")
+        if re.search(r"(?:^|[ /_.:-])(?:DEX|R8|D8|LINK|SOLINK)(?:[ /_.:-]|$)", description, re.I):
+            active = progress.setdefault("terminal_actions", set())
+            if match[3] == b"S":
+                active.add(description)
+            else:
+                active.discard(description)
         if match[3] == b"S" and description.startswith(("LINK ", "SOLINK ")):
             progress["link_action"] = description
             progress["link_started"] = time.monotonic()
@@ -452,6 +458,16 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
     last_console_progress = started
     progress = {}
     try:
+        guard = None
+        deadline = None
+        if production:
+            import runpy
+            guard = runpy.run_path(str(Path(__file__).with_name("guard.py")))
+            if epoch := os.environ.get("COMPILE_STOP_EPOCH"):
+                remaining = int(epoch) - time.time()
+                if remaining > PRODUCTION_TIME_LIMIT:
+                    raise ValueError("Compile deadline exceeds one runner job")
+                deadline = time.monotonic() + remaining
         if phase not in {"seed", "restore"} or seconds <= 0 or sample_seconds <= 0:
             raise ValueError("Invalid trial phase or time budget")
         if sum((scale, large, production)) > 1:
@@ -495,6 +511,12 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                 result["resources_before"]["free_inodes"] < PRODUCTION_MIN_FREE_INODES):
             result["reason"] = "preflight-disk-limit"
             return result
+        if production:
+            level, _ = guard['pressure']({'estimate': snapshot['archive_input_estimate_bytes'],
+                                          'entries': snapshot['entries']}, guard['disk'](source_root), False)
+            if level == 'stop' or (deadline is not None and time.monotonic() >= deadline):
+                result['reason'] = 'preflight-resource-or-time'
+                return result
         log_path.parent.mkdir(parents=True, exist_ok=True)
         arguments = command if command is not None else [
             "autoninja", "-C", str(BUILD_DIR), "-j", str(jobs),
@@ -511,6 +533,11 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             selector.register(process.stdout, selectors.EVENT_READ)
             interrupted_at = None
             last_sample = 0
+            last_guard_sample = snapshot
+            last_resource_poll = 0
+            level = 'normal'
+            if production:
+                sample_seconds = 30
             leader_exited_at = None
             while True:
                 now = time.monotonic()
@@ -519,11 +546,22 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                     reason = None
                     if received_signals:
                         reason = "controller-interrupted"
-                    elif now - started >= seconds:
+                    elif now - started >= seconds or (deadline is not None and now >= deadline):
                         reason = "time-limit"
-                    elif now - last_sample >= sample_seconds:
+                    if not reason and production and now - last_resource_poll >= 0.5:
+                        last_resource_poll = now
+                        fs = guard['disk'](source_root)
+                        level, sample_seconds = guard['pressure'](
+                            {'estimate': last_guard_sample['archive_input_estimate_bytes'],
+                             'entries': last_guard_sample['entries']}, fs, bool(progress.get('terminal_actions')))
+                        if level == 'stop':
+                            reason = 'disk-limit' if fs['free_bytes']-min_free_bytes <= guard['STOP_MARGIN'] or fs['free_inodes']-PRODUCTION_MIN_FREE_INODES <= guard['STOP_ENTRIES'] else 'output-limit'
+                    if not reason and now - last_sample >= sample_seconds:
                         sample = tree_snapshot(output, include_paths=False)
                         sample.pop("paths")
+                        last_guard_sample = sample
+                        if production:
+                            result['monitor_interval_seconds'] = sample_seconds
                         free = shutil.disk_usage(source_root).free
                         result["last_sample"] = {**sample, "free_bytes": free}
                         if production:
@@ -710,11 +748,13 @@ def main():
     if args.jobs == 1 and not args.production:
         parser.error("--jobs 1 requires --production")
     time_limit, output_limit, entry_limit, disk_floor = trial_limits(args.scale, args.large, args.production)
-    seconds = args.seconds if args.seconds is not None else (time_limit if expanded else 180)
+    seconds = args.seconds if args.seconds is not None else (180 * 60 if args.production else time_limit if expanded else 180)
     default_output = PRODUCTION_DEFAULT_OUTPUT_LIMIT if args.production else output_limit
     max_output_bytes = args.max_output_bytes if args.max_output_bytes is not None else default_output
     max_output_entries = args.max_output_entries if args.max_output_entries is not None else entry_limit
     min_free_bytes = args.min_free_bytes if args.min_free_bytes is not None else disk_floor
+    if args.production and seconds > 180 * 60 and not os.environ.get("COMPILE_STOP_EPOCH"):
+        parser.error("Extended compile time requires a verified absolute job deadline")
     if not 1 <= seconds <= time_limit:
         parser.error(f"--seconds must be between 1 and {time_limit}")
     if not 1 <= max_output_bytes <= output_limit or min_free_bytes < disk_floor:
