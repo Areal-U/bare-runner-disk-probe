@@ -76,6 +76,38 @@ def inventory(path, collection):
     raise ValueError("Unbounded inventory")
 
 
+S2_IDENTITY = "a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc"
+
+
+def last_private_slot(jobs, receipts, run, sha, artifacts):
+    # A partial publication can only belong to a producer that actually started.
+    # Slot 13 verifies a parent only and has no publishable next generation.
+    pattern = re.compile(r"^Bounded build segment ([1-9]|1[0-2]) /")
+    candidates = [int(m[1]) for j in jobs if (m := pattern.match(j["name"])) and j["run_id"] == run and
+                  j["run_attempt"] == 1 and j.get("conclusion") != "skipped" and any(
+                      s.get("name") == "Issue time-limited parent read descriptors bound to the peer" and
+                      s.get("conclusion") == "success" for s in j.get("steps", []))]
+    if not candidates:
+        return {}
+    n = max(candidates)
+    if n == 1:
+        parent, identity = S2_SHA, S2_IDENTITY
+    else:
+        previous = [r for r in receipts if r["ordinal"] == n-1 and r["status"]=="candidate" and r["producer_sha"]==sha]
+        require(len(previous)==1, "Unconfirmed predecessor for private recovery")
+        parent,identity=previous[0]["sha"],previous[0]["identity"]
+    found = [a for a in artifacts if a["name"] == f"r28-{run}-a1-s{n:02}-outcome"]
+    require(len(found)<=1, "Conflicting encrypted candidate artifacts")
+    result = {"private_ordinal": n, "private_parent": parent, "private_identity": identity}
+    if found:
+        a,=found
+        require(a["workflow_run"]["id"] == run and a["workflow_run"]["head_sha"] == sha and
+                re.fullmatch(r"sha256:[a-f0-9]{64}", a.get("digest") or ""), "Unbound private trial envelope")
+        result.update(private_outcome_asset_id=a["id"], private_outcome_expires_at=a["expires_at"],
+                      private_outcome_expired=a["expired"], private_outcome_outer_digest=a["digest"])
+    return result
+
+
 def salvage(outcome, jobs, artifacts, run, head, read_log):
     pattern = re.compile(r"bare-personal-204-encrypted-" + str(run) + r"-1-s([1-9]|1[0-2])")
     matches = [(a, int(m[1])) for a in artifacts if (m := pattern.fullmatch(a["name"]))]
@@ -127,6 +159,8 @@ def main():
     outcome = follow(receipts, run, sha)
     artifacts = inventory(f"actions/runs/{run}/artifacts", "artifacts")
     outcome = salvage(outcome, jobs, artifacts, run, sha, lambda j: get(f"actions/jobs/{j}/logs"))
+    if outcome["status"] == "recovery-no-terminal":
+        outcome.update(last_private_slot(jobs, receipts, run, sha, artifacts))
     aid = outcome.get("cipher_id", "")
     if aid:
         artifact = json.loads(get("actions/artifacts/" + aid))
@@ -141,7 +175,8 @@ def main():
             require(outcome.get("cipher_cache"), "Artifact expired; check the private recipient's durable copy")
     print("R28_READ_ONLY_RECOVERY " + json.dumps(outcome, sort_keys=True))
     with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-        for k in ("status", "cipher_id", "cipher_cache", "cipher_sha", "cipher_bytes"):
+        for k in ("status", "cipher_id", "cipher_cache", "cipher_sha", "cipher_bytes",
+                  "private_ordinal", "private_parent", "private_identity"):
             print(f"{k}={outcome.get(k,'')}",file=f)
 
 

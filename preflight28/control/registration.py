@@ -24,8 +24,9 @@ def instant(value):
 
 def bind(helper, env, event, now):
     aid, digest = env["REGISTRATION_ASSET_ID"], env["REGISTRATION_SHA"]
-    require(re.fullmatch(r"[1-9][0-9]{0,18}", aid) and re.fullmatch("[0-9a-f]{64}", digest),
-            "Missing or invalid pre-registered private collection ticket")
+    require((not aid and not digest) or
+            (re.fullmatch(r"[1-9][0-9]{0,18}", aid) and re.fullmatch("[0-9a-f]{64}", digest)),
+            "Supply both private ticket identifiers together or leave both empty")
     run, revision = int(env["GITHUB_RUN_ID"]), env["GITHUB_SHA"]
     require(env["GITHUB_RUN_ATTEMPT"] == "1" and run > 0 and re.fullmatch("[0-9a-f]{40}", revision)
             and env["GITHUB_JOB"] == "bind-private-receiver" and env["GITHUB_REPOSITORY"] == REPO
@@ -39,10 +40,16 @@ def bind(helper, env, event, now):
             and all(api["actor"].get(k) == v for k,v in OWNER.items())
             and api["repository"]["id"] == api["head_repository"]["id"] == REPO_ID, "Unconfirmed physical run")
     release = helper.draft(RELEASE_ID)
-    found = [x for x in release["assets"] if x.get("id") == int(aid)]
-    require(len(found) == 1, "Registration ID does not exist in the private owner Draft")
+    expected_name = CAMPAIGN + "-collection-registration.json"
+    found = [x for x in release["assets"] if x.get("name") == expected_name]
+    require(len(found) == 1, "Expected one owner collection ticket for this campaign")
     asset = found[0]
-    require(asset["name"] == CAMPAIGN + "-collection-registration.json" and 0 < asset["size"] <= 4096
+    if not aid:
+        aid = str(asset["id"])
+        digest = (asset.get("digest") or "").removeprefix("sha256:")
+        require(asset.get("digest") == "sha256:" + digest and re.fullmatch("[0-9a-f]{64}", digest),
+                "Service did not attest the discovered ticket digest")
+    require(asset.get("id") == int(aid) and int(aid) > 0 and 0 < asset["size"] <= 4096
             and all((asset.get("uploader") or {}).get(k) == v for k,v in OWNER.items()),
             "Missing owner-issued collection registration")
     helper.asset_info(release, asset["name"], asset["size"], digest, int(aid))

@@ -9,7 +9,8 @@ import unittest
 import yaml
 
 from admission import S2_SHA
-from recover import follow, salvage
+from recover import follow, salvage, last_private_slot
+from recover_private import read_only
 
 HERE = Path(__file__).resolve().parents[2]
 if not (HERE/".github/workflows/bare-r28-native-slot.yml").exists():
@@ -88,6 +89,11 @@ class NativeTests(unittest.TestCase):
                 for step in job.get("steps", []):
                     if step.get("shell") == "python":
                         compile(step["run"], step.get("name", "workflow step"), "exec")
+        for job in CALLER["jobs"].values():
+            if job.get("uses") in ("./.github/workflows/bare-arm64-probe.yml","./.github/workflows/bare-r28-native-slot.yml"):
+                self.assertEqual(job["permissions"], {"actions":"read","contents":"write"})
+        self.assertEqual(ARM["jobs"]["compile-probe"]["permissions"], {"actions":"read"})
+        self.assertEqual(ARM["jobs"]["draft-publisher"]["permissions"], {"actions":"read","contents":"write"})
         for name in ("slot01", "production"):
             self.assertIn("bind-private-receiver",CALLER["jobs"][name]["needs"])
             self.assertIn("claim_asset_id",CALLER["jobs"][name]["if"])
@@ -99,6 +105,22 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(record(n,2,backend="draft")[1]["manifest_id"],"409")
         o["private_readback_verified"]="false"
         self.assertNotEqual(record(n,2,backend="draft")[0].returncode,0)
+
+    def test_partial_private_publication_is_recovered_with_only_gets(self):
+        job=dict(id=18,run_id=77,run_attempt=1,name="Bounded build segment 2 / Private checkpoint receipt for slot 2",
+                 conclusion="failure",steps=[dict(name="Issue time-limited parent read descriptors bound to the peer",conclusion="success")])
+        receipt=dict(ordinal=1,status="candidate",producer_sha=REV,sha="c"*64,identity="d"*64)
+        out=last_private_slot([job],[receipt],77,REV,[])
+        self.assertEqual((out["private_ordinal"],out["private_parent"],out["private_identity"]),(2,"c"*64,"d"*64))
+        with self.assertRaises(ValueError): last_private_slot([job],[],77,REV,[])
+        calls=[]
+        client=read_only(lambda *args,**kwargs: calls.append(args[1]))
+        client("api","GET","/test",auth=True)
+        with self.assertRaises(ValueError): client("api","POST","/test",body=b"")
+        self.assertEqual(calls,["GET"])
+        recovery=CALLER["jobs"]["recover-draft-checkpoint"]
+        self.assertIn("github.run_attempt != '1'",recovery["if"])
+        self.assertFalse(any("publish" in step.get("run","") or "upload" in step.get("uses","") for step in recovery["steps"]))
 
     def test_original_seal_can_be_salvaged_after_verifier_failed(self):
         initial=dict(status="recovery-no-terminal",accepted_parent=S2_SHA)

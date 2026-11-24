@@ -20,7 +20,7 @@ class OwnerDraft:
     def data(self): return json.dumps(self.ticket).encode()
     def draft(self, rid):
         assert rid == RELEASE_ID
-        return {"assets":[dict(self.asset,size=len(self.data()))]}
+        return {"assets":[dict(self.asset,size=len(self.data()),digest="sha256:"+hashlib.sha256(self.data()).hexdigest())]}
     def asset_info(self, release, name, size, sha, aid):
         assert len(self.data()) == size and aid == 901
     def metadata(self, path): return self.origin
@@ -44,6 +44,14 @@ class TicketTests(unittest.TestCase):
         holder=claim.call_args.args[1]
         self.assertEqual((holder["run_id"],holder["producer_attempt"],holder["ticket_asset_id"]),(81,1,901))
         self.assertEqual(claim.call_args.kwargs["name"],CLAIM)
+    @patch("registration.admit",return_value=92)
+    def test_dispatch_with_defaults_discovers_exact_owner_ticket(self, claim):
+        self.env.update(REGISTRATION_ASSET_ID="",REGISTRATION_SHA="")
+        self.assertEqual(bind(self.d,self.env,self.event,self.now)[0],92)
+        self.assertEqual(claim.call_args.args[1]["ticket_asset_id"],901)
+        asset=self.d.draft(RELEASE_ID)["assets"][0]
+        with patch.object(self.d,"draft",return_value={"assets":[asset,asset]}), self.assertRaises(ValueError):
+            bind(self.d,self.env,self.event,self.now)
     @patch("registration.admit")
     def test_ticket_not_prepared_earlier_or_wrong_actor_or_expired(self, claim):
         for target, key, bad in [(self.d.asset,"created_at","2026-11-25T01:04:00Z"),
