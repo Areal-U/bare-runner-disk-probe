@@ -331,6 +331,55 @@ def verify_outputs(mid,sha_manifest):
              checkpoint_advanced="true")
 
 
+def put_json(suffix, record):
+    raw=json.dumps(record,sort_keys=True,separators=(",",":")).encode("ascii")
+    return put(suffix,io.BytesIO(raw),0,len(raw),hashlib.sha256(raw).hexdigest())
+
+
+def existing(rel, suffix):
+    base=stem()+"-"+suffix
+    found=[row for row in rel["assets"] if row["name"] in (base,base+"-retry1") and row["state"]=="uploaded"]
+    b.require(len(found)<=1,"Ambiguous private generation intent or committed object")
+    return found[0] if found else None
+
+
+def recovered_intent(rel):
+    row=existing(rel,"intent.json")
+    if not row:
+        return False
+    api=b.auth_api()
+    b.require(0<row["size"]<32768 and row["digest"].startswith("sha256:"),"Invalid immutable intent")
+    digest=row["digest"].removeprefix("sha256:")
+    api.asset_info(rel,row["name"],row["size"],digest,row["id"])
+    f=io.BytesIO()
+    api.download(row["id"],row["size"],digest,f)
+    intent=json.loads(f.getvalue())
+    b.require(same(intent) and intent["format"]=="tar.zst" and sha_check(intent["sha256"]) and
+              sha_check(intent["identity"]) and sha_check(intent["proof_sha"]) and 0<intent["bytes"]<=b.CAP and
+              0<len(intent["parts"])<=2 and sum(p["bytes"] for p in intent["parts"])==intent["bytes"],
+              "Unbound partial generation intent")
+    total=hashlib.sha256()
+    class Sink:
+        def write(self, block): total.update(block)
+    found=[]
+    for i,part in enumerate(intent["parts"]):
+        b.require(part["bytes"]==min(PART,intent["bytes"]-i*PART) and sha_check(part["sha256"]),
+                  "Invalid part in private intent")
+        obj=existing(rel,f"p{i:02}")
+        if obj:
+            api.asset_info(rel,obj["name"],part["bytes"],part["sha256"],obj["id"])
+            api.download(obj["id"],part["bytes"],part["sha256"],Sink())
+            found.append(obj["id"])
+    status="partial_private_parts"
+    if len(found)==len(intent["parts"]):
+        b.require(total.hexdigest()==intent["sha256"],"Recovered all private parts but recombined bytes differ")
+        status="all_private_bytes_verified_manifest_absent"
+    print("uncommitted_private_evidence="+json.dumps({"status":status,"intent_id":row["id"],
+          "sha256":intent["sha256"],"expected_bytes":intent["bytes"],"verified_part_ids":found},sort_keys=True))
+    b.output(recovery_status=status,checkpoint_advanced="false",private_readback_verified="false")
+    return True
+
+
 def publish():
     b.require(b.env_int("GITHUB_RUN_ATTEMPT")==1,"Rerun may only reconcile existing receipts")
     r=json.loads((ROOT/"incoming/outcome.json").read_text())
@@ -350,15 +399,20 @@ def publish():
     b.require(plain.stat().st_size==r["bytes"] and b.digest(plain)==r["sha256"],"Checkpoint content changed")
     verify_payload(plain,r)
     m={**context(),**{k:r[k] for k in ("bytes","sha256","identity","proof_sha")},"format":"tar.zst","parts":[]}
+    # A small immutable intent permits GET-only recovery of all or some already
+    # uploaded plaintext parts, even if the final manifest write never ran.
+    expected=[]
     with plain.open("rb") as source:
-        for i,off in enumerate(range(0,m["bytes"],PART)):
+        for off in range(0,m["bytes"],PART):
             n=min(PART,m["bytes"]-off);h=hashlib.sha256()
-            source.seek(off);remaining=Section(source,n)
+            remaining=Section(source,n)
             while block:=remaining.read(1024**2):h.update(block)
             b.require(remaining.left==0,"Short local candidate")
-            m["parts"].append(put(f"p{i:02}",source,off,n,h.hexdigest()))
-    data=json.dumps(m,sort_keys=True,separators=(",",":")).encode()
-    receipt=put("manifest.json",io.BytesIO(data),0,len(data),hashlib.sha256(data).hexdigest())
+            expected.append({"bytes":n,"sha256":h.hexdigest()})
+        put_json("intent.json",{**m,"parts":expected})
+        for i,part in enumerate(expected):
+            m["parts"].append(put(f"p{i:02}",source,i*PART,part["bytes"],part["sha256"]))
+    receipt=put_json("manifest.json",m)
     verify_outputs(receipt["id"],receipt["sha256"])
 
 
@@ -366,10 +420,12 @@ def recover():
     # After VM loss only an actually readable committed generation is a recovery
     # source. A surviving CMS archive alone cannot recover its vanished private key.
     api=b.auth_api()
-    names=(stem()+"-manifest.json",stem()+"-manifest.json-retry1")
-    found=[a for a in api.draft(b.RELEASE)["assets"] if a["name"] in names and a["state"]=="uploaded"]
-    b.require(len(found)==1,"No unique committed generation; inspect exact ciphertext and owner-wrapped recovery receipt before any reissue; no automatic recomputation")
-    row,=found
+    release=api.draft(b.RELEASE)
+    row=existing(release,"manifest.json")
+    if not row:
+        if recovered_intent(release):
+            return
+        raise ValueError("No unique committed generation; inspect exact ciphertext and owner-wrapped recovery receipt before any reissue; no automatic recomputation")
     verify_outputs(row["id"],row["digest"].removeprefix("sha256:"))
 
 

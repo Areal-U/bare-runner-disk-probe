@@ -104,10 +104,17 @@ class TestTransport(unittest.TestCase):
                 role("limited",1)
                 with patch.object(n,"verify_outputs",side_effect=ValueError("response lost after immutable manifest")):
                     with self.assertRaisesRegex(ValueError,"response lost"):n.publish()
-                self.assertEqual(len(api.assets),3)
+                self.assertEqual(len(api.assets),4)
                 os.environ["GITHUB_RUN_ATTEMPT"]="2"
+                manifest_row=api.assets.pop()
                 n.recover()
-                self.assertEqual(len(api.assets),3)
+                self.assertIn("recovery_status=all_private_bytes_verified_manifest_absent",(work/"outputs").read_text())
+                second=api.assets.pop()
+                n.recover()
+                self.assertIn("recovery_status=partial_private_parts",(work/"outputs").read_text())
+                api.assets.extend([second,manifest_row])
+                n.recover()
+                self.assertEqual(len(api.assets),4)
                 with self.assertRaisesRegex(ValueError,"Rerun"):n.publish()
                 rec=dict(line.split("=",1) for line in (work/"outputs").read_text().splitlines())
                 self.assertEqual(rec["checkpoint_key"],"bare-coexist-204-1234-1-checkpoint-production-s1")
@@ -129,7 +136,7 @@ class TestTransport(unittest.TestCase):
                 with patch.object(http.client,"HTTPSConnection",CDN):n.acquire()
                 self.assertEqual((n.ROOT/"checkpoint.tar.zst").read_bytes(),candidate.read_bytes())
                 n.stop("verify-only");copy_peer(2,"ordinary","limited",["outcome.json"])
-                role("limited",2);n.publish();self.assertEqual(len(api.assets),3)
+                role("limited",2);n.publish();self.assertEqual(len(api.assets),4)
                 # Ciphertext-only or missing generation never publishes/restarts other work.
                 with self.assertRaisesRegex(ValueError,"No unique committed"):n.recover()
 
