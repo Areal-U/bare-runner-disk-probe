@@ -93,6 +93,14 @@ sudo -n chmod 0755 exchange/checkpoint
 """)
     # Legacy gzip omitted GN packaging descriptors. Private v2 preserves them.
     script = once(script, "gn gen out/Bare\ncmp -- /exchange/args.gn", 'if [[ $R28_ROLE == produce ]]; then gn gen out/Bare; fi\ncmp -- /exchange/args.gn')
+    # No command can execute on the readback VM, including the inherited
+    # marker checks prior to the graph-specific verifier.
+    marker = 'autoninja -C out/Bare -j 2 -v '
+    if script.count(marker) != 3:
+        raise ValueError("Unexpected legacy marker command count")
+    script = script.replace(marker, 'autoninja "${read_mode[@]}" -C out/Bare -j 2 -v ')
+    script = once(script, 'object=out/Bare/obj/base/third_party/cityhash/cityhash/city.o',
+                  'read_mode=()\n[[ $R28_ROLE != receive ]] || read_mode=(-n)\nobject=out/Bare/obj/base/third_party/cityhash/cityhash/city.o')
     # The 26-minute timeout was for legacy restore-only assertions. The new bounded
     # graph planner and one edge run inside the per-job guard and a 95-minute cap.
     i = script.index("zstd -qdc -M128MB")
