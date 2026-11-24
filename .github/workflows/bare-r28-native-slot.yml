@@ -66,12 +66,41 @@ name: Bare 2.0.4 verified segment (native cache route)
         value: ${{ jobs.result.outputs.cipher_bytes }}
 permissions: {}
 jobs:
+  collection-lease:
+    name: Re-read the existing owner-bound collection lease for this segment
+    if: ${{ github.run_attempt == '1' }}
+    permissions:
+      actions: read
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      latest_start: ${{ steps.lease.outputs.latest_start }}
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+        sparse-checkout: |
+          preflight28
+          .github/workflows/bare-round26-transport-check.yml
+        sparse-checkout-cone-mode: false
+    - run: python3 preflight28/transport/prepare.py tools
+    - name: Verify the prior collector acknowledgement with a GET-only client
+      id: lease
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REGISTRATION_ASSET_ID: ''
+        REGISTRATION_SHA: ''
+      run: python3 preflight28/control/registration.py check-lease
   arm:
+    needs: collection-lease
     permissions:
       actions: read
       contents: write
     uses: ./.github/workflows/bare-arm64-probe.yml
     with:
+      collector_latest_start: ${{ needs.collection-lease.outputs.latest_start }}
       backend: ${{ inputs.backend }}
       parent_manifest_id: ${{ inputs.parent_manifest_id }}
       parent_manifest_sha: ${{ inputs.parent_manifest_sha }}
@@ -90,7 +119,7 @@ jobs:
       compile_minutes: ${{ inputs.minutes }}
       retain_existing_caches: false
     name: Authenticate parent on this runner, then run the permitted operation
-    if: ${{ github.run_attempt == '1' || inputs.verify_only }}
+    if: ${{ github.run_attempt == '1' && needs.collection-lease.result == 'success' }}
   read:
     name: Receive the generated checkpoint at its immutable segment key
     needs: arm
@@ -254,6 +283,8 @@ jobs:
         if ordinal > 1:
             checked(o.get("parent_frontier_verified") == "true", "Unverified previous frontier")
         if status in {"apk-size-exceeded","cipher-size-exceeded"}:
+            checked(a["result"] == "success" and read["result"] == apk["result"] == "skipped",
+                    "Size stop conflicts with unsuccessful or publishing jobs")
             result["status"] = status
         else:
             checked(a["result"] == "success", "Worker failed; retain the independently verified parent")

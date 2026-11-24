@@ -5,6 +5,15 @@ name: Bare Personal ARM64 checkpoint build
       probe:
         type: string
         default: smoke
+      verify_frontier_only:
+        type: boolean
+        default: false
+      segment_ordinal:
+        type: number
+        default: 0
+      expected_parent_producer:
+        type: string
+        default: ''
       checkpoint_segment:
         type: string
         default: initial
@@ -41,27 +50,61 @@ name: Bare Personal ARM64 checkpoint build
       retain_existing_caches:
         type: boolean
         default: false
+      backend:
+        type: string
+        default: cache
+      parent_manifest_id:
+        type: string
+        default: ''
+      parent_manifest_sha:
+        type: string
+        default: ''
+      collector_latest_start:
+        type: string
+        default: ''
     outputs:
+      frontier_status:
+        value: ${{ jobs.compile-probe.outputs.frontier_status }}
+      parent_frontier_verified:
+        value: ${{ jobs.compile-probe.outputs.parent_frontier_verified }}
+      checkpoint_ordinal:
+        value: ${{ jobs.compile-probe.outputs.checkpoint_ordinal }}
+      producer_sha:
+        value: ${{ jobs.compile-probe.outputs.producer_sha }}
       checkpoint_key:
-        value: ${{ jobs.compile-probe.outputs.checkpoint_key }}
+        value: ${{ (inputs.backend == 'draft' && jobs.draft-publisher.outputs.checkpoint_key) || (inputs.backend != 'draft' && jobs.compile-probe.outputs.checkpoint_key)
+          || '' }}
       checkpoint_sha:
-        value: ${{ jobs.compile-probe.outputs.checkpoint_sha }}
+        value: ${{ (inputs.backend == 'draft' && jobs.draft-publisher.outputs.checkpoint_sha) || (inputs.backend != 'draft' && jobs.compile-probe.outputs.checkpoint_sha)
+          || '' }}
       checkpoint_identity:
-        value: ${{ jobs.compile-probe.outputs.checkpoint_identity }}
+        value: ${{ (inputs.backend == 'draft' && jobs.draft-publisher.outputs.checkpoint_identity) || (inputs.backend != 'draft' && jobs.compile-probe.outputs.checkpoint_identity)
+          || '' }}
       base_image:
         value: ${{ jobs.compile-probe.outputs.base_image }}
       checkpoint_saved:
-        value: ${{ jobs.compile-probe.outputs.checkpoint_saved }}
+        value: ${{ (inputs.backend == 'draft' && jobs.draft-publisher.outputs.private_readback_verified) || (inputs.backend != 'draft' && jobs.compile-probe.outputs.checkpoint_saved)
+          || '' }}
       checkpoint_advanced:
         value: ${{ jobs.compile-probe.outputs.checkpoint_advanced }}
       apk_artifact_id:
         value: ${{ jobs.compile-probe.outputs.apk_artifact_id }}
       apk_cache_key:
         value: ${{ jobs.compile-probe.outputs.apk_cache_key }}
+      apk_delivery_status:
+        value: ${{ jobs.compile-probe.outputs.apk_delivery_status }}
       apk_encrypted_sha:
         value: ${{ jobs.compile-probe.outputs.apk_encrypted_sha }}
       apk_encrypted_bytes:
         value: ${{ jobs.compile-probe.outputs.apk_encrypted_bytes }}
+      checkpoint_manifest_id:
+        value: ${{ jobs.draft-publisher.outputs.checkpoint_manifest_id }}
+      checkpoint_manifest_sha:
+        value: ${{ jobs.draft-publisher.outputs.checkpoint_manifest_sha }}
+      checkpoint_bytes:
+        value: ${{ jobs.draft-publisher.outputs.checkpoint_bytes }}
+      private_readback_verified:
+        value: ${{ jobs.draft-publisher.outputs.private_readback_verified }}
   workflow_dispatch:
     inputs:
       probe:
@@ -75,22 +118,29 @@ jobs:
   compile-probe:
     permissions:
       actions: read
-    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' && github.ref == 'refs/heads/bare-coexist-v2.0.4' && inputs.probe == 'checkpoint-production'
-      }}
+    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' && github.ref == 'refs/heads/bare-coexist-v2.0.4' &&
+      inputs.probe == 'checkpoint-production' && (github.run_attempt == '1' || inputs.verify_frontier_only) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ inputs.probe == 'checkpoint-production' && 350 || inputs.probe == 'checkpoint-large' && 250 || inputs.probe == 'checkpoint-scale' && 190 || 120 }}
+    timeout-minutes: ${{ inputs.probe == 'checkpoint-production' && 350 || inputs.probe == 'checkpoint-large' && 250 || inputs.probe == 'checkpoint-scale' && 190 || 120
+      }}
     concurrency:
       group: bare-coexist-204-compile
       cancel-in-progress: false
     outputs:
+      frontier_status: ${{ steps.frontier_finish.outputs.status }}
+      parent_frontier_verified: ${{ steps.frontier.outputs.verified }}
       checkpoint_key: ${{ steps.identity.outputs.key }}
+      checkpoint_ordinal: ${{ steps.identity.outputs.ordinal }}
+      producer_sha: ${{ github.sha }}
       checkpoint_sha: ${{ steps.pack-checkpoint.outputs.sha }}
       checkpoint_identity: ${{ steps.pack-checkpoint.outputs.identity }}
       base_image: ${{ steps.prepare.outputs.base_image }}
-      checkpoint_saved: ${{ inputs.probe == 'checkpoint-production' && steps.checkpoint-proof.outputs.verified || inputs.probe != 'checkpoint-production' && steps.saved-receipt.outputs.saved || '' }}
+      checkpoint_saved: ${{ inputs.probe == 'checkpoint-production' && steps.checkpoint-proof.outputs.verified || inputs.probe != 'checkpoint-production' && steps.saved-receipt.outputs.saved
+        || '' }}
       checkpoint_advanced: ${{ steps.pack-checkpoint.outputs.checkpoint_advanced }}
-      apk_artifact_id: ${{ steps.apk_upload.outcome == 'success' && steps.apk_upload.outputs.artifact-id || '' }}
+      apk_artifact_id: ${{ steps.seal_receipt.outputs.id }}
       apk_cache_key: ${{ steps.apk_fallback_receipt.outputs.key }}
+      apk_delivery_status: ${{ steps.apk_seal.outputs.status }}
       apk_encrypted_sha: ${{ steps.apk_seal.outputs.sha }}
       apk_encrypted_bytes: ${{ steps.apk_seal.outputs.bytes }}
     env:
@@ -99,6 +149,7 @@ jobs:
       DEPOT_REV: 96a7c1418eedaa6bea333a8941e8a0078681b4d0
       GIT_TERMINAL_PROMPT: '0'
       PROBE_MODE: ${{ inputs.probe }}
+      VERIFY_FRONTIER_ONLY: ${{ inputs.verify_frontier_only && 'true' || 'false' }}
       COEXIST_COLD: ${{ inputs.coexist_cold && 'true' || 'false' }}
       REPAIR_LEGACY_INPUT_PATHS: ${{ inputs.repair_legacy_input_paths && 'true' || 'false' }}
       LEGACY_PRODUCTION_KEY: bare-transfer-v2-42973841138-1-checkpoint-large
@@ -113,6 +164,7 @@ jobs:
       SNAPSHOT_PRODUCTION_REV: 2601b4b4eb11f53204450c4c9909c868a2df04fb
       FINAL_LINK_PRODUCTION_KEY: bare-transfer-v2-43768891019-1-checkpoint-production
       FINAL_LINK_PRODUCTION_REV: f0695d66e60385f869d101d3b535ee241373f28c
+      COEXIST_27_S2_KEY: bare-coexist-204-45285202990-1-checkpoint-production-s2
       COEXIST_22_KEY: bare-coexist-204-43987539656-1-checkpoint-production
       COEXIST_22_REV: 17a2bed5a26071215258627dc76f56e357b21a6b
       COEXIST_23_KEY: bare-coexist-204-44281142681-1-checkpoint-production
@@ -124,6 +176,14 @@ jobs:
       EXPECTED_KEY: ${{ inputs.expected_checkpoint_key }}
       APK_OUTPUT_GIB: ${{ inputs.retain_existing_caches && 4 || inputs.apk_output_gib }}
       COMPILE_MINUTES: ${{ inputs.compile_minutes }}
+      CHECKPOINT_BACKEND: ${{ inputs.backend }}
+      R28_SLOT: ${{ inputs.segment_ordinal }}
+      R28_PARENT_SHA: ${{ inputs.expected_checkpoint_sha }}
+      R28_PARENT_IDENTITY: ${{ inputs.expected_checkpoint_identity }}
+      R28_PARENT_MANIFEST: ${{ inputs.parent_manifest_id }}
+      R28_PARENT_MANIFEST_SHA: ${{ inputs.parent_manifest_sha }}
+      R28_HEAD_SHA: ${{ github.sha }}
+      SEGMENT_ORDINAL: ${{ inputs.segment_ordinal }}
     defaults:
       run:
         shell: bash
@@ -132,6 +192,8 @@ jobs:
       id: identity
       env:
         CHECKPOINT_SEGMENT: ${{ inputs.checkpoint_segment }}
+        SEGMENT_ORDINAL: ${{ inputs.segment_ordinal }}
+        PARENT_PRODUCER: ${{ inputs.expected_parent_producer }}
         EXPECTED_KEY: ${{ inputs.expected_checkpoint_key }}
         EXPECTED_SHA: ${{ inputs.expected_checkpoint_sha }}
         EXPECTED_IDENTITY: ${{ inputs.expected_checkpoint_identity }}
@@ -139,6 +201,13 @@ jobs:
         APK_RECIPIENT: ${{ inputs.apk_recipient }}
         APK_JOBS: ${{ inputs.apk_jobs }}
       run: |
+        [[ $CHECKPOINT_BACKEND == cache || $CHECKPOINT_BACKEND == draft ]]
+        if [[ $CHECKPOINT_BACKEND == draft ]]; then
+          [[ $GITHUB_REF == refs/heads/bare-coexist-v2.0.4 && $GITHUB_RUN_ATTEMPT == 1 && $GITHUB_ACTOR == Areal-U ]]
+          [[ $SEGMENT_ORDINAL =~ ^([1-9]|1[0-3])$ ]]
+          if (( SEGMENT_ORDINAL == 1 )); then [[ -z $R28_PARENT_MANIFEST || $R28_PARENT_MANIFEST == 0 ]]; [[ -z $R28_PARENT_MANIFEST_SHA ]];
+          else [[ $R28_PARENT_MANIFEST =~ ^[1-9][0-9]*$ && $R28_PARENT_MANIFEST_SHA =~ ^[0-9a-f]{64}$ ]]; fi
+        fi
         date +%s > "$RUNNER_TEMP/bare-probe-start"
         if [[ $GITHUB_EVENT_NAME != workflow_dispatch || $RUNNER_ENVIRONMENT != github-hosted || $RUNNER_ARCH != X64 ]]; then
           echo 'Expected a manually started GitHub-hosted x64 runner.' >&2
@@ -149,20 +218,38 @@ jobs:
         [[ $APK_RECIPIENT =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$ ]]
         key="bare-coexist-204-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-checkpoint-production"
         [[ $CHECKPOINT_SEGMENT == initial || $CHECKPOINT_SEGMENT == next ]]
-        if [[ $CHECKPOINT_SEGMENT == next ]]; then
+        suffix=
+        if [[ $SEGMENT_ORDINAL != 0 ]]; then
+          [[ $SEGMENT_ORDINAL =~ ^([1-9]|1[0-3])$ ]]
+          [[ $COEXIST_COLD == false && $RETAIN_EXISTING_CACHES == false ]]
+          [[ $GITHUB_RUN_ATTEMPT == 1 || ${{ inputs.verify_frontier_only && 'true' || 'false' }} == true ]]
+          if (( SEGMENT_ORDINAL == 1 )); then
+            [[ $EXPECTED_KEY == bare-coexist-204-45285202990-1-checkpoint-production-s2 ]]
+            [[ $PARENT_PRODUCER == bf70ddbf474f3390a62220a076b8c43347fecc64 ]]
+          else
+            [[ $PARENT_PRODUCER == "$GITHUB_SHA" ]]
+            [[ $EXPECTED_KEY == "bare-coexist-204-$GITHUB_RUN_ID-1-checkpoint-production-s$((SEGMENT_ORDINAL-1))" ]]
+          fi
+          [[ $SEGMENT_ORDINAL != 13 || ${{ inputs.verify_frontier_only && 'true' || 'false' }} == true ]]
+          suffix="-s$SEGMENT_ORDINAL"
+          key+="${suffix}"
+        elif [[ $CHECKPOINT_SEGMENT == next ]]; then
           [[ $COEXIST_COLD == false && $RETAIN_EXISTING_CACHES == false ]]
           # Failed-job reruns can consume the first job's original successful attempt.
           [[ $EXPECTED_KEY =~ ^bare-coexist-204-([1-9][0-9]*)-([1-9][0-9]{0,8})-checkpoint-production$ ]]
           [[ ${BASH_REMATCH[1]} == "$GITHUB_RUN_ID" ]]
           (( BASH_REMATCH[2] <= GITHUB_RUN_ATTEMPT ))
           key+="-s2"
+          suffix="-s2"
         fi
+        echo "SEGMENT_SUFFIX=$suffix" >> "$GITHUB_ENV"
+        echo "ordinal=$SEGMENT_ORDINAL" >> "$GITHUB_OUTPUT"
         if [[ $RETAIN_EXISTING_CACHES == true ]]; then
           [[ $COEXIST_COLD == false && $EXPECTED_KEY == "$COEXIST_22_KEY" ]]
           [[ $APK_OUTPUT_GIB == 4 && $APK_JOBS == 1 && $COMPILE_MINUTES == 25 ]]
         else
           [[ $APK_OUTPUT_GIB == 18 && ( $APK_JOBS == 1 || $APK_JOBS == 2 ) ]]
-          [[ $COMPILE_MINUTES == 180 || $COMPILE_MINUTES == 25 ]]
+          [[ $COMPILE_MINUTES == 0 || $COMPILE_MINUTES == 180 || $COMPILE_MINUTES == 25 ]]
         fi
         [[ $REPAIR_LEGACY_INPUT_PATHS == false ]]
         predecessor_rev=''
@@ -172,7 +259,7 @@ jobs:
           [[ -z $EXPECTED_KEY && -z $EXPECTED_SHA && -z $EXPECTED_IDENTITY ]]
         else
           [[ $COEXIST_COLD == false ]]
-          [[ $EXPECTED_KEY =~ ^bare-coexist-204-[0-9]+-[0-9]+-checkpoint-production(-s2)?$ ]]
+          [[ $EXPECTED_KEY =~ ^bare-coexist-204-[0-9]+-[0-9]+-checkpoint-production(-s([1-9]|1[0-2]))?$ ]]
           [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_IDENTITY =~ ^[0-9a-f]{64}$ ]]
           if [[ $EXPECTED_KEY == "$COEXIST_22_KEY" ]]; then
             [[ $EXPECTED_SHA == 0e734d8a64f55bd83f5c0143b4dd8e87ede15e08691f1113e10dcb5bfa045115 ]]
@@ -180,6 +267,12 @@ jobs:
             predecessor_rev=$COEXIST_22_REV
             predecessor_arm_sha=26f64ca7ab4d8b72a53608d57bd5c856e1b456a337ce9cc5e7f1ae14f425760a
             predecessor_transfer_sha=82c7036b25749a164041ec52ddb02fe373a600bcf643b9ad3920dee4a8368033
+          elif [[ $EXPECTED_KEY == "$COEXIST_27_S2_KEY" ]]; then
+            [[ $EXPECTED_SHA == 4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf ]]
+            [[ $EXPECTED_IDENTITY == a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc ]]
+            predecessor_rev=bf70ddbf474f3390a62220a076b8c43347fecc64
+            predecessor_arm_sha=7f4ba3e8ff94e91777a4bf0b400bfc0e4250cafaa485ad43b050818ea565911b
+            predecessor_transfer_sha=5cfc45c4033c052330ff00247ccde69f800828539df879f9eddd04800b039407
           elif [[ $EXPECTED_KEY == "$COEXIST_23_KEY" ]]; then
             [[ $EXPECTED_SHA == d05b4867fdbc8fecdcf3805f560cbbb078eb8a9b63192fb20a75c1581d5e0e3b ]]
             [[ $EXPECTED_IDENTITY == c14e976472c1ba626fc1d39cfdd624dfe6ea8112c19aabd771152eb4cb105b1b ]]
@@ -200,8 +293,11 @@ jobs:
       timeout-minutes: 5
       run: |
         mkdir -p "$RUNNER_TEMP/bare-ci"
-        for file in checkpoint.py build_trial.py coexist_inputs.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+        for file in checkpoint.py build_trial.py coexist_inputs.py guard.py check_archive.py graph.py retained.py segment_graph.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
           source=$file
+          [[ $file != guard.py ]] || source=preflight28/limits/guard.py
+          [[ $file != check_archive.py ]] || source=preflight28/bridge/check_archive.py
+          [[ $file != graph.py && $file != retained.py && $file != segment_graph.py ]] || source=preflight28/graph/$file
           [[ $file != *.yml ]] || source=".github/workflows/$file"
           curl --fail --location --retry 2 --max-time 60 \
             "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/$source" \
@@ -210,14 +306,110 @@ jobs:
         python3 -m py_compile "$RUNNER_TEMP/bare-ci/checkpoint.py" "$RUNNER_TEMP/bare-ci/build_trial.py"
         if [[ -n $COEXIST_PREDECESSOR_REV ]]; then
           mkdir "$RUNNER_TEMP/bare-ci/predecessor-workflows"
-          for file in bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+          for file in checkpoint.py build_trial.py coexist_inputs.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+            source=$file
+            [[ $file != *.yml ]] || source=".github/workflows/$file"
             curl --fail --location --retry 2 --max-time 60 \
-              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$COEXIST_PREDECESSOR_REV/.github/workflows/$file" \
+              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$COEXIST_PREDECESSOR_REV/$source" \
               --output "$RUNNER_TEMP/bare-ci/predecessor-workflows/$file"
           done
         fi
-    - name: Prepare encrypted APK recovery
+    - name: Establish the production job clock
       if: ${{ inputs.probe == 'checkpoint-production' }}
+      timeout-minutes: 2
+      env:
+        JOB_READ_TOKEN: ${{ github.token }}
+        MY_CHECK: ${{ job.check_run_id }}
+        CLOCK_SUFFIX: Compile or verify authenticated APK slot ${{ inputs.segment_ordinal }}
+        GH_TOKEN: ${{ github.token }}
+      run: |-
+        set -euo pipefail
+        if [[ ! ${MY_CHECK:-} =~ ^[1-9][0-9]*$ ]]; then
+          MY_CHECK=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" | jq -er --arg suffix "$CLOCK_SUFFIX" '
+            select(.total_count == (.jobs|length)) | [.jobs[]|select((.name|endswith($suffix)) and .status=="in_progress")|.check_run_url|split("/")|last] | select(length==1) | first')
+        fi
+        python3 -I "$RUNNER_TEMP/bare-ci/guard.py" job-clock --check-run "$MY_CHECK" > "$RUNNER_TEMP/bare-probe-start"
+    - name: Read the pinned public transport helpers anonymously
+      if: ${{ inputs.backend == 'draft' }}
+      timeout-minutes: 4
+      run: |-
+        set -euo pipefail
+        [[ $GITHUB_SHA =~ ^[a-f0-9]{40}$ && $GITHUB_REPOSITORY == Areal-U/bare-runner-disk-probe ]]
+        git init --quiet .
+        git sparse-checkout set --no-cone '/preflight28/' '/checkpoint.py' '/.github/workflows/bare-round26-zstd-six-receiver.yml'
+        GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.extraHeader= fetch --no-tags --depth=1 \
+          "https://github.com/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
+        git checkout --quiet --detach FETCH_HEAD
+        [[ $(git rev-parse HEAD) == "$GITHUB_SHA" ]]
+    - name: Reserve the relay peak before acquiring a large peer artifact
+      run: bash preflight28/bridge/host_space.sh
+      if: ${{ inputs.backend == 'draft' }}
+    - name: Bind peer artifacts to this run and logical slot
+      id: peer_names
+      run: python3 preflight28/bridge/normal.py names
+      if: ${{ inputs.backend == 'draft' }}
+    - name: Create an ephemeral ordinary transfer key
+      id: peer_key
+      timeout-minutes: 4
+      env:
+        GH_TOKEN: ${{ github.token }}
+        CHECK_RUN: ${{ job.check_run_id }}
+        CLOCK_SUFFIX: Compile or verify authenticated APK slot ${{ inputs.segment_ordinal }}
+      run: |-
+        set -euo pipefail
+        if [[ ! ${CHECK_RUN:-} =~ ^[1-9][0-9]*$ ]]; then
+          CHECK_RUN=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" | jq -er --arg suffix "$CLOCK_SUFFIX" '
+            select(.total_count == (.jobs|length)) | [.jobs[]|select((.name|endswith($suffix)) and .status=="in_progress")|.check_run_url|split("/")|last] | select(length==1) | first')
+        fi
+        python3 preflight28/bridge/normal.py keygen ordinary --check-run "$CHECK_RUN"
+      if: ${{ inputs.backend == 'draft' }}
+    - name: Deposit key in this run
+      id: peer_put_key
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      timeout-minutes: 4
+      with:
+        name: ${{ steps.peer_names.outputs.key_name }}
+        path: |-
+          ${{ runner.temp }}/r28-normal/public.pem
+          ${{ runner.temp }}/r28-normal/holder.json
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 1
+        compression-level: 0
+      if: ${{ inputs.backend == 'draft' }}
+    - name: Discover exact peer descriptor
+      id: peer_wait_descriptor
+      timeout-minutes: 12
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 preflight28/bridge/normal.py wait descriptor
+      if: ${{ inputs.backend == 'draft' }}
+    - name: Fetch authenticated descriptor by immutable artifact ID
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 4
+      with:
+        artifact-ids: ${{ steps.peer_wait_descriptor.outputs.id }}
+        path: ${{ runner.temp }}/r28-normal/incoming
+        merge-multiple: true
+      if: ${{ inputs.backend == 'draft' }}
+    - name: Open restricted peer descriptor and verify the exact input archive
+      id: peer_acquire
+      timeout-minutes: 15
+      run: |-
+        set -euo pipefail
+        python3 preflight28/bridge/normal.py acquire
+        if (( R28_SLOT > 1 )); then
+          file="$RUNNER_TEMP/r28-normal/checkpoint.tar.zst"
+          printf '%s  %s\n' "$R28_PARENT_SHA" "$file" | sha256sum --check --strict
+          for operation in validate-archive verify-continuation inspect-input-paths; do
+            args=(--production)
+            if [[ $operation == verify-continuation ]]; then args+=(--ci-revision "$R28_HEAD_SHA" --expected-identity "$R28_PARENT_IDENTITY"); fi
+            python3 preflight28/bridge/check_archive.py "$RUNNER_TEMP/bare-ci/checkpoint.py" "$operation" "$file" "${args[@]}"
+          done
+        fi
+      if: ${{ inputs.backend == 'draft' }}
+    - name: Prepare encrypted APK recovery
+      if: ${{ inputs.probe == 'checkpoint-production' && !inputs.verify_frontier_only }}
       timeout-minutes: 5
       env:
         APK_RECIPIENT: ${{ inputs.apk_recipient }}
@@ -324,21 +516,27 @@ jobs:
         print(json.dumps({'cache_bytes_observed': used, 'reserved_bytes': reserve, 'limit_bytes': limit_bytes}))
         PYTHON
     - name: Check repository cache headroom without deleting older checkpoints
-      if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
+      if: ${{ (startsWith(inputs.probe, 'checkpoint-') && !inputs.verify_frontier_only) && (inputs.backend != 'draft') }}
       timeout-minutes: 5
       env:
         CACHE_READ_TOKEN: ${{ github.token }}
       run: exec /usr/bin/python3 -I "$RUNNER_TEMP/bare-cache-reader/check-cache-budget.py"
+    - name: Read the six authenticated Ubuntu payloads and stage the fixed-index installer
+      if: ${{ inputs.backend == 'draft' }}
+      timeout-minutes: 12
+      run: python3 preflight28/transport/normal_deps.py
     - name: Restore the producer key exactly, including on a consumer-only rerun
       id: restore-checkpoint
-      if: ${{ startsWith(inputs.probe, 'checkpoint-') && inputs.probe != 'checkpoint-seed' && !inputs.coexist_cold }}
+      if: ${{ (startsWith(inputs.probe, 'checkpoint-') && inputs.probe != 'checkpoint-seed' && !inputs.coexist_cold) && (inputs.backend != 'draft' || inputs.segment_ordinal
+        == 1) }}
       uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
       with:
         path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
         key: ${{ inputs.expected_checkpoint_key }}
         fail-on-cache-miss: true
     - name: Validate the received archive before checkout
-      if: ${{ startsWith(inputs.probe, 'checkpoint-') && inputs.probe != 'checkpoint-seed' && !inputs.coexist_cold }}
+      if: ${{ (startsWith(inputs.probe, 'checkpoint-') && inputs.probe != 'checkpoint-seed' && !inputs.coexist_cold) && (inputs.backend != 'draft' || inputs.segment_ordinal
+        == 1) }}
       timeout-minutes: ${{ inputs.probe == 'checkpoint-production' && 15 || inputs.probe == 'checkpoint-large' && 10 || inputs.probe == 'checkpoint-scale' && 7 || 4 }}
       env:
         CACHE_HIT: ${{ steps.restore-checkpoint.outputs.cache-hit }}
@@ -435,6 +633,11 @@ jobs:
 
         if [[ $PROBE_MODE == checkpoint-* ]]; then
           cp "$RUNNER_TEMP/bare-ci/"*.py "$RUNNER_TEMP/bare-ci/"*.yml exchange/
+          if [[ $CHECKPOINT_BACKEND == draft ]]; then
+            install -m 0644 "$RUNNER_TEMP/round26-pool-install.py" exchange/round26-pool-install.py
+            install -d -m 0755 exchange/verified-six
+            install -m 0644 "$RUNNER_TEMP/verified-six/"{*.deb,receipts.json,receive_six.py} exchange/verified-six/
+          fi
           if [[ -n $COEXIST_PREDECESSOR_REV ]]; then
             cp -R "$RUNNER_TEMP/bare-ci/predecessor-workflows" exchange/
           fi
@@ -474,6 +677,8 @@ jobs:
             && grep -qF 'deb {snapshot_url}/ jammy-security ' /etc/apt/sources.list \
             && apt-get -o Acquire::https::CAInfo=/tmp/bare-ci-apt-ca.pem -o APT::Update::Error-Mode=any update \
             && apt-get -o Acquire::https::CAInfo=/tmp/bare-ci-apt-ca.pem install"""
+            if os.environ['CHECKPOINT_BACKEND'] == 'draft':
+                bootstrap = bootstrap.replace('apt-get -o Acquire::https::CAInfo', 'apt-get -o Acquire::Retries=3 -o Acquire::https::CAInfo')
             text = text.replace(apt_install, bootstrap, 1)
         path.write_text(text)
         PYTHON
@@ -481,6 +686,13 @@ jobs:
         echo "base_image=$base_image" >> "$GITHUB_OUTPUT"
         bash builder.sh build
         bash builder.sh start
+        if [[ $CHECKPOINT_BACKEND == draft ]]; then
+          docker compose exec -T chromium-builder bash -seu <<'APT_SEAL'
+        sudo dpkg --add-architecture i386
+        sudo apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any -o Acquire::AllowInsecureRepositories=false update
+        python3 -I /exchange/verified-six/receive_six.py index /exchange/verified-six
+        APT_SEAL
+        fi
         if [[ $PROBE_MODE == checkpoint-production ]]; then
           for package in libc6:amd64 libc6-dev:amd64; do
             actual=$(docker compose exec -T chromium-builder dpkg-query -W -f='${Version}' "$package")
@@ -501,7 +713,7 @@ jobs:
       env:
         REQUESTED_BASE: ${{ inputs.expected_base_image }}
     - name: Test runner and builder archive handoff before fetching Chromium
-      if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
+      if: ${{ (startsWith(inputs.probe, 'checkpoint-') && !inputs.verify_frontier_only) && (inputs.backend != 'draft') }}
       timeout-minutes: 3
       run: |
         cd "$RUNNER_TEMP/bare-official"
@@ -593,13 +805,17 @@ jobs:
         PROBE_MODE: ${{ inputs.probe }}
       run: |
         cd "$RUNNER_TEMP/bare-official"
-        docker compose exec -T -e GIT_TERMINAL_PROMPT=0 -e "PROBE_MODE=$PROBE_MODE" -e "COEXIST_COLD=$COEXIST_COLD" -e "UBUNTU_GLIBC_VERSION=$UBUNTU_GLIBC_VERSION" chromium-builder \
+        docker compose exec -T -e GIT_TERMINAL_PROMPT=0 -e CHECKPOINT_BACKEND -e "PROBE_MODE=$PROBE_MODE" -e "COEXIST_COLD=$COEXIST_COLD" -e "UBUNTU_GLIBC_VERSION=$UBUNTU_GLIBC_VERSION" chromium-builder \
           timeout --kill-after=2m 30m bash -seu <<'CONTAINER'
         set -o pipefail
         export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
         cd /work/chromium/src
         echo 'Installing Chromium build dependencies'
-        ./build/install-build-deps.sh --android --no-prompt
+        if [[ $CHECKPOINT_BACKEND == draft ]]; then
+          python3 -I /exchange/round26-pool-install.py
+        else
+          ./build/install-build-deps.sh --android --no-prompt
+        fi
         for package in libc6:amd64 libc6:i386 libc6-dev:amd64; do
           [[ $(dpkg-query -W -f='${Version}' "$package") == "$UBUNTU_GLIBC_VERSION" ]]
         done
@@ -640,8 +856,19 @@ jobs:
         EXPECTED_IDENTITY: ${{ inputs.expected_checkpoint_identity }}
       run: |
         cd "$RUNNER_TEMP/bare-official"
+        streamed=false
+        if [[ $CHECKPOINT_BACKEND == draft ]] && (( R28_SLOT > 1 )); then
+          docker compose exec -T chromium-builder bash -euc '
+            cd /work/chromium/src
+            python3 -I /exchange/guard.py space /work --bytes "$((22*1024**3))" --inodes 550000
+            rm -rf --one-file-system -- out/Bare'
+          set -o pipefail
+          zstd -qdc -M128MB -- "$RUNNER_TEMP/r28-normal/checkpoint.tar.zst" |
+            docker compose exec -T chromium-builder bash -euc 'cd /work/chromium/src && tar -xf -'
+          streamed=true
+        fi
         docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CI_REVISION=$GITHUB_SHA" -e "BASE_IMAGE=$BARE_BASE_IMAGE" \
-          -e "EXPECTED_IDENTITY=$EXPECTED_IDENTITY" -e "REPAIR_LEGACY_INPUT_PATHS=$REPAIR_LEGACY_INPUT_PATHS" \
+          -e "EXPECTED_IDENTITY=$EXPECTED_IDENTITY" -e "STREAMED=$streamed" -e VERIFY_FRONTIER_ONLY -e "REPAIR_LEGACY_INPUT_PATHS=$REPAIR_LEGACY_INPUT_PATHS" \
           -e "PROBE_MODE=$PROBE_MODE" -e "EXPECTED_KEY=$EXPECTED_KEY" -e "LEGACY_PRODUCTION_KEY=$LEGACY_PRODUCTION_KEY" \
           -e "EXPANDED_PRODUCTION_KEY=$EXPANDED_PRODUCTION_KEY" \
           -e "PRE_SNAPSHOT_KEY=$PRE_SNAPSHOT_KEY" -e "PRE_SNAPSHOT_BACKUP_KEY=$PRE_SNAPSHOT_BACKUP_KEY" \
@@ -662,7 +889,7 @@ jobs:
             incoming_limits+=(--production)
           fi
         fi
-        python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint-input.tar.gz "${incoming_limits[@]}"
+        if [[ $STREAMED != true ]]; then python3 /exchange/checkpoint.py validate-archive /exchange/checkpoint/checkpoint-input.tar.gz "${incoming_limits[@]}"; fi
         if [[ $PROBE_MODE == checkpoint-production ]]; then
           for package in libc6:amd64 libc6:i386 libc6-dev:amd64; do
             [[ $(dpkg-query -W -f='${Version}' "$package") == "$UBUNTU_GLIBC_VERSION" ]]
@@ -673,10 +900,12 @@ jobs:
           inodes=$(df -Pi /work | awk 'NR == 2 { print $4 }')
           [[ $free =~ ^[0-9]+$ && $inodes =~ ^[0-9]+$ ]]
           # Leave 20 GiB free and 3 GiB for allocated blocks/metadata at the 19 GiB tar limit.
-          (( free >= 42 * 1024**3 && inodes >= 570000 ))
+          if [[ $STREAMED != true ]]; then python3 -I /exchange/guard.py space /work --bytes "$((22*1024**3))" --inodes 550000; else python3 -I /exchange/guard.py space /work --bytes 0 --inodes 0; fi
         fi
-        rm -rf --one-file-system -- out/Bare
-        tar -xzf /exchange/checkpoint/checkpoint-input.tar.gz
+        if [[ $STREAMED != true ]]; then
+          rm -rf --one-file-system -- out/Bare
+          tar -xzf /exchange/checkpoint/checkpoint-input.tar.gz
+        fi
         repair=()
         [[ $PROBE_MODE != checkpoint-scale ]] || repair+=(--allow-scale-predecessor)
         [[ $PROBE_MODE != checkpoint-large ]] || repair+=(--allow-larger-predecessor)
@@ -690,7 +919,7 @@ jobs:
         [[ $REPAIR_LEGACY_INPUT_PATHS != true ]] || repair+=(--repair-legacy-input-paths)
         if [[ -n $COEXIST_PREDECESSOR_REV ]]; then
           # Recompute the exact predecessor's provenance with the freshly prepared inputs,
-          # unchanged helpers, and the immutable producer workflow definitions.
+          # the pinned producer helpers, and both pinned producer workflows.
           python3 - <<'PYTHON' | tee /exchange/checkpoint/provenance-check.json
         import hashlib, json, os, shutil, sys, tempfile
         from pathlib import Path
@@ -708,7 +937,7 @@ jobs:
 
         with tempfile.TemporaryDirectory() as directory:
             producer = Path(directory)
-            for source, hashes in ((exchange, helpers), (exchange / 'predecessor-workflows', workflows)):
+            for source, hashes in ((exchange / 'predecessor-workflows', helpers), (exchange / 'predecessor-workflows', workflows)):
                 for name, expected in hashes.items():
                     contents = (source / name).read_bytes()
                     if hashlib.sha256(contents).hexdigest() != expected:
@@ -726,6 +955,16 @@ jobs:
                 Path('out/Bare/checkpoint-provenance.json'), os.environ['COEXIST_PREDECESSOR_REV'],
                 os.environ['BASE_IMAGE'], exchange=producer,
             )
+            # Independently compare functional source, toolchain, OS and GN inputs at
+            # the new revision. Only the CI implementation and its revision may differ.
+            old = json.loads(Path('out/Bare/checkpoint-provenance.json').read_text())['identity']
+            fresh = checkpoint.provenance_identity(
+                os.environ['CI_REVISION'], os.environ['BASE_IMAGE'], exchange=exchange)
+            allowed = {'ci_revision', 'ci_files'}
+            if {k:v for k,v in old.items() if k not in allowed} != {k:v for k,v in fresh.items() if k not in allowed}:
+                raise SystemExit('Effective peer-build inputs changed during the CI migration.')
+            if checkpoint.file_hash(exchange / 'coexist_inputs.py') != helpers['coexist_inputs.py']:
+                raise SystemExit('Coexist implementation differs from the approved migration.')
         result['producer_ci_revision'] = os.environ['COEXIST_PREDECESSOR_REV']
         result['validator_ci_revision'] = os.environ['CI_REVISION']
         print(json.dumps(result))
@@ -746,20 +985,30 @@ jobs:
         if [[ $PROBE_MODE == checkpoint-production ]]; then
           # The public archive omits apks/, including GN's own text descriptors.
           # Generate them before Siso takes its snapshot of the restored inputs.
-          echo 'Regenerating the ARM64 manifest and its local packaging descriptors'
-          gn gen out/Bare
+          if [[ $STREAMED != true ]]; then
+            echo 'Regenerating the ARM64 manifest and its local packaging descriptors'
+            gn gen out/Bare
+          fi
           cmp -- /exchange/args.gn out/Bare/args.gn
           python3 /exchange/checkpoint.py check-gn-packaging out/Bare
         fi
         object=out/Bare/obj/base/third_party/cityhash/cityhash/city.o
         python3 /exchange/checkpoint.py verify-object "$object" out/Bare/checkpoint-object.json
         python3 /exchange/checkpoint.py verify-evidence out/Bare/checkpoint-evidence.json
-        autoninja -C out/Bare -j 2 -v base/third_party/cityhash:cityhash | tee /exchange/checkpoint/cityhash-noop.log
+        # A recovery attempt cannot compile even if a legacy marker is dirty.
+        restored_ninja() {
+          if [[ $VERIFY_FRONTIER_ONLY == true ]]; then
+            autoninja -n "$@"
+          else
+            autoninja "$@"
+          fi
+        }
+        restored_ninja -C out/Bare -j 2 -v base/third_party/cityhash:cityhash | tee /exchange/checkpoint/cityhash-noop.log
         grep -F 'ninja: no work to do.' /exchange/checkpoint/cityhash-noop.log
         python3 /exchange/checkpoint.py evidence-targets out/Bare/checkpoint-evidence.json > /exchange/checkpoint/evidence-targets.txt
         mapfile -t targets < /exchange/checkpoint/evidence-targets.txt
         (( ${#targets[@]} > 0 ))
-        autoninja -C out/Bare -j 2 -v "${targets[@]}" | tee /exchange/checkpoint/apk-objects-noop.log
+        restored_ninja -C out/Bare -j 2 -v "${targets[@]}" | tee /exchange/checkpoint/apk-objects-noop.log
         grep -F 'ninja: no work to do.' /exchange/checkpoint/apk-objects-noop.log
         python3 /exchange/checkpoint.py verify-object "$object" out/Bare/checkpoint-object.json
         python3 /exchange/checkpoint.py verify-evidence out/Bare/checkpoint-evidence.json
@@ -769,7 +1018,7 @@ jobs:
           python3 /exchange/checkpoint.py verify-reuse-markers "$record" > /exchange/checkpoint/production-before.json
           mapfile -t targets < /exchange/checkpoint/production-targets.txt
           (( ${#targets[@]} == 3 ))
-          autoninja -C out/Bare -j 2 -v "${targets[@]}" 2>&1 | tee /exchange/checkpoint/production-noop.log
+          restored_ninja -C out/Bare -j 2 -v "${targets[@]}" 2>&1 | tee /exchange/checkpoint/production-noop.log
           tr '\r' '\n' < /exchange/checkpoint/production-noop.log > /exchange/checkpoint/production-noop.txt
           grep -Fx 'ninja: no work to do.' /exchange/checkpoint/production-noop.txt
           summary=$(grep -F 'Build Succeeded:' /exchange/checkpoint/production-noop.txt | tail -n 1)
@@ -833,12 +1082,42 @@ jobs:
         fi
         touch /exchange/checkpoint/reuse-verified
         CONTAINER
+    - name: Verify the received APK frontier and establish the segment baseline
+      id: frontier
+      if: ${{ inputs.probe == 'checkpoint-production' }}
+      timeout-minutes: 35
+      env:
+        PARENT_ARCHIVE_SHA: ${{ inputs.expected_checkpoint_sha }}
+      run: |
+        set -euo pipefail
+        cd "$RUNNER_TEMP/bare-official"
+        docker compose exec -T -e VERIFY_FRONTIER_ONLY -e EXPECTED_KEY -e COEXIST_PREDECESSOR_REV \
+          -e COEXIST_COLD -e PARENT_ARCHIVE_SHA -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 \
+          chromium-builder bash -euc '
+            cd /work/chromium/src
+            args=(before --baseline /exchange/checkpoint/segment-before.json)
+            if [[ $COEXIST_COLD == true ]]; then
+              args+=(--parent-sha cold --bootstrap)
+            else
+              args+=(--parent-sha "$PARENT_ARCHIVE_SHA")
+              [[ -z $COEXIST_PREDECESSOR_REV ]] || args+=(--bootstrap)
+            fi
+            [[ $VERIFY_FRONTIER_ONLY == false ]] || args+=(--verify-only)
+            set -o pipefail
+            python3 /exchange/segment_graph.py "${args[@]}" | tee /exchange/checkpoint/frontier-before.log
+          '
+        verified=$(tail -n 1 exchange/checkpoint/frontier-before.log | jq -r .parent_frontier_verified)
+        [[ $verified == true || $verified == false ]]
+        [[ $VERIFY_FRONTIER_ONLY != true || $verified == true ]]
+        echo "verified=$verified" >> "$GITHUB_OUTPUT"
     - name: Run the real APK target within its time and output budgets
       id: trial
-      if: ${{ startsWith(inputs.probe, 'checkpoint-') }}
-      timeout-minutes: ${{ inputs.probe == 'checkpoint-production' && 188 || inputs.probe == 'checkpoint-large' && 95 || inputs.probe == 'checkpoint-scale' && 65 || 12 }}
+      if: ${{ startsWith(inputs.probe, 'checkpoint-') && !inputs.verify_frontier_only }}
+      timeout-minutes: ${{ inputs.probe == 'checkpoint-production' && 316 || inputs.probe == 'checkpoint-large' && 95 || inputs.probe == 'checkpoint-scale' && 65 || 12
+        }}
       env:
         APK_JOBS: ${{ inputs.apk_jobs }}
+        COLLECTOR_LATEST_START: ${{ inputs.collector_latest_start }}
       run: |
         cd "$RUNNER_TEMP/bare-official"
         # The clock starts before preparation and restore, not at compiler startup.
@@ -846,7 +1125,7 @@ jobs:
         latest_start=55
         [[ $PROBE_MODE != checkpoint-large ]] || latest_start=60
         [[ $PROBE_MODE != checkpoint-production ]] || latest_start=65
-        if (( elapsed > latest_start * 60 )); then
+        if [[ $PROBE_MODE != checkpoint-production ]] && (( elapsed > latest_start * 60 )); then
           echo 'Not enough time reserved for stop, hashing, packing, upload and diagnostics.' >&2
           exit 1
         fi
@@ -855,6 +1134,7 @@ jobs:
         trial_timeout=9m
         kill_after=2m
         compile_seconds=0
+        deadline_epoch=
         if [[ $PROBE_MODE == checkpoint-scale ]]; then
           trial_timeout=63m
           kill_after=1m
@@ -862,11 +1142,18 @@ jobs:
           trial_timeout=93m
           kill_after=1m
         elif [[ $PROBE_MODE == checkpoint-production ]]; then
-          # Allow time for quiescence, validation, packing, transfer, and the hard job deadline.
-          compile_seconds=$(( (350 - 80 - 17 - 8) * 60 - elapsed ))
+          # Reserve the existing 105-minute gzip/cache closure plus the bounded
+          # full-graph check at the clean stop; this is independent of the Draft trial.
+          reserve=130
+          # Full graph comparison (25m), measured-trial pack/verify/settle budget
+          # (40m), plus the sealed relay and upload (20m). Draft publication and its
+          # independent readback run in the restricted job with its own bounded clock.
+          [[ $CHECKPOINT_BACKEND != draft ]] || reserve=85
+          deadline_epoch=$(( $(cat "$RUNNER_TEMP/bare-probe-start") + (350 - reserve) * 60 ))
+          compile_seconds=$(( deadline_epoch - $(date +%s) ))
           (( compile_seconds > 0 ))
           requested_seconds=$((COMPILE_MINUTES * 60))
-          if (( compile_seconds > requested_seconds )); then
+          if (( requested_seconds > 0 && compile_seconds > requested_seconds )); then
             compile_seconds=$requested_seconds
           fi
           printf 'APK compilation budget: %s seconds\n' "$compile_seconds"
@@ -880,8 +1167,14 @@ jobs:
           done
         fi
         echo "phase=$phase" >> "$GITHUB_OUTPUT"
+        if [[ $PROBE_MODE == checkpoint-production ]]; then
+          [[ $COLLECTOR_LATEST_START =~ ^[1-9][0-9]{8,10}$ ]] && (( $(date +%s) <= 10#$COLLECTOR_LATEST_START )) || {
+            echo 'The independently registered collector lease cannot cover a new compile start.' >&2
+            exit 1
+          }
+        fi
         docker compose exec -T -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 \
-          -e "TRIAL_PHASE=$phase" -e "PROBE_MODE=$PROBE_MODE" -e "COMPILE_SECONDS=$compile_seconds" \
+          -e "TRIAL_PHASE=$phase" -e "PROBE_MODE=$PROBE_MODE" -e "COMPILE_SECONDS=$compile_seconds" -e "COMPILE_STOP_EPOCH=$deadline_epoch" \
           -e "APK_OUTPUT_GIB=$APK_OUTPUT_GIB" -e "APK_JOBS=$APK_JOBS" chromium-builder \
           timeout --kill-after="$kill_after" "$trial_timeout" bash -seu <<'CONTAINER'
         set -o pipefail
@@ -943,7 +1236,7 @@ jobs:
     - name: Verify the completed APK and encrypt it for private recovery
       id: apk_seal
       if: ${{ always() && inputs.probe == 'checkpoint-production' && steps.quiesce.outputs.quiescent == 'true' }}
-      timeout-minutes: 12
+      timeout-minutes: 37
       env:
         APK_RECIPIENT: ${{ inputs.apk_recipient }}
         TRIAL_PHASE: ${{ steps.trial.outputs.phase }}
@@ -972,6 +1265,22 @@ jobs:
         [[ ! -e $final_dir && ! -L $final_dir ]]
         mkdir -m 700 "$final_dir"
         [[ $APK_RECIPIENT =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$ ]]
+        if docker compose exec -T chromium-builder python3 -I /exchange/guard.py size apk /work/chromium/src/out/Bare/apks/ChromePublic.apk; then
+          :
+        else
+          status=$?
+          if (( status == 65 )); then
+            printf 'status=apk-size-exceeded\nready=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit "$status"
+        fi
+        docker compose exec -T -e TRIAL_PHASE -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 chromium-builder bash -euc '
+          cd /work/chromium/src
+          set -o pipefail
+          python3 /exchange/segment_graph.py after --terminal --host-quiesced --baseline /exchange/checkpoint/segment-before.json \
+            --trial "/exchange/checkpoint/trial-$TRIAL_PHASE.json" | tee /exchange/checkpoint/terminal-frontier.log
+        '
         docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CHROMIUM_REV=$CHROMIUM_REV" \
           -e "CI_REVISION=$GITHUB_SHA" -e "TRIAL_PHASE=$TRIAL_PHASE" chromium-builder bash -seu <<'CONTAINER' \
           | age -r "$APK_RECIPIENT" -o "$delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age"
@@ -1088,9 +1397,21 @@ jobs:
         name=Bare-Personal-2.0.4-arm64-v8a.tar.age
         [[ $(head -n 1 -- "$delivery/$name") == age-encryption.org/v1 ]]
         encrypted_bytes=$(stat -c %s -- "$delivery/$name")
-        (( encrypted_bytes > 0 && encrypted_bytes <= 451 * 1024 * 1024 ))
+        if python3 -I "$RUNNER_TEMP/bare-ci/guard.py" size cipher "$delivery/$name"; then
+          echo 'status=sealed' >> "$GITHUB_OUTPUT"
+        else
+          status=$?
+          if (( status == 65 )); then
+            printf 'status=cipher-size-exceeded\nready=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit "$status"
+        fi
         sha=$(sha256sum -- "$delivery/$name" | cut -d ' ' -f 1)
         mv -T -- "$delivery/$name" "$final_dir/$name"
+        if [[ $SEGMENT_ORDINAL =~ ^([1-9]|1[0-2])$ ]]; then
+          printf 'R28_SEALED_CIPHER {"run":%s,"attempt":%s,"ordinal":%s,"sha":"%s","bytes":%s}\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SEGMENT_ORDINAL" "$sha" "$encrypted_bytes"
+        fi
         echo "sha=$sha" >> "$GITHUB_OUTPUT"
         echo "bytes=$encrypted_bytes" >> "$GITHUB_OUTPUT"
         echo 'ready=true' >> "$GITHUB_OUTPUT"
@@ -1101,24 +1422,45 @@ jobs:
       continue-on-error: true
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
-        name: bare-personal-204-encrypted-${{ github.run_id }}-${{ github.run_attempt }}
+        name: bare-personal-204-encrypted-${{ github.run_id }}-${{ github.run_attempt }}${{ env.SEGMENT_SUFFIX }}
         path: ${{ runner.temp }}/bare-apk-delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age
         if-no-files-found: error
         retention-days: 3
         compression-level: 0
-    - name: Record the encrypted APK receipt
-      if: ${{ steps.apk_upload.outcome == 'success' }}
+    - name: Resolve the exact encrypted artifact after the upload attempt
+      id: seal_receipt
+      if: ${{ !cancelled() && steps.apk_seal.outputs.ready == 'true' }}
+      timeout-minutes: 2
       env:
-        ENCRYPTED_ID: ${{ steps.apk_upload.outputs.artifact-id }}
+        GH_TOKEN: ${{ github.token }}
+        RETURNED_ID: ${{ steps.apk_upload.outputs.artifact-id }}
         ENCRYPTED_SHA: ${{ steps.apk_seal.outputs.sha }}
         ENCRYPTED_BYTES: ${{ steps.apk_seal.outputs.bytes }}
       run: |
-        [[ $ENCRYPTED_ID =~ ^[1-9][0-9]*$ && $ENCRYPTED_SHA =~ ^[0-9a-f]{64}$ && $ENCRYPTED_BYTES =~ ^[1-9][0-9]*$ ]]
-        printf 'Encrypted APK artifact ID %s, SHA-256 %s, %s bytes\n' \
-          "$ENCRYPTED_ID" "$ENCRYPTED_SHA" "$ENCRYPTED_BYTES" | tee -a "$GITHUB_STEP_SUMMARY"
+        set -euo pipefail
+        [[ $ENCRYPTED_SHA =~ ^[0-9a-f]{64}$ && $ENCRYPTED_BYTES =~ ^[1-9][0-9]*$ ]]
+        name=bare-personal-204-encrypted-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT${SEGMENT_SUFFIX}
+        id=
+        if [[ $RETURNED_ID =~ ^[1-9][0-9]*$ ]]; then
+          id=$RETURNED_ID
+        else
+          if ! listing=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=$name&per_page=100"); then
+            echo 'Artifact receipt lookup inconclusive; try to preserve the same ciphertext.'
+            exit 0
+          fi
+          id=$(jq -er --arg name "$name" '
+            select(.total_count == (.artifacts|length)) |
+            [.artifacts[]|select(.name==$name and .expired==false)|.id]|unique|
+            if length == 1 then .[0]|tostring elif length == 0 then "" else error("multiple artifact receipts") end' <<<"$listing")
+        fi
+        if [[ -n $id ]]; then
+          [[ $id =~ ^[1-9][0-9]*$ ]]
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "Candidate artifact $id, ciphertext $ENCRYPTED_SHA ($ENCRYPTED_BYTES B)." >> "$GITHUB_STEP_SUMMARY"
+        fi
     - name: Check temporary recovery capacity for the encrypted APK
       id: apk_fallback_budget
-      if: ${{ always() && steps.apk_seal.outputs.ready == 'true' && steps.apk_upload.outcome != 'success' }}
+      if: ${{ always() && steps.apk_seal.outputs.ready == 'true' && steps.seal_receipt.outcome == 'success' && steps.seal_receipt.outputs.id == '' }}
       timeout-minutes: 3
       env:
         CACHE_READ_TOKEN: ${{ github.token }}
@@ -1138,7 +1480,7 @@ jobs:
         if max(usage, listed) + encrypted + 1024**2 + 1024**3 > 10 * 1024**3:
             raise SystemExit('Encrypted APK fallback exceeds the configured free cache budget.')
         PYTHON
-        echo "key=bare-coexist-204-apk-v1-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+        echo "key=bare-coexist-204-apk-v1-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT${SEGMENT_SUFFIX}" >> "$GITHUB_OUTPUT"
     - name: Save only the encrypted APK for retrieval retry
       id: apk_fallback_save
       if: ${{ always() && steps.apk_fallback_budget.outcome == 'success' }}
@@ -1157,7 +1499,7 @@ jobs:
         ENCRYPTED_SHA: ${{ steps.apk_seal.outputs.sha }}
         ENCRYPTED_BYTES: ${{ steps.apk_seal.outputs.bytes }}
       run: |
-        [[ $ENCRYPTED_KEY == "bare-coexist-204-apk-v1-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
+        [[ $ENCRYPTED_KEY == "bare-coexist-204-apk-v1-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT${SEGMENT_SUFFIX}" ]]
         cache_id=$(/usr/bin/python3 -I - <<'PYTHON'
         import os
         import runpy
@@ -1187,9 +1529,31 @@ jobs:
         echo "key=$ENCRYPTED_KEY" >> "$GITHUB_OUTPUT"
         printf 'APK artifact upload failed; temporary ciphertext cache ID %s, key %s, SHA-256 %s, %s bytes\n' \
           "$cache_id" "$ENCRYPTED_KEY" "$ENCRYPTED_SHA" "$ENCRYPTED_BYTES" | tee -a "$GITHUB_STEP_SUMMARY"
+    - name: Classify progress on the fixed APK graph after all writers stop
+      id: frontier_finish
+      if: ${{ !cancelled() && inputs.probe == 'checkpoint-production' && steps.quiesce.outputs.quiescent == 'true' && steps.apk_seal.outcome == 'success' && steps.apk_seal.outputs.terminal
+        != 'true' }}
+      timeout-minutes: 25
+      env:
+        TRIAL_PHASE: ${{ steps.trial.outputs.phase }}
+      run: |
+        set -euo pipefail
+        cd "$RUNNER_TEMP/bare-official"
+        docker compose exec -T -e TRIAL_PHASE -e CHECKPOINT_BACKEND -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 chromium-builder bash -euc '
+          cd /work/chromium/src
+          set -o pipefail
+          flags=()
+          [[ $CHECKPOINT_BACKEND != draft ]] || flags+=(--private-intermediates)
+          python3 /exchange/segment_graph.py after "${flags[@]}" --baseline /exchange/checkpoint/segment-before.json \
+            --trial "/exchange/checkpoint/trial-$TRIAL_PHASE.json" --host-quiesced | tee /exchange/checkpoint/frontier-after.log
+        '
+        status=$(tail -n 1 exchange/checkpoint/frontier-after.log | jq -r .frontier_status)
+        [[ $status == candidate || $status == no-progress ]]
+        echo "status=$status" >> "$GITHUB_OUTPUT"
     - name: Pack the completed intermediate outputs
       id: pack-checkpoint
-      if: ${{ !cancelled() && steps.quiesce.outputs.quiescent == 'true' && (inputs.probe != 'checkpoint-production' || steps.apk_seal.outcome == 'success' && steps.apk_seal.outputs.terminal != 'true') }}
+      if: ${{ !cancelled() && steps.quiesce.outputs.quiescent == 'true' && (inputs.probe != 'checkpoint-production' || steps.frontier_finish.outputs.status == 'candidate')
+        }}
       timeout-minutes: ${{ (inputs.probe == 'checkpoint-large' || inputs.probe == 'checkpoint-production') && 45 || inputs.probe == 'checkpoint-scale' && 35 || 28 }}
       env:
         TRIAL_PHASE: ${{ steps.trial.outputs.phase }}
@@ -1204,10 +1568,12 @@ jobs:
         [[ $PROBE_MODE != checkpoint-production ]] || pack_timeout=42m
         docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CI_REVISION=$GITHUB_SHA" -e "BASE_IMAGE=$BARE_BASE_IMAGE" \
           -e "TRIAL_PHASE=$phase" -e "PROBE_MODE=$PROBE_MODE" -e "PRODUCTION_CAP_BYTES=$PRODUCTION_CAP_BYTES" \
-          -e "RETAIN_EXISTING_CACHES=$RETAIN_EXISTING_CACHES" chromium-builder \
+          -e CHECKPOINT_BACKEND -e "RETAIN_EXISTING_CACHES=$RETAIN_EXISTING_CACHES" chromium-builder \
           timeout --kill-after=2m "$pack_timeout" bash -seu <<'CONTAINER'
         set -o pipefail
         cd /work/chromium/src
+        continuation=(python3 /exchange/checkpoint.py)
+        if [[ $CHECKPOINT_BACKEND == draft ]]; then continuation=(python3 /exchange/check_archive.py /exchange/checkpoint.py); fi
         if [[ ! -s /exchange/checkpoint/trial-$TRIAL_PHASE.json ]]; then
           if [[ $PROBE_MODE == checkpoint-production ]]; then
             echo 'Production controller did not report a result; retain the previous checkpoint.' >&2
@@ -1263,7 +1629,7 @@ jobs:
             # Keep the existing archive verifier's canonical receipt path.
             # Its payload still identifies a cold seed and carries real completed actions.
             mv -- out/Bare/checkpoint-trial-seed.json out/Bare/checkpoint-trial-restore.json
-            if ! python3 /exchange/checkpoint.py record-continuation \
+            if ! "${continuation[@]}" record-continuation \
               out/Bare/checkpoint-trial-restore.json out/Bare/checkpoint-continuation.json "${limits[@]}"; then
               proof=false
             fi
@@ -1275,7 +1641,7 @@ jobs:
           if [[ $PROBE_MODE == checkpoint-scale || $PROBE_MODE == checkpoint-large ]]; then
             rm -f -- out/Bare/checkpoint-continuation.json
           fi
-          if ! python3 /exchange/checkpoint.py record-continuation \
+          if ! "${continuation[@]}" record-continuation \
             out/Bare/checkpoint-trial-restore.json out/Bare/checkpoint-continuation.json "${limits[@]}"; then
             proof=false
           fi
@@ -1311,6 +1677,12 @@ jobs:
           exclusions+=(--exclude=out/Bare/apks --exclude='*.[aA][pP][kK]' --exclude='*.[aA][pP]_' \
             --exclude='*.[aA][aA][bB]' --exclude='*.[aA][pP][kK][sS]')
         fi
+        if [[ $CHECKPOINT_BACKEND == draft ]]; then
+          cp out/Bare/checkpoint-provenance.json /exchange/checkpoint/provenance.json
+          sha256sum out/Bare/checkpoint-segment-frontier.json | cut -d' ' -f1 > /exchange/checkpoint/frontier-proof.sha
+          chmod 0644 /exchange/checkpoint/{provenance.json,frontier-proof.sha,proof.json} "/exchange/checkpoint/trial-$TRIAL_PHASE.json"
+          exit 0
+        fi
         candidate=$(mktemp /exchange/checkpoint/checkpoint-next.XXXXXX)
         trap 'rm -f -- "$candidate"' EXIT
         cap=2952790016
@@ -1343,6 +1715,39 @@ jobs:
         [[ ! -e /exchange/checkpoint/checkpoint-next.tar.gz && ! -L /exchange/checkpoint/checkpoint-next.tar.gz ]]
         mv -T -- "$candidate" /exchange/checkpoint/checkpoint-next.tar.gz
         CONTAINER
+        if [[ $CHECKPOINT_BACKEND == draft ]]; then
+          file="$RUNNER_TEMP/r28-normal/child.tar.zst"
+          python3 "$GITHUB_WORKSPACE/preflight28/limits/guard.py" space "$RUNNER_TEMP" --bytes $((2 * 3758096384 + 16 * 1024**2)) --inodes 5
+          docker compose exec -T chromium-builder bash -euc '
+            cd /work/chromium/src
+            # This archive travels only as CMS to the fixed private Draft. The completed
+            # target is handled by the owner-signing path; all dependencies, including
+            # generated GN descriptors and intermediate Android packages, must survive.
+            [[ ! -e out/Bare/apks/ChromePublic.apk && ! -L out/Bare/apks/ChromePublic.apk ]]
+            tar --format=posix --pax-option=delete=atime,delete=ctime -cf - out/Bare' |
+            zstd -q -T2 -9 -c | python3 "$GITHUB_WORKSPACE/preflight28/transport/stream.py" "$file"
+          # Credentials are scoped to individual Actions steps and no process in the
+          # isolated build container survives into the Artifact handshake.
+          docker compose stop --timeout 20
+          [[ -z $(docker compose ps --status running -q) ]]
+          [[ $(jq -er .evidence_valid exchange/checkpoint/proof.json) == true ]]
+          jq -e '.ready_for_restore_test == true and .forced_kill == false and .failed_step_count == 0' "exchange/checkpoint/trial-$phase.json" > /dev/null
+          identity=$(jq -er .identity_sha256 exchange/checkpoint/provenance.json)
+          check="$GITHUB_WORKSPACE/preflight28/bridge/check_archive.py"
+          for operation in validate-archive verify-continuation inspect-input-paths; do
+            args=(--production)
+            if [[ $operation == verify-continuation ]]; then args+=(--ci-revision "$GITHUB_SHA" --expected-identity "$identity"); fi
+            python3 "$check" "$RUNNER_TEMP/bare-ci/checkpoint.py" "$operation" "$file" "${args[@]}"
+          done
+          proof=$(cat exchange/checkpoint/frontier-proof.sha)
+          [[ $proof =~ ^[0-9a-f]{64}$ && $(tail -n 1 exchange/checkpoint/frontier-after.log | jq -r .candidate_progress) == true ]]
+          python3 "$GITHUB_WORKSPACE/preflight28/bridge/normal.py" seal "$file" --identity "$identity" --proof-sha "$proof"
+          echo "sha=$(sha256sum "$file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "bytes=$(stat -c%s "$file")" >> "$GITHUB_OUTPUT"
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+          echo 'checkpoint_advanced=true' >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
         candidate=exchange/checkpoint/checkpoint-next.tar.gz
         archive=exchange/checkpoint/checkpoint.tar.gz
         [[ -f $candidate && ! -L $candidate && ! -e $archive && ! -L $archive ]]
@@ -1361,12 +1766,14 @@ jobs:
         echo "sha=$sha" >> "$GITHUB_OUTPUT"
         echo "identity=$identity" >> "$GITHUB_OUTPUT"
         echo "bytes=$size" >> "$GITHUB_OUTPUT"
-        python3 - "exchange/checkpoint/trial-$phase.json" >> "$GITHUB_OUTPUT" <<'PYTHON'
-        import json, sys
-        with open(sys.argv[1]) as trial:
-            count = json.load(trial).get('new_completed_output_count')
-        print('checkpoint_advanced=' + ('true' if type(count) is int and count > 0 else 'false'))
-        PYTHON
+        if [[ $PROBE_MODE == checkpoint-production ]]; then
+          test "$(tail -n 1 exchange/checkpoint/frontier-after.log | jq -r .candidate_progress)" = true
+          # A candidate can start a receiver. Its independent check admits any subsequent compilation.
+          echo "checkpoint_advanced=true" >> "$GITHUB_OUTPUT"
+        else
+          python3 -c 'import json,sys; n=json.load(open(sys.argv[1])).get("new_completed_output_count"); print("checkpoint_advanced=" + str(type(n) is int and n>0).lower())' \
+            "exchange/checkpoint/trial-$phase.json" >> "$GITHUB_OUTPUT"
+        fi
         {
           echo '### Saved-output candidate'
           echo "- Key: $CHECKPOINT_KEY"
@@ -1402,8 +1809,8 @@ jobs:
         } | tee -a "$GITHUB_STEP_SUMMARY" || echo '::warning::Summary display failed; continue to checkpoint saving.'
     - name: Measure the checkpoint payload before upload
       id: measure-checkpoint
-      if: ${{ !cancelled() && (inputs.probe == 'checkpoint-scale' || inputs.probe == 'checkpoint-large' || inputs.probe == 'checkpoint-production') && steps.pack-checkpoint.outcome
-        == 'success' }}
+      if: ${{ (!cancelled() && (inputs.probe == 'checkpoint-scale' || inputs.probe == 'checkpoint-large' || inputs.probe == 'checkpoint-production') && steps.pack-checkpoint.outcome
+        == 'success') && (inputs.backend != 'draft') }}
       timeout-minutes: ${{ (inputs.probe == 'checkpoint-large' || inputs.probe == 'checkpoint-production') && 8 || 5 }}
       run: |
         archive="$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
@@ -1424,7 +1831,7 @@ jobs:
         CANDIDATE_BYTES: ${{ steps.pack-checkpoint.outputs.bytes }}
     - name: Recheck storage and predecessor keys before the scale upload
       id: scale-save-budget
-      if: ${{ !cancelled() && steps.measure-checkpoint.outcome == 'success' }}
+      if: ${{ (!cancelled() && steps.measure-checkpoint.outcome == 'success') && (inputs.backend != 'draft') }}
       timeout-minutes: 5
       env:
         CACHE_READ_TOKEN: ${{ github.token }}
@@ -1432,8 +1839,8 @@ jobs:
       run: exec /usr/bin/python3 -I "$RUNNER_TEMP/bare-cache-reader/check-cache-budget.py"
     - name: Save a new bounded generation without replacing the producer
       id: save-checkpoint
-      if: ${{ !cancelled() && steps.pack-checkpoint.outcome == 'success' && (!(inputs.probe == 'checkpoint-scale' || inputs.probe ==
-        'checkpoint-large' || inputs.probe == 'checkpoint-production') || steps.scale-save-budget.outcome == 'success') }}
+      if: ${{ (!cancelled() && steps.pack-checkpoint.outcome == 'success' && (!(inputs.probe == 'checkpoint-scale' || inputs.probe == 'checkpoint-large' || inputs.probe
+        == 'checkpoint-production') || steps.scale-save-budget.outcome == 'success')) && (inputs.backend != 'draft') }}
       timeout-minutes: ${{ (inputs.probe == 'checkpoint-large' || inputs.probe == 'checkpoint-production') && 15 || 10 }}
       uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
       with:
@@ -1441,7 +1848,7 @@ jobs:
         key: ${{ steps.identity.outputs.key }}
     - name: Confirm the exact saved key exists before reporting success
       id: saved-receipt
-      if: ${{ always() && steps.save-checkpoint.outcome == 'success' }}
+      if: ${{ (always() && steps.save-checkpoint.outcome == 'success') && (inputs.backend != 'draft') }}
       timeout-minutes: ${{ (inputs.probe == 'checkpoint-large' || inputs.probe == 'checkpoint-production') && 4 || 3 }}
       env:
         CACHE_READ_TOKEN: ${{ github.token }}
@@ -1473,7 +1880,7 @@ jobs:
         echo "saved=true" >> "$GITHUB_OUTPUT"
     - name: Separate candidate preservation from a passing reuse test
       id: checkpoint-proof
-      if: ${{ always() && steps.saved-receipt.outcome == 'success' }}
+      if: ${{ (always() && steps.saved-receipt.outcome == 'success') && (inputs.backend != 'draft') }}
       timeout-minutes: 2
       env:
         TRIAL_PHASE: ${{ steps.trial.outputs.phase }}
@@ -1539,3 +1946,150 @@ jobs:
             done
           ' || true
         fi
+    - name: Emit terminal peer outcome for this exact slot
+      id: peer_stop
+      if: ${{ always() && !cancelled() && inputs.backend == 'draft' && steps.peer_acquire.outcome == 'success' && steps.pack-checkpoint.outputs.checkpoint_advanced !=
+        'true' }}
+      env:
+        FRONTIER: ${{ steps.frontier_finish.outputs.status }}
+        TERMINAL: ${{ steps.apk_seal.outputs.terminal }}
+        DELIVERY_STATUS: ${{ steps.apk_seal.outputs.status }}
+        VERIFY_ONLY: ${{ inputs.verify_frontier_only && 'true' || 'false' }}
+        JOB_STATUS: ${{ job.status }}
+      run: |-
+        set -euo pipefail
+        reason=failed
+        if [[ $JOB_STATUS == success ]]; then
+          if [[ $VERIFY_ONLY == true ]]; then reason=verify-only;
+          elif [[ $DELIVERY_STATUS == apk-size-exceeded || $DELIVERY_STATUS == cipher-size-exceeded ]]; then reason=size-exceeded;
+          elif [[ $TERMINAL == true ]]; then reason=apk;
+          elif [[ $FRONTIER == no-progress ]]; then reason=no-progress; fi
+        fi
+        python3 preflight28/bridge/normal.py stop --reason "$reason"
+    - name: Measure retained relay bytes before uploading the sealed checkpoint
+      id: peer_capacity
+      if: ${{ !cancelled() && inputs.backend == 'draft' && steps.pack-checkpoint.outputs.checkpoint_advanced == 'true' }}
+      timeout-minutes: 3
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
+      run: python3 preflight28/bridge/normal.py capacity
+    - name: Deposit outcome in this run
+      id: peer_put_outcome
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      timeout-minutes: 18
+      with:
+        name: ${{ steps.peer_names.outputs.outcome_name }}
+        path: ${{ steps.pack-checkpoint.outputs.checkpoint_advanced == 'true' && format('{0}/r28-normal/outcome.json{1}{0}/r28-normal/checkpoint.cms', runner.temp, fromJSON('"\n"'))
+          || format('{0}/r28-normal/outcome.json', runner.temp) }}
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 1
+        compression-level: 0
+      if: ${{ always() && !cancelled() && inputs.backend == 'draft' && (steps.peer_stop.outcome == 'success' || steps.peer_capacity.outcome == 'success')
+        }}
+    name: Compile or verify authenticated APK slot ${{ inputs.segment_ordinal }}
+  draft-publisher:
+    name: Private checkpoint receipt for slot ${{ inputs.segment_ordinal }}
+    if: ${{ inputs.backend == 'draft' && github.event_name == 'workflow_dispatch' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-coexist-v2.0.4'
+      && github.actor == 'Areal-U' && github.run_attempt == '1' && inputs.probe == 'checkpoint-production' && inputs.segment_ordinal >= 1 && inputs.segment_ordinal <=
+      13 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    permissions:
+      actions: read
+      contents: write
+    env:
+      R28_SLOT: ${{ inputs.segment_ordinal }}
+      R28_PARENT_SHA: ${{ inputs.expected_checkpoint_sha }}
+      R28_PARENT_IDENTITY: ${{ inputs.expected_checkpoint_identity }}
+      R28_PARENT_MANIFEST: ${{ inputs.parent_manifest_id }}
+      R28_PARENT_MANIFEST_SHA: ${{ inputs.parent_manifest_sha }}
+      R28_HEAD_SHA: ${{ github.sha }}
+    outputs:
+      checkpoint_manifest_id: ${{ steps.publish.outputs.checkpoint_manifest_id }}
+      checkpoint_manifest_sha: ${{ steps.publish.outputs.checkpoint_manifest_sha }}
+      checkpoint_sha: ${{ steps.publish.outputs.checkpoint_sha }}
+      checkpoint_key: ${{ steps.publish.outputs.checkpoint_key }}
+      checkpoint_bytes: ${{ steps.publish.outputs.checkpoint_bytes }}
+      checkpoint_identity: ${{ steps.publish.outputs.checkpoint_identity }}
+      private_readback_verified: ${{ steps.publish.outputs.private_readback_verified }}
+    steps:
+    - name: Read trusted workflow helpers without retaining credentials
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+        sparse-checkout: |-
+          preflight28
+          .github/workflows/bare-round26-transport-check.yml
+          /checkpoint.py
+        sparse-checkout-cone-mode: false
+    - name: Reserve the relay peak before acquiring a large peer artifact
+      run: bash preflight28/bridge/host_space.sh
+    - name: Bind peer artifacts to this run and logical slot
+      id: peer_names
+      run: python3 preflight28/bridge/normal.py names
+    - name: Stage the fixed owner-Draft interface
+      run: python3 preflight28/transport/prepare.py tools
+    - name: Create an ephemeral limited transfer key
+      id: peer_key
+      timeout-minutes: 4
+      env:
+        GH_TOKEN: ${{ github.token }}
+        CHECK_RUN: ${{ job.check_run_id }}
+        CLOCK_SUFFIX: Private checkpoint receipt for slot ${{ inputs.segment_ordinal }}
+      run: |-
+        set -euo pipefail
+        if [[ ! ${CHECK_RUN:-} =~ ^[1-9][0-9]*$ ]]; then
+          CHECK_RUN=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" | jq -er --arg suffix "$CLOCK_SUFFIX" '
+            select(.total_count == (.jobs|length)) | [.jobs[]|select((.name|endswith($suffix)) and .status=="in_progress")|.check_run_url|split("/")|last] | select(length==1) | first')
+        fi
+        python3 preflight28/bridge/normal.py keygen limited --check-run "$CHECK_RUN"
+    - name: Discover exact peer key
+      id: peer_wait_key
+      timeout-minutes: 12
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 preflight28/bridge/normal.py wait key
+    - name: Fetch authenticated key by immutable artifact ID
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 4
+      with:
+        artifact-ids: ${{ steps.peer_wait_key.outputs.id }}
+        path: ${{ runner.temp }}/r28-normal/incoming
+        merge-multiple: true
+    - name: Issue time-limited parent read descriptors bound to the peer
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 preflight28/bridge/normal.py issue
+    - name: Deposit descriptor in this run
+      id: peer_put_descriptor
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      timeout-minutes: 4
+      with:
+        name: ${{ steps.peer_names.outputs.descriptor_name }}
+        path: ${{ runner.temp }}/r28-normal/input.cms
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 1
+        compression-level: 0
+    - name: Discover exact peer outcome
+      id: peer_wait_outcome
+      timeout-minutes: 330
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 preflight28/bridge/normal.py wait outcome
+    - name: Fetch authenticated outcome by immutable artifact ID
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 18
+      with:
+        artifact-ids: ${{ steps.peer_wait_outcome.outputs.id }}
+        path: ${{ runner.temp }}/r28-normal/incoming
+        merge-multiple: true
+    - name: Receive bounded ciphertext and independently verify fixed private publication
+      id: publish
+      timeout-minutes: 34
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 preflight28/bridge/normal.py publish
