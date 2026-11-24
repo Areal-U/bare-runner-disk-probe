@@ -168,7 +168,9 @@ def anonymous(row):
 
 
 def receive():
-    source()
+    # An already-received private child remains recoverable if the old cache later expires.
+    if CAMPAIGN != V2 or os.environ["GITHUB_RUN_ATTEMPT"] == "1":
+        source()
     found = [row for suffix in ("manifest.json", "manifest.json-retry1")
              if (row := locate(prefix() + suffix)) and row["state"] == "uploaded"]
     demand(len(found) == 1, "Canonical completed manifest missing or ambiguous")

@@ -45,7 +45,7 @@ if [[ ! ${CHECK_RUN:-} =~ ^[1-9][0-9]*$ ]]; then
 fi
 epoch=$(python3 preflight28/limits/guard.py job-clock --check-run "$CHECK_RUN")
 echo "JOB_STARTED=$epoch" >> "$GITHUB_ENV"
-python3 preflight28/transport/exchange.py parent''',3,env={**TOKEN,"JOB_READ_TOKEN":"${{ github.token }}","CHECK_RUN":"${{ job.check_run_id }}","CLOCK_NAME":name})
+if [[ $GITHUB_JOB != receive || $GITHUB_RUN_ATTEMPT == 1 ]]; then python3 preflight28/transport/exchange.py parent; fi''',3,env={**TOKEN,"JOB_READ_TOKEN":"${{ github.token }}","CHECK_RUN":"${{ job.check_run_id }}","CLOCK_NAME":name})
 
 def artifact(kind):
     return "r28-fresh-${{ github.run_id }}-"+{"key":"writer","cipher":"cipher","delta":"delta"}[kind]
@@ -198,7 +198,7 @@ python3 preflight28/transport/exchange.py receive''',75,
                    env={**TOKEN,"MANIFEST_ID":"${{ needs.send.outputs.manifest_id }}","MANIFEST_SHA":"${{ needs.send.outputs.manifest_sha }}"}),
                 sh("Independently restore complete fixed APK graph and retained contents without new compilation",
                    "python3 preflight28/transport/prepare.py receive",177),
-                sh("Reconfirm original S2 remains available after receipt",EXCHANGE+" parent",3,True)]}
+                sh("Reconfirm original S2 remains available after receipt",EXCHANGE+" parent",3,True,**{"if":"${{ github.run_attempt == '1' }}"})]}
     jobs={"reserve":reserve,"produce":producer,"send":sender,"receive":receive}
     for j in jobs.values():
         assert all(len(step.get("run",""))<21000 for step in j["steps"])
