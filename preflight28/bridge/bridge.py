@@ -94,22 +94,45 @@ def guard():
             event["after"] == HEAD == pr["head"]["sha"] and event["sender"]["id"] == 292261483,
             "Unauthorized trial generation")
     sid = env_int("SOURCE_RUN")
-    info = api_json(f"/repos/{REPO}/actions/runs/{sid}/attempts/1")
-    require(info["conclusion"]=="success" and info["head_sha"] == os.environ["SOURCE_HEAD"] and
-            info["run_attempt"]==1 and info["head_branch"]==pr["head"]["ref"] and info["path"]==SOURCE_WORKFLOW and
-            info["repository"]["id"]==1450926240 and info["actor"]["id"]==292261483,
-            "Real source workflow not independently successful")
-    jobs = api_json(f"/repos/{REPO}/actions/runs/{sid}/attempts/1/jobs?per_page=100")["jobs"]
-    steps = {s["name"] for j in jobs if j["conclusion"]=="success" for s in j["steps"] if s["conclusion"]=="success"}
-    require({"Send only the verified generation to the existing owner Draft",
-             "Rebuild fixed environment and prove full restored APK frontier without new compilation"} <= steps,
-             "No previously accepted source generation")
+    read_attempt=env_int("SOURCE_RECEIVER_ATTEMPT")
+    require(1<=read_attempt<=12,"Unbounded source recovery")
+    def source_jobs(attempt,final):
+        info=api_json(f"/repos/{REPO}/actions/runs/{sid}/attempts/{attempt}")
+        require(info["status"]=="completed" and (not final or info["conclusion"]=="success")
+                and info["head_sha"]==os.environ["SOURCE_HEAD"] and info["run_attempt"]==attempt
+                and info["head_branch"]==pr["head"]["ref"] and info["path"]==SOURCE_WORKFLOW
+                and info["repository"]["id"]==1450926240 and info["actor"]["id"]==292261483,
+                "Wrong completed source attempt")
+        return api_json(f"/repos/{REPO}/actions/runs/{sid}/attempts/{attempt}/jobs?per_page=100")["jobs"]
+    producer_jobs=source_jobs(1,read_attempt==1)
+    receiver_jobs=producer_jobs if read_attempt==1 else source_jobs(read_attempt,True)
+    def verified(jobs,required):
+        return [j["id"] for j in jobs if j["conclusion"]=="success" and
+                any(s["name"]==required and s["conclusion"]=="success" for s in j["steps"])]
+    produced=verified(producer_jobs,"Send only the verified generation to the existing owner Draft")
+    received=verified(receiver_jobs,"Rebuild fixed environment and prove full restored APK frontier without new compilation")
+    require(len(produced)==len(received)==1 and produced!=received,"No separately accepted source generation")
+    print(f"source_producer_job={produced[0]} attempt=1 receiver_job={received[0]} receiver_attempt={read_attempt}")
     if os.environ["GITHUB_JOB"]=="ordinary":
         api_json(f"/repos/{REPO}/releases/{RELEASE}", expected="denied")
     require(not ROOT.exists(), "Runner staging directory already exists")
     ROOT.mkdir(mode=0o700)
-    disk("begin", 2*CAP + 24*1024**2 + (2753879385 if os.environ["GITHUB_JOB"]=="ordinary" else 0))
+    disk("begin", 2*CAP + 160*1024**2 + (2753879385 if os.environ["GITHUB_JOB"]=="ordinary" else 0))
     inventory()
+
+
+def reserve():
+    sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"control"))
+    import admission
+    require(os.environ["GITHUB_JOB"]=="limited" and env_int("GITHUB_RUN_ATTEMPT")==1,"Restricted claim required")
+    # Same recipe/head and same physical source can have only one expensive relay,
+    # even if the provider delivers the same synchronize event under a second run ID.
+    holder={"schema":"bare-r28-cms-relay-claim-v1","run":env_int("GITHUB_RUN_ID"),"attempt":1,
+            "trial_head":HEAD,"source_sha":os.environ["SOURCE_HEAD"],"source_run":env_int("SOURCE_RUN"),
+            "manifest_id":env_int("SOURCE_MANIFEST_ID"),"manifest_sha":os.environ["SOURCE_MANIFEST_SHA"]}
+    name=f"r28-split-relay-{holder['manifest_id']}-{HEAD}-claim.json"
+    asset=admission.admit("compute",holder,auth_api(),name=name)
+    print(f"limited_relay_claim_asset={asset} metadata_bytes={len(admission.encode(holder))}",flush=True)
 
 
 def disk(stage, future=0):
@@ -138,6 +161,10 @@ def inventory():
         "visible_trial":[[r["id"],r["name"],r["size_in_bytes"],r["expired"],r["expires_at"]]
                          for r in rows if r["name"].startswith("r28-split-s2-")]}, separators=(",",":")))
     return rows
+
+
+def parent_space():
+    disk("before-S2-outer-and-inner-cache-materialization",2742685925+2753879385+64*1024**2)
 
 
 def before_upload():
@@ -173,9 +200,9 @@ def wait(kind):
     raise ValueError("Peer stage unavailable before bounded receipt deadline")
 
 
-def openssl(*args, capture=False):
+def openssl(*args, capture=False, timeout=500):
     return subprocess.run(["openssl",*map(str,args)],check=True,stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
-                          stderr=subprocess.PIPE,timeout=500).stdout
+                          stderr=subprocess.PIPE,timeout=timeout).stdout
 
 
 def fingerprint(key):
@@ -193,15 +220,15 @@ def keygen():
     print("generated_ephemeral_public_fingerprint=" + fingerprint(ROOT/"public.pem"))
 
 
-def encrypt(public, plain, sealed):
+def encrypt(public, plain, sealed, *, timeout=500):
     fingerprint(public)
     openssl("cms","-encrypt","-binary","-stream","-outform","DER","-aes-256-gcm","-in",plain,"-out",sealed,
-            "-recip",public,"-keyopt","rsa_padding_mode:oaep","-keyopt","rsa_oaep_md:sha256")
+            "-recip",public,"-keyopt","rsa_padding_mode:oaep","-keyopt","rsa_oaep_md:sha256",timeout=timeout)
 
 
-def decrypt(sealed, plain):
+def decrypt(sealed, plain, *, timeout=500):
     openssl("cms","-decrypt","-inform","DER","-binary","-in",sealed,"-recip",ROOT/"public.pem",
-            "-inkey",ROOT/"key.pem","-out",plain)
+            "-inkey",ROOT/"key.pem","-out",plain,timeout=timeout)
 
 
 def get_source():
@@ -297,7 +324,7 @@ def acquire():
     require(file.stat().st_size==m["bytes"] and whole.hexdigest()==m["sha256"],"Full input mismatch")
     print(f"verified_ordinary_input source_manifest={rec['manifest_id']} bytes={m['bytes']} sha256={m['sha256']}")
     (ROOT/"writer.pem").write_text(rec["writer_key"])
-    disk("ordinary-input",m["bytes"]+16*1024**2)
+    disk("ordinary-input",m["bytes"]+160*1024**2)
 
 
 def seal(file):
@@ -309,7 +336,8 @@ def seal(file):
     require(file.stat().st_size==rec["source"]["bytes"] and digest(file)==rec["source"]["sha256"],
             "This trial may transport only its existing verified generation")
     sealed=ROOT/"checkpoint.cms"
-    encrypt(ROOT/"writer.pem",file,sealed)
+    from frames import seal as seal_frames
+    seal_frames(ROOT/"writer.pem",file,sealed,rec["source"]["sha256"])
     require(0<sealed.stat().st_size<=file.stat().st_size+16*1024**2,"Cipher overhead exceeds trial allocation")
     info={"run":env_int("GITHUB_RUN_ID"),"attempt":1,"trial_head":HEAD,"source_manifest":env_int("SOURCE_MANIFEST_ID"),
         "source_sha":rec["source"]["sha256"],"source_bytes":file.stat().st_size,"sealed_bytes":sealed.stat().st_size,
@@ -329,9 +357,10 @@ def accepted():
         evidence["source_sha"]==manifest["sha256"] and evidence["recipient_fpr"]==fingerprint(ROOT/"public.pem") and
         sealed.stat().st_size==evidence["sealed_bytes"] and digest(sealed)==evidence["sealed_sha"],
         "Ciphertext receipt mismatch")
-    disk("writer-cipher",manifest["bytes"])
+    disk("writer-cipher",manifest["bytes"]+144*1024**2)
     plain=ROOT/"restored.tar.zst"
-    decrypt(sealed,plain)
+    from frames import receive as receive_frames
+    receive_frames(sealed,plain,manifest["bytes"],manifest["sha256"])
     require(plain.stat().st_size==manifest["bytes"] and digest(plain)==manifest["sha256"],"Recovered checkpoint differs")
     combined=hashlib.sha256()
     class Sink:
@@ -341,14 +370,14 @@ def accepted():
         api.download(part["id"],part["bytes"],part["sha256"],Sink())
     require(combined.hexdigest()==manifest["sha256"],"Existing full owner checkpoint no longer matches")
     disk("writer-restored")
-    print(f"writer_verified_existing_draft={RELEASE} manifest_id={env_int('SOURCE_MANIFEST_ID')} checkpoint_bytes={manifest['bytes']} sha256={combined.hexdigest()} additional_draft_upload_bytes=0")
+    print(f"writer_verified_existing_draft={RELEASE} manifest_id={env_int('SOURCE_MANIFEST_ID')} checkpoint_bytes={manifest['bytes']} sha256={combined.hexdigest()} additional_draft_checkpoint_payload_bytes=0")
     inventory()
 
 
 if __name__=="__main__":
     os.umask(0o077)
     ap=argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("mode",choices=["guard","keygen","wait","issue","acquire","seal","accepted","inventory","before_upload"])
+    ap.add_argument("mode",choices=["guard","keygen","wait","issue","acquire","seal","accepted","inventory","before_upload","parent_space","reserve"])
     ap.add_argument("value",nargs="?")
     args=ap.parse_args()
     if args.mode=="wait":

@@ -12,6 +12,7 @@ import subprocess
 import time
 from urllib.parse import quote, urlsplit
 import bridge as b
+import frames
 from verify_payload import check as verify_payload
 
 ROOT = Path(os.environ["RUNNER_TEMP"]) / "r28-normal"
@@ -242,8 +243,8 @@ def seal(file,identity,proof_sha):
     plain_hash=b.digest(file)
     b.require(plain_hash!=rec["parent_sha"],"Exact parent replay")
     sealed=ROOT/"checkpoint.cms"
-    b.disk("before-checkpoint-encryption",file.stat().st_size+16*1024**2)
-    b.encrypt(ROOT/"writer.pem",file,sealed)
+    b.disk("before-checkpoint-encryption",file.stat().st_size+160*1024**2)
+    frames.seal(ROOT/"writer.pem",file,sealed,plain_hash)
     b.require(0<sealed.stat().st_size<=file.stat().st_size+16*1024**2,"Unbounded ciphertext")
     evidence={**context(),"status":"candidate","bytes":file.stat().st_size,"sha256":plain_hash,"identity":identity,
               "proof_sha":proof_sha,"sealed_bytes":sealed.stat().st_size,"sealed_sha":b.digest(sealed),
@@ -416,8 +417,8 @@ def publish():
               and slot()<=12 and file.stat().st_size==r["sealed_bytes"] and b.digest(file)==r["sealed_sha"]
               and b.fingerprint(ROOT/"public.pem")==r["recipient_fpr"],"Sealed checkpoint mismatch")
     plain=ROOT/"candidate.tar.zst"
-    b.disk("before-private-writer-decryption",r["bytes"])
-    b.decrypt(file,plain)
+    b.disk("before-private-writer-decryption",r["bytes"]+144*1024**2)
+    frames.receive(file,plain,r["bytes"],r["sha256"])
     b.require(plain.stat().st_size==r["bytes"] and b.digest(plain)==r["sha256"],"Checkpoint content changed")
     verify_payload(plain,r)
     m={**context(),**{k:r[k] for k in ("bytes","sha256","identity","proof_sha")},"format":"tar.zst","parts":[]}

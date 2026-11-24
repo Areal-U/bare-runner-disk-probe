@@ -55,7 +55,8 @@ df -Pi "$RUNNER_TEMP"
 openssl version
 '''}
 
-def render(before, run, head, mid, msha):
+def render(before, run, head, mid, msha, source_receiver_attempt=1):
+    assert 1<=source_receiver_attempt<=12
     assert all(re.fullmatch("[0-9a-f]{40}",h) for h in (before,head)) and re.fullmatch("[0-9a-f]{64}",msha) and run>0 and mid>0
     guard=("github.event_name == 'pull_request' && github.event.action == 'synchronize' && "
         "github.event.pull_request.number == 9 && github.run_attempt == '1' && github.actor == 'Areal-U' && "
@@ -69,13 +70,14 @@ def render(before, run, head, mid, msha):
     check=call("Verify already-accepted source and record current storage","guard",True)
     key=call("Generate a job-local test transport key","keygen")
     ordinary={**commons,"name":"Ordinary runner without Draft access","permissions":{"actions":"read"},"cache-mode":"read",
-            "steps":[stage,embed("bridge/compiler_fixture.py"),embed("graph/retained.py"),begin,check,key,upload("key",["public.pem"]),*read("descriptor"),
+            "steps":[stage,embed("bridge/frames.py"),embed("bridge/compiler_fixture.py"),embed("graph/retained.py"),begin,check,key,upload("key",["public.pem"]),*read("descriptor"),
                 call("Acquire exact full successor with no repository token","acquire"),
                 call("Seal the same complete checkpoint to the separate Draft writer",'seal "$RUNNER_TEMP/r28-split/checkpoint.tar.zst"'),
                 {"name":"Compile and separately seal a native test object on the ordinary runner", "run":"python3 preflight28/bridge/compiler_fixture.py produce"},
                 call("Measure repository peak before introducing one full encrypted relay","before_upload",True),
                 upload("cipher",["checkpoint.cms","fixture.cms","cipher-receipt.json"]),
                 call("Record ordinary runner storage after ciphertext upload","inventory",True),
+                call("Reserve both native cache archive and restored original gzip before cache restore","parent_space"),
                 {"name":"Read fixed S2 only for payload continuity cross-check",
                  "id":"parent","uses":"actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25","timeout-minutes":10,
                  "with":{"path":"${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz",
@@ -91,9 +93,9 @@ def render(before, run, head, mid, msha):
     limited={**commons,"name":"Restricted existing owner-Draft worker","permissions":{"contents":"write","actions":"read"},
             "steps":[{"name":"Check out fixed owner PR head, persist no credentials","uses":"actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
                       "with":{"ref":"${{ github.event.pull_request.head.sha }}","persist-credentials":False}},
-                     stage,embed("bridge/compiler_fixture.py"),embed("transport/prepare.py"),
+                     stage,embed("bridge/frames.py"),embed("bridge/compiler_fixture.py"),embed("transport/prepare.py"),embed("control/admission.py"),
                      {"name":"Stage fixed and hash-validated private archive client","run":"python3 preflight28/transport/prepare.py tools"},
-                     begin,check,key,*read("key"),
+                     begin,check,call("Reserve this one physical full-byte relay before issuing any descriptor","reserve",True),key,*read("key"),
                      call("Issue an encrypted time-limited part-scoped read descriptor","issue",True),
                      upload("descriptor",["input.cms"]),*read("cipher"),
                      {"name":"Independently receive and verify the compiled fixture from the ordinary runner", "run":"python3 preflight28/bridge/compiler_fixture.py receive"},
@@ -102,15 +104,16 @@ def render(before, run, head, mid, msha):
             "on":{"pull_request":{"types":["synchronize"],"branches":["bare-coexist-v2.0.4"],"paths":[NAME]}},
             "permissions":{},"cache-mode":"none","concurrency":{"group":"r28-split-existing-checkpoint-only","cancel-in-progress":False},
             "env":{"PRIOR_SHA":before,"TRIAL_SHA":"${{ github.event.pull_request.head.sha }}","SOURCE_RUN":str(run),
-                   "SOURCE_HEAD":head,"SOURCE_MANIFEST_ID":str(mid),"SOURCE_MANIFEST_SHA":msha},
+                   "SOURCE_HEAD":head,"SOURCE_RECEIVER_ATTEMPT":str(source_receiver_attempt),"SOURCE_MANIFEST_ID":str(mid),"SOURCE_MANIFEST_SHA":msha},
             "defaults":{"run":{"shell":"bash"}},"jobs":{"ordinary":ordinary,"limited":limited}}
 
 if __name__=="__main__":
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument("before");ap.add_argument("source_run",type=int);ap.add_argument("source_head")
     ap.add_argument("manifest_id",type=int);ap.add_argument("manifest_sha");ap.add_argument("out",type=Path)
+    ap.add_argument("--source-receiver-attempt",type=int,default=1)
     x=ap.parse_args()
-    data=yaml.dump(render(x.before,x.source_run,x.source_head,x.manifest_id,x.manifest_sha),Dumper=Readable,sort_keys=False,width=140)
+    data=yaml.dump(render(x.before,x.source_run,x.source_head,x.manifest_id,x.manifest_sha,x.source_receiver_attempt),Dumper=Readable,sort_keys=False,width=140)
     x.out.parent.mkdir(parents=True,exist_ok=True)
     x.out.write_text(data)
     print("workflow_bytes",len(data.encode()),"sha256",hashlib.sha256(data.encode()).hexdigest())
