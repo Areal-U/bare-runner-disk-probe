@@ -7,6 +7,7 @@ it does not claim that every possible writer has exited.
 """
 
 import argparse
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -449,6 +450,7 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
         result["rebuilt_completed_output_count"] = 0
         result["resources_before"] = resource_status(source_root)
     process = None
+    settle_pool = None
     selector = selectors.DefaultSelector()
     old_handlers = {}
     received_signals = []
@@ -535,6 +537,7 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             last_sample = 0
             last_guard_sample = snapshot
             last_resource_poll = 0
+            settle = None
             level = 'normal'
             if production:
                 sample_seconds = 30
@@ -597,10 +600,43 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                             os.killpg(process.pid, signal.SIGINT)
                         result["interrupt_sent"] = True
                         interrupted_at = now
-                if running and interrupted_at is not None and now - interrupted_at >= stop_grace_seconds:
+                risk = None
+                if running and production and interrupted_at is not None:
+                    if settle is None:
+                        fs = guard['disk'](source_root)
+                        settle_sample = {'estimate': last_guard_sample['archive_input_estimate_bytes'],
+                                         'entries': last_guard_sample['entries']}
+                        settle = guard['QuiescenceBudget'](settle_sample, fs, max_output_bytes, max_output_entries, min_free_bytes)
+                        settle_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                        settle_scan = None
+                        next_tree = next_poll = now
+                        watch = result['quiescence_monitor'] = {
+                            'disk_polls': 0, 'tree_scans': 0, 'min_free_bytes': fs['free_bytes'],
+                            'min_free_inodes': fs['free_inodes'], 'peak_estimate': settle_sample['estimate'],
+                        }
+                    if now >= next_poll:
+                        fs = guard['disk'](source_root)
+                        if settle_scan is not None and settle_scan.done():
+                            settle_sample = settle_scan.result()
+                            settle_scan = None
+                            watch['tree_scans'] += 1
+                        if settle_scan is None and now >= next_tree:
+                            settle_scan = settle_pool.submit(guard['tree'], output)
+                            next_tree = now + 5
+                        watch['disk_polls'] += 1
+                        watch['min_free_bytes'] = min(watch['min_free_bytes'], fs['free_bytes'])
+                        watch['min_free_inodes'] = min(watch['min_free_inodes'], fs['free_inodes'])
+                        watch['peak_estimate'] = max(watch['peak_estimate'], settle_sample['estimate'])
+                        risk = settle.risk(settle_sample, fs)
+                        next_poll = now + 0.5
+                if running and interrupted_at is not None and (risk or now - interrupted_at >= stop_grace_seconds):
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(process.pid, signal.SIGKILL)
                     result["forced_kill"] = True
+                    if production:
+                        result['stop_reason'] = result['reason']
+                        result['reason'] = 'quiescence-forced-kill'
+                        watch['kill_reason'] = risk or 'grace-timeout'
                     process.wait(timeout=10)
                 for key, _ in selector.select(timeout=0.2):
                     try:
@@ -631,12 +667,22 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                             sink.write(chunk)
                             sink.flush()
                 if process.poll() is not None:
+                    if production and not result['forced_kill']:
+                        try:
+                            os.killpg(process.pid, 0)
+                        except ProcessLookupError:
+                            pass
+                        else:
+                            with contextlib.suppress(ProcessLookupError):
+                                os.killpg(process.pid, signal.SIGKILL)
+                            result['forced_kill'] = True
+                            result['reason'] = 'unsettled-process-group'
                     leader_exited_at = leader_exited_at or time.monotonic()
                     if not selector.get_map() or time.monotonic() - leader_exited_at > 1:
                         break
             result["returncode"] = process.returncode
             result["stdout_drain_complete"] = not bool(selector.get_map())
-            if interrupted_at is None:
+            if interrupted_at is None and not result['forced_kill']:
                 result["reason"] = "completed" if process.returncode == 0 else "compile-error"
         result["close"] = close_evidence(info_path, close_before, output, journal_before)
         if production:
@@ -684,6 +730,8 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             result["forced_kill"] = True
             process.wait(timeout=10)
             result["returncode"] = process.returncode
+        if settle_pool is not None:
+            settle_pool.shutdown(wait=True, cancel_futures=True)
         selector.close()
         if process is not None and process.stdout is not None:
             process.stdout.close()
@@ -770,7 +818,7 @@ def main():
     for key in ("scale_limits", "large_limits", "production_limits", "output_before", "last_sample",
                 "measurements", "completed_output_count", "new_completed_output_count",
                 "rebuilt_completed_output_count", "evidence_truncated", "console", "artifact_ready",
-                "resources_before", "resources_after", "oom_kill_count"):
+                "resources_before", "resources_after", "oom_kill_count", "quiescence_monitor"):
         if key in result:
             summary[key] = result[key]
     print(json.dumps(summary))
