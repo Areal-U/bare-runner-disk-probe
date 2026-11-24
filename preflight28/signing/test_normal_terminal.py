@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Audit the normal terminal with public inputs only. Does not create a production APK."""
+import argparse
+import ast
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+from zipfile import ZipFile
+import zipfile
+
+import yaml
+
+
+U = "assets/bare/ublock_origin.crx"
+NATIVE = "lib/arm64-v8a/libchrome.so"
+CRX_SHA = "d688ed3f0262ec4f8bdcd4c8f65987c5444c560aeb387a9e02aca1facdfa7046"
+CI_CERT = "32a2fc74d731105859e5a85df16d95f102d85b22099b8064c5d8915c61dad1e0"
+CI_PACKAGE = "org.barebrowser.personal"
+REV = "a"*40
+
+
+def expect_reject(function, message):
+    try:
+        function()
+    except (SystemExit,ValueError) as error:
+        if message not in str(error):
+            raise AssertionError(f"expected {message}: {error}") from error
+    else:
+        raise AssertionError(f"unsafe acceptance: {message}")
+
+
+def normal_checks(workflows, reference, aapt2, signer):
+    steps = yaml.safe_load((workflows/"bare-arm64-probe.yml").read_text())["jobs"]["compile-probe"]["steps"]
+    shell = next(s["run"] for s in steps if s.get("id") == "apk_seal")
+    marker = 'python3 - "$apk" "$temp" <<\'PYTHON\'\n'
+    body = ast.parse(shell.split(marker)[1].split("\nPYTHON")[0])
+    start = next(i for i,n in enumerate(body.body) if isinstance(n,ast.Assign)
+                 and isinstance(n.targets[0],ast.Name) and n.targets[0].id == "expected_package")
+    # Only the extraction point changes: these are the exact normal policy statements.
+    body.body = body.body[start:]
+    code = compile(body,"normal-embedded-apk-identity","exec")
+    original_badging = subprocess.check_output([str(aapt2),"dump","badging",str(reference)],text=True)
+    original_signing = subprocess.check_output(["java","-jar",str(signer),"verify","--verbose","--print-certs",str(reference)],text=True)
+    assert "org.barebrowser'" in original_badging and "2.0.0-beta.6" in original_badging
+    assert CI_CERT in original_signing
+    with ZipFile(reference) as source:
+        public_crx = source.read(U)
+        assert hashlib.sha256(public_crx).hexdigest() == CRX_SHA
+        with source.open(NATIVE) as f:
+            public_elf_header = f.read(20)
+
+    example = "\n".join(["package: name='org.barebrowser.personal' versionName='2.0.4' versionCode='802000415'",
+                       "application-label:'Bare Personal'", "native-code: 'arm64-v8a'"])
+    with TemporaryDirectory() as td:
+        temp = Path(td)
+        apk = temp/"policy-input.zip"  # local policy control; no Android manifest or signature
+        def check(badging=example, signing=original_signing, crx=public_crx, core=public_elf_header):
+            with ZipFile(apk,"w") as out:
+                out.writestr(U,crx)
+                out.writestr(NATIVE,core)
+            (temp/"badging.txt").write_text(badging)
+            (temp/"signing.txt").write_text(signing)
+            values = dict(apk=apk,temp=temp,os=os,zipfile=zipfile,re=re,json=json,hashlib=hashlib,
+                          info=apk.stat(),digest=hashlib.sha256(apk.read_bytes()).hexdigest())
+            with patch.dict(os.environ,dict(BARE_REV=REV,CHROMIUM_REV=REV,CI_REVISION=REV)):
+                exec(code,values)
+            result=json.loads((temp/"apk-metadata.json").read_text())
+            assert (result["package"],result["version_name"],result["version_code"],result["abi"],
+                    result["embedded_ublock_origin_sha256"],result["signer_sha256"]) == (
+                CI_PACKAGE,"2.0.4","802000415","arm64-v8a",CRX_SHA,CI_CERT)
+        check()
+        for positive,negative,why in [(CI_PACKAGE,"org.barebrowser","package name or version"),
+                                      ("2.0.4","2.0.3","package name or version"),("802000415","802000414","package name or version"),
+                                      ("Bare Personal","Bare","launcher label"),("arm64-v8a","x86_64","ARM64 ABI")]:
+            expect_reject(lambda: check(example.replace(positive,negative)), why)
+        expect_reject(lambda:check(badging=original_badging),"package name or version")
+        expect_reject(lambda:check(signing=original_signing.replace(CI_CERT,"b"*64)),"signing certificate")
+        expect_reject(lambda:check(signing=original_signing.replace("Number of signers: 1","Number of signers: 2")),"signing certificate")
+        expect_reject(lambda:check(crx=public_crx+b"!"),"uBlock")
+        expect_reject(lambda:check(core=public_elf_header[:18]+b"\x3e\0"),"AArch64 ELF")
+    print("NORMAL_APK_POLICY 1 positive and 10 negatives, real old APK SDK signing/ABI/CRX, synthetic personal badging only")
+
+
+def normal_binding(registration_dir, workflows):
+    sys.path.insert(0,str(registration_dir))
+    import registration as gate
+    jobs=yaml.safe_load((workflows/"bare-checkpoint-transfer.yml").read_text())["jobs"]
+    assert "validate-build" in jobs["bind-private-receiver"]["needs"]
+    for n in ("production","slot01"):
+        assert "bind-private-receiver" in jobs[n]["needs"] and "claim_asset_id != ''" in jobs[n]["if"]
+    assert gate.RECIPIENT not in (Path(__file__).parent/"produce.sh").read_text()
+    clock=datetime(2026,11,25,1,0,0,tzinfo=timezone.utc)
+    env=dict(REGISTRATION_ASSET_ID="51",GITHUB_RUN_ID="101",GITHUB_RUN_ATTEMPT="1",GITHUB_SHA=REV,
+             GITHUB_JOB="bind-private-receiver",GITHUB_REPOSITORY=gate.REPO,GITHUB_REF="refs/heads/"+gate.BASE_REF,
+             GITHUB_EVENT_NAME="workflow_dispatch")
+    event=dict(repository=dict(id=gate.REPO_ID),sender=gate.OWNER,
+               inputs=dict(mode="build-apk",build_segments="12",apk_recipient=gate.RECIPIENT))
+    ticket=dict(schema=1,campaign=gate.CAMPAIGN,repository_id=gate.REPO_ID,workflow=gate.WORKFLOW,
+                branch=gate.BASE_REF,head=REV,initial_parent=gate.S2_SHA,release_id=gate.RELEASE_ID,recipient=gate.RECIPIENT,
+                collector_registration_id="Automation_"+"1"*32,issued_at="2026-11-25T00:00:00Z",expires_at="2026-11-26T00:00:00Z")
+    class Draft:
+        BASE=UPLOAD="example.invalid"
+        def __init__(self):
+            self.values={}
+            self.writes=0
+            self.ticket_created="2026-11-25T00:00:00Z"
+        def metadata(self,_):
+            return dict(id=int(env["GITHUB_RUN_ID"]),run_attempt=1,head_sha=REV,path=gate.WORKFLOW,event="workflow_dispatch",
+                        head_branch=gate.BASE_REF,actor=gate.OWNER,repository=dict(id=gate.REPO_ID),
+                        head_repository=dict(id=gate.REPO_ID),created_at="2026-11-25T00:10:00Z")
+        def draft(self,_):
+            self.values[51]=json.dumps(ticket).encode()
+            return dict(assets=[dict(id=k,size=len(v),name=gate.CAMPAIGN+"-collection-registration.json" if k==51 else gate.CLAIM,
+                                     created_at=self.ticket_created,uploader=gate.OWNER) for k,v in self.values.items()])
+        def asset_info(self,release,name,length,digest,asset_id=None):
+            found=[a for a in release["assets"] if a["name"]==name]
+            assert len(found)==1
+            a=found[0]
+            if not (a["size"]==length and (asset_id is None or asset_id==a["id"])
+                    and hashlib.sha256(self.values[a["id"]]).hexdigest()==digest):
+                raise ValueError("conflicting canonical claim")
+            return a
+        def download(self,aid,length,digest,target):
+            target.write(self.values[aid])
+        def request(self,host,method,path,**kwargs):
+            assert method=="POST" and host==self.UPLOAD and path.endswith(gate.CLAIM) and 52 not in self.values
+            self.writes+=1
+            self.values[52]=kwargs["body"]
+            raise ConnectionResetError("simulated reply lost after durable create")
+    helper=Draft()
+    def bind():
+        env["REGISTRATION_SHA"]=hashlib.sha256(json.dumps(ticket).encode()).hexdigest()
+        return gate.bind(helper,env,event,clock)
+    helper.ticket_created="2026-11-25T00:11:00Z"
+    expect_reject(bind,"prepared after run")
+    helper.ticket_created="2026-11-25T00:00:00Z"
+    assert bind()==(52,ticket["collector_registration_id"]) and bind()[0]==52 and helper.writes==1
+    env["GITHUB_RUN_ID"]="102"
+    expect_reject(bind,"conflicting canonical claim")
+    assert helper.writes==1
+    print("NORMAL_REGISTRATION late-ticket refusal + durable prior ticket + dropped POST reply + duplicate readback + conflicting run, 1 POST")
+
+
+if __name__=="__main__":
+    parser=argparse.ArgumentParser(description=__doc__)
+    for arg in ["repo","reference-apk","aapt2","apksigner-jar","registration-dir"]:
+        parser.add_argument("--"+arg,type=Path,required=True)
+    args=parser.parse_args()
+    y=args.repo/".github/workflows"
+    normal_checks(y,args.reference_apk,args.aapt2,args.apksigner_jar)
+    normal_binding(args.registration_dir,y)
