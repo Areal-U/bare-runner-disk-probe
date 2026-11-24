@@ -1,0 +1,421 @@
+name: Bare R28 S2 recoverable fresh checkpoint trial
+run-name: r28-preflight-s2-20261125-v2 / restricted fresh handoff
+'on':
+  pull_request:
+    types:
+    - synchronize
+    branches:
+    - bare-coexist-v2.0.4
+    paths:
+    - .github/workflows/bare-r28-s2-recovery.yml
+permissions: {}
+cache-mode: none
+concurrency:
+  group: r28-preflight-s2-20261125-v2-fresh-only
+  cancel-in-progress: false
+env:
+  PRIOR_SHA: 828c31d7c948970027b747618d6aee3df5377845
+  TRIAL_SHA: ${{ github.event.pull_request.head.sha }}
+  R28_CAMPAIGN: r28-preflight-s2-20261125-v2
+defaults:
+  run:
+    shell: bash
+jobs:
+  reserve:
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    name: Restricted verification of lost run and one superseding claim
+    if: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number
+      == 9 && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.repository == 'Areal-U/bare-runner-disk-probe'
+      && github.event.pull_request.base.repo.full_name == github.repository && github.event.pull_request.head.repo.full_name
+      == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4'
+      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == '828c31d7c948970027b747618d6aee3df5377845'
+      && github.run_attempt == '1' }}
+    permissions: &id002
+      actions: read
+      contents: write
+    timeout-minutes: 13
+    outputs:
+      claim_id: ${{ steps.claim.outputs.claim_id }}
+    steps:
+    - name: Read fixed public source at the exact synchronized head
+      timeout-minutes: 6
+      run: |-
+        set -euo pipefail
+        test "$GITHUB_REPOSITORY" = Areal-U/bare-runner-disk-probe
+        [[ $TRIAL_SHA =~ ^[0-9a-f]{40}$ ]]
+        git init --quiet .
+        git sparse-checkout set --no-cone '/preflight28/' '/.github/workflows/'
+        GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.extraHeader= fetch --no-tags --depth=1 "https://github.com/$GITHUB_REPOSITORY.git" "$TRIAL_SHA"
+        git checkout --quiet --detach FETCH_HEAD
+        test "$(git rev-parse HEAD)" = "$TRIAL_SHA"
+        printf 'run=%s attempt=%s role=%s hosted_runner=%s version=%s
+        ' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB" "$RUNNER_NAME" "${ImageVersion:-unknown}"
+    - name: Load fixed R26 environment and validated owner-Draft client
+      timeout-minutes: 5
+      run: python3 preflight28/transport/prepare.py tools
+    - name: Bind one superseding physical run only after complete prior reconciliation
+      timeout-minutes: 8
+      env: &id001
+        GH_TOKEN: ${{ github.token }}
+      run: python3 preflight28/transport/recovery_claim.py reserve
+      id: claim
+  produce:
+    runs-on: ubuntu-24.04
+    cache-mode: read
+    name: Ordinary read-only runner builds and seals new APK dependency
+    if: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number
+      == 9 && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.repository == 'Areal-U/bare-runner-disk-probe'
+      && github.event.pull_request.base.repo.full_name == github.repository && github.event.pull_request.head.repo.full_name
+      == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4'
+      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == '828c31d7c948970027b747618d6aee3df5377845'
+      && github.run_attempt == '1' && needs.reserve.result == 'success' && needs.reserve.outputs.claim_id != '' }}
+    permissions:
+      actions: read
+    needs: reserve
+    timeout-minutes: 215
+    steps:
+    - name: Read fixed public source at the exact synchronized head
+      timeout-minutes: 6
+      run: |-
+        set -euo pipefail
+        test "$GITHUB_REPOSITORY" = Areal-U/bare-runner-disk-probe
+        [[ $TRIAL_SHA =~ ^[0-9a-f]{40}$ ]]
+        git init --quiet .
+        git sparse-checkout set --no-cone '/preflight28/' '/.github/workflows/'
+        GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.extraHeader= fetch --no-tags --depth=1 "https://github.com/$GITHUB_REPOSITORY.git" "$TRIAL_SHA"
+        git checkout --quiet --detach FETCH_HEAD
+        test "$(git rev-parse HEAD)" = "$TRIAL_SHA"
+        printf 'run=%s attempt=%s role=%s hosted_runner=%s version=%s
+        ' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB" "$RUNNER_NAME" "${ImageVersion:-unknown}"
+    - name: Load fixed R26 environment and validated owner-Draft client
+      timeout-minutes: 5
+      run: python3 preflight28/transport/prepare.py tools
+    - name: Use authenticated service job start and confirm original cache identity
+      timeout-minutes: 3
+      run: |-
+        set -euo pipefail
+        if [[ ! ${CHECK_RUN:-} =~ ^[1-9][0-9]*$ ]]; then
+         CHECK_RUN=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" |
+           jq -er --arg name "$CLOCK_NAME" '[.jobs[]|select(.name==$name and .status=="in_progress")|.check_run_url|split("/")|last]|select(length==1)|first')
+        fi
+        epoch=$(python3 preflight28/limits/guard.py job-clock --check-run "$CHECK_RUN")
+        echo "JOB_STARTED=$epoch" >> "$GITHUB_ENV"
+        if [[ $GITHUB_JOB != receive || $GITHUB_RUN_ATTEMPT == 1 ]]; then python3 preflight28/transport/exchange.py parent; fi
+      env:
+        GH_TOKEN: ${{ github.token }}
+        JOB_READ_TOKEN: ${{ github.token }}
+        CHECK_RUN: ${{ job.check_run_id }}
+        CLOCK_NAME: Ordinary read-only runner builds and seals new APK dependency
+    - name: Confirm ordinary token cannot read the owner Draft
+      timeout-minutes: 2
+      env: *id001
+      run: 'PYTHONPATH=preflight28/bridge python3 -c ''import bridge as b; b.api_json(f"/repos/{b.REPO}/releases/{b.RELEASE}",expected="denied")'' '
+    - name: Restore the exact S2 parent at its original read-only cache key
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+      id: parent
+      timeout-minutes: 15
+      with:
+        path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+        key: bare-coexist-204-45285202990-1-checkpoint-production-s2
+        fail-on-cache-miss: true
+    - name: Prepare fixed builder and progress one genuine APK dependency, then pack new full zstd
+      timeout-minutes: 178
+      run: |-
+        set -euo pipefail
+        [[ $HIT == true && $MATCH == 'bare-coexist-204-45285202990-1-checkpoint-production-s2' ]]
+        python3 preflight28/transport/prepare.py produce
+      env:
+        MATCH: ${{ steps.parent.outputs.cache-matched-key }}
+        HIT: ${{ steps.parent.outputs.cache-hit }}
+    - name: Locate exact same-run key Artifact by service ID
+      timeout-minutes: 10
+      env:
+        GH_TOKEN: ${{ github.token }}
+        FRESH_PEER_NAME: Limited sender receives new complete bytes and publishes one private checkpoint
+      run: python3 preflight28/transport/fresh.py wait key
+      id: wait_key
+    - name: Download exact key by immutable ID
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 18
+      with:
+        artifact-ids: ${{ steps.wait_key.outputs.id }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/r28-split/incoming
+    - name: Seal full newly built candidate to the independent restricted writer
+      timeout-minutes: 19
+      run: python3 preflight28/transport/fresh.py seal
+    - name: Record simultaneous Action Artifact use immediately before full upload
+      timeout-minutes: 3
+      env: *id001
+      run: python3 preflight28/transport/fresh.py capacity
+    - name: Upload the scoped cipher Artifact
+      id: put_cipher
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      timeout-minutes: 18
+      continue-on-error: true
+      env:
+        NODE_OPTIONS: --require=${{ github.workspace }}/preflight28/transport/quota-marker.cjs
+      with:
+        name: r28-fresh-${{ github.run_id }}-cipher
+        path: |-
+          ${{ runner.temp }}/r28-split/checkpoint.cms
+          ${{ runner.temp }}/r28-split/cipher-receipt.json
+        retention-days: 1
+        compression-level: 0
+        if-no-files-found: error
+        overwrite: false
+    - name: Reconcile an ambiguous full-upload response before permitting a small sealed delta
+      timeout-minutes: 2
+      env: *id001
+      run: "set -euo pipefail\nname=r28-fresh-$GITHUB_RUN_ID-cipher\nfor n in 1 2 3 4 5; do\n  state=$(gh api \"repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=$name\"\
+        \ |\n    jq -er --arg name \"$name\" --arg rid \"$GITHUB_RUN_ID\" --arg head \"$TRIAL_SHA\" '\n      select(.total_count==(.artifacts|length))|[.artifacts[]|select(.name==$name\
+        \ and .expired==false and\n      (.workflow_run.id|tostring)==$rid and .workflow_run.head_sha==$head and .size_in_bytes>0)]|\n\
+        \      if length==0 then \"absent\" elif length==1 then \"present\" else error(\"ambiguous\") end')\n  if [[ $state\
+        \ == present ]]; then echo 'delta=false' >> \"$GITHUB_OUTPUT\"; exit 0; fi\n  if (( n<5 )); then sleep 15; fi\ndone\n\
+        if ! grep -Fxq 'create-rejected-storage-quota' \"$RUNNER_TEMP/r28-split/full-quota-evidence\"; then\n  echo 'Provider\
+        \ acceptance remains ambiguous after bounded read-only reconciliation. Alternate deposit and publication stopped.'\
+        \ >&2\n  exit 1\nfi\necho 'delta=true' >> \"$GITHUB_OUTPUT\"\necho 'Provider explicitly rejected creation for storage\
+        \ quota, and no full Artifact is present.' \n"
+      id: fallback
+      if: ${{ !cancelled() && steps.put_cipher.outcome == 'failure' }}
+    - name: Generate a bounded sealed S2-relative delta from this same complete candidate
+      timeout-minutes: 16
+      run: |
+        set -euo pipefail
+        if ! command -v rdiff >/dev/null; then
+          sudo -n apt-get -qq -o Acquire::Retries=2 update
+          sudo -n apt-get -qq -o Acquire::Retries=2 --no-install-recommends install rdiff
+        fi
+        python3 preflight28/transport/delta.py seal "$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz" "$RUNNER_TEMP/r28-child.tar.zst" "$RUNNER_TEMP/r28-split/incoming/public.pem" "$RUNNER_TEMP/r28-split-delta"
+        install -m 600 "$RUNNER_TEMP/r28-split/cipher-receipt.json" "$RUNNER_TEMP/r28-split-delta/cipher-receipt.json"
+        (( $(du -b -c "$RUNNER_TEMP/r28-split-delta/"{delta.cms,delta.json,cipher-receipt.json} | tail -1 | cut -f1) + 1048576 <= 268435456 ))
+      if: ${{ !cancelled() && steps.fallback.outputs.delta == 'true' }}
+    - name: Upload one small sealed fallback Artifact after missing full receipt
+      id: put_delta
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      timeout-minutes: 10
+      if: ${{ !cancelled() && steps.fallback.outputs.delta == 'true' && success() }}
+      with:
+        name: r28-fresh-${{ github.run_id }}-delta
+        retention-days: 1
+        compression-level: 0
+        overwrite: false
+        if-no-files-found: error
+        path: |-
+          ${{ runner.temp }}/r28-split-delta/delta.cms
+          ${{ runner.temp }}/r28-split-delta/delta.json
+          ${{ runner.temp }}/r28-split-delta/cipher-receipt.json
+    - name: Compare all retained APK payloads from original S2 against the securely deposited child
+      timeout-minutes: 20
+      run: |
+        set -euo pipefail
+        sha=$(jq -er .sha256 "$RUNNER_TEMP/r28-split/cipher-receipt.json")
+        python3 -I preflight28/graph/retained.py archives --parent "$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"   --child "$RUNNER_TEMP/r28-child.tar.zst" --parent-sha 4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf --child-sha "$sha"
+    - name: Reconfirm original read-only cache after transfer
+      timeout-minutes: 3
+      env: *id001
+      run: python3 preflight28/transport/exchange.py parent
+  send:
+    runs-on: ubuntu-24.04
+    cache-mode: read
+    name: Limited sender receives new complete bytes and publishes one private checkpoint
+    needs: reserve
+    if: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number
+      == 9 && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.repository == 'Areal-U/bare-runner-disk-probe'
+      && github.event.pull_request.base.repo.full_name == github.repository && github.event.pull_request.head.repo.full_name
+      == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4'
+      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == '828c31d7c948970027b747618d6aee3df5377845'
+      && github.run_attempt == '1' && needs.reserve.result == 'success' && needs.reserve.outputs.claim_id != '' }}
+    permissions: *id002
+    timeout-minutes: 350
+    outputs:
+      manifest_id: ${{ steps.send.outputs.manifest_id }}
+      manifest_sha: ${{ steps.send.outputs.manifest_sha }}
+    steps:
+    - name: Read fixed public source at the exact synchronized head
+      timeout-minutes: 6
+      run: |-
+        set -euo pipefail
+        test "$GITHUB_REPOSITORY" = Areal-U/bare-runner-disk-probe
+        [[ $TRIAL_SHA =~ ^[0-9a-f]{40}$ ]]
+        git init --quiet .
+        git sparse-checkout set --no-cone '/preflight28/' '/.github/workflows/'
+        GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.extraHeader= fetch --no-tags --depth=1 "https://github.com/$GITHUB_REPOSITORY.git" "$TRIAL_SHA"
+        git checkout --quiet --detach FETCH_HEAD
+        test "$(git rev-parse HEAD)" = "$TRIAL_SHA"
+        printf 'run=%s attempt=%s role=%s hosted_runner=%s version=%s
+        ' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB" "$RUNNER_NAME" "${ImageVersion:-unknown}"
+    - name: Load fixed R26 environment and validated owner-Draft client
+      timeout-minutes: 5
+      run: python3 preflight28/transport/prepare.py tools
+    - name: Reserve full ciphertext and decoded checkpoint staging on disposable runner
+      timeout-minutes: 6
+      run: bash preflight28/bridge/host_space.sh
+    - name: Generate a local recipient and seal its recovery copy to the prior test-only recipient
+      timeout-minutes: 7
+      run: |-
+        set -euo pipefail
+        umask 077
+        if ! command -v age >/dev/null; then
+          sudo -n apt-get -qq -o Acquire::Retries=2 update
+          sudo -n apt-get -qq -o Acquire::Retries=2 --no-install-recommends install age
+        fi
+        mkdir -m 700 -p "$RUNNER_TEMP/r28-split"
+        python3 preflight28/bridge/bridge.py keygen
+        public_test=age1ndr7f7txhcjqfxdjzrlf7m7za0sfa7yhzm4gg9404pfl5jtq4geqgcu466
+        grep -Fq "pub=$public_test" .github/workflows/bare-r28-delivery-preflight.yml
+        age -r "$public_test" -o "$RUNNER_TEMP/r28-split/writer-key.age" "$RUNNER_TEMP/r28-split/key.pem"
+        [[ -s $RUNNER_TEMP/r28-split/writer-key.age ]]
+        sha256sum "$RUNNER_TEMP/r28-split/writer-key.age"
+    - name: Upload the scoped key Artifact
+      id: put_key
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      timeout-minutes: 6
+      with:
+        name: r28-fresh-${{ github.run_id }}-writer
+        path: |-
+          ${{ runner.temp }}/r28-split/public.pem
+          ${{ runner.temp }}/r28-split/writer-key.age
+        retention-days: 1
+        compression-level: 0
+        if-no-files-found: error
+        overwrite: false
+    - name: Locate exact same-run cipher Artifact by service ID
+      timeout-minutes: 225
+      env:
+        GH_TOKEN: ${{ github.token }}
+        FRESH_PEER_NAME: Ordinary read-only runner builds and seals new APK dependency
+      run: python3 preflight28/transport/fresh.py wait cipher
+      id: wait_cipher
+    - name: Download exact cipher by immutable ID
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 18
+      with:
+        artifact-ids: ${{ steps.wait_cipher.outputs.id }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/r28-split/incoming
+    - name: Collect a concurrently visible small alternate relay by ID for receipt reconciliation
+      if: ${{ steps.wait_cipher.outputs.other_id != '' }}
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 10
+      with:
+        artifact-ids: ${{ steps.wait_cipher.outputs.other_id }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/r28-split/alternate
+    - name: Check exact original declaration across both transfer forms
+      timeout-minutes: 2
+      run: cmp -- "$RUNNER_TEMP/r28-split/incoming/cipher-receipt.json" "$RUNNER_TEMP/r28-split/alternate/cipher-receipt.json"
+      if: ${{ steps.wait_cipher.outputs.other_id != '' }}
+    - name: Reserve both fixed S2 cache layers before fallback patching
+      timeout-minutes: 2
+      run: python3 preflight28/limits/guard.py space "$RUNNER_TEMP" --bytes 5563674174 --inodes 5
+      if: ${{ steps.wait_cipher.outputs.mode == 'delta' }}
+    - name: Acquire read-only original S2 only for a sealed delta
+      if: ${{ steps.wait_cipher.outputs.mode == 'delta' }}
+      id: delta_parent
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+      timeout-minutes: 15
+      with:
+        path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+        key: bare-coexist-204-45285202990-1-checkpoint-production-s2
+        fail-on-cache-miss: true
+    - name: Restore and authenticate the exact original full zstd bytes from the smaller encrypted relay
+      timeout-minutes: 20
+      run: |
+        set -euo pipefail
+        [[ $MATCH == 'bare-coexist-204-45285202990-1-checkpoint-production-s2' ]]
+        if ! command -v rdiff >/dev/null; then
+          sudo -n apt-get -qq -o Acquire::Retries=2 update
+          sudo -n apt-get -qq -o Acquire::Retries=2 --no-install-recommends install rdiff
+        fi
+        incoming="$RUNNER_TEMP/r28-split/incoming"
+        packet="$RUNNER_TEMP/r28-split/delta-packet"
+        mkdir -m 700 "$packet"
+        ln -- "$incoming/delta.cms" "$incoming/delta.json" "$packet/"
+        sha=$(jq -er .sha256 "$incoming/cipher-receipt.json")
+        bytes=$(jq -er .bytes "$incoming/cipher-receipt.json")
+        python3 preflight28/transport/delta.py restore "$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz" "$packet" "$RUNNER_TEMP/r28-child.tar.zst" --key-dir "$RUNNER_TEMP/r28-split" --expected-sha "$sha" --expected-bytes "$bytes"
+      if: ${{ steps.wait_cipher.outputs.mode == 'delta' }}
+      env:
+        MATCH: ${{ steps.delta_parent.outputs.cache-matched-key }}
+    - name: Verify full ciphertext, authenticated private payload, and put new bounded draft parts
+      timeout-minutes: 26
+      run: python3 preflight28/transport/fresh.py send
+      id: send
+      env:
+        GH_TOKEN: ${{ github.token }}
+        FRESH_MODE: ${{ steps.wait_cipher.outputs.mode }}
+        FRESH_ARTIFACT_ID: ${{ steps.wait_cipher.outputs.id }}
+        FRESH_OTHER_ID: ${{ steps.wait_cipher.outputs.other_id }}
+        FRESH_PEER_NAME: Ordinary read-only runner builds and seals new APK dependency
+  receive:
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    name: Fresh runner restores new private generation without production build
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number
+      == 9 && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.repository == 'Areal-U/bare-runner-disk-probe'
+      && github.event.pull_request.base.repo.full_name == github.repository && github.event.pull_request.head.repo.full_name
+      == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4'
+      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == '828c31d7c948970027b747618d6aee3df5377845'
+      && (github.run_attempt != '1' || (needs.produce.result == 'success' && needs.send.result == 'success')) }}
+    needs:
+    - produce
+    - send
+    permissions: *id002
+    timeout-minutes: 215
+    steps:
+    - name: Read fixed public source at the exact synchronized head
+      timeout-minutes: 6
+      run: |-
+        set -euo pipefail
+        test "$GITHUB_REPOSITORY" = Areal-U/bare-runner-disk-probe
+        [[ $TRIAL_SHA =~ ^[0-9a-f]{40}$ ]]
+        git init --quiet .
+        git sparse-checkout set --no-cone '/preflight28/' '/.github/workflows/'
+        GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.extraHeader= fetch --no-tags --depth=1 "https://github.com/$GITHUB_REPOSITORY.git" "$TRIAL_SHA"
+        git checkout --quiet --detach FETCH_HEAD
+        test "$(git rev-parse HEAD)" = "$TRIAL_SHA"
+        printf 'run=%s attempt=%s role=%s hosted_runner=%s version=%s
+        ' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB" "$RUNNER_NAME" "${ImageVersion:-unknown}"
+    - name: Load fixed R26 environment and validated owner-Draft client
+      timeout-minutes: 5
+      run: python3 preflight28/transport/prepare.py tools
+    - name: Verify original accepted supersession without changing it
+      timeout-minutes: 4
+      env: *id001
+      run: python3 preflight28/transport/recovery_claim.py verify
+    - name: Use authenticated service job start and confirm original cache identity
+      timeout-minutes: 3
+      run: |-
+        set -euo pipefail
+        if [[ ! ${CHECK_RUN:-} =~ ^[1-9][0-9]*$ ]]; then
+         CHECK_RUN=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" |
+           jq -er --arg name "$CLOCK_NAME" '[.jobs[]|select(.name==$name and .status=="in_progress")|.check_run_url|split("/")|last]|select(length==1)|first')
+        fi
+        epoch=$(python3 preflight28/limits/guard.py job-clock --check-run "$CHECK_RUN")
+        echo "JOB_STARTED=$epoch" >> "$GITHUB_ENV"
+        if [[ $GITHUB_JOB != receive || $GITHUB_RUN_ATTEMPT == 1 ]]; then python3 preflight28/transport/exchange.py parent; fi
+      env:
+        GH_TOKEN: ${{ github.token }}
+        JOB_READ_TOKEN: ${{ github.token }}
+        CHECK_RUN: ${{ job.check_run_id }}
+        CLOCK_NAME: Fresh runner restores new private generation without production build
+    - name: Restore exact manifest and all bytes from owner Draft
+      timeout-minutes: 75
+      run: |-
+        set -euo pipefail
+        python3 preflight28/limits/guard.py space "$RUNNER_TEMP" --bytes 3758096384 --inodes 2
+        python3 preflight28/transport/exchange.py receive
+      env:
+        GH_TOKEN: ${{ github.token }}
+        MANIFEST_ID: ${{ needs.send.outputs.manifest_id }}
+        MANIFEST_SHA: ${{ needs.send.outputs.manifest_sha }}
+    - name: Independently restore complete fixed APK graph and retained contents without new compilation
+      timeout-minutes: 177
+      run: python3 preflight28/transport/prepare.py receive
+    - name: Reconfirm original S2 remains available after receipt
+      timeout-minutes: 3
+      env: *id001
+      run: python3 preflight28/transport/exchange.py parent
+      if: ${{ github.run_attempt == '1' }}
