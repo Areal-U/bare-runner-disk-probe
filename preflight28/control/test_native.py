@@ -1,6 +1,7 @@
 """Run the result-producing Python from the real candidate workflows on regression cases."""
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -86,6 +87,30 @@ class NativeTests(unittest.TestCase):
         self.assertNotEqual(record(n,2)[0].returncode,0)
         n=inputs(13);n["read"]["result"]="skipped"
         self.assertEqual(record(n,13,True)[1]["status"],"limit-verified")
+
+    def test_exact_workflow_graph_and_embedded_scripts(self):
+        workflows=("bare-checkpoint-transfer.yml","bare-r28-native-slot.yml","bare-arm64-probe.yml",
+                   "bare-r28-replay-chain.yml","bare-r28-replay-worker.yml")
+        parsed={name:yaml.safe_load((WF/name).read_text()) for name in workflows}
+        for name,wf in parsed.items():
+            for job_name,job in wf["jobs"].items():
+                deps=job.get("needs",[])
+                self.assertTrue(set([deps] if isinstance(deps,str) else deps)<=wf["jobs"].keys(),(name,job_name))
+                path=job.get("uses","")
+                if path.startswith("./"):
+                    schema=parsed[Path(path).name]["on"]["workflow_call"]["inputs"]
+                    supplied=job.get("with",{}).keys()
+                    self.assertTrue(supplied<=schema.keys(),(name,job_name))
+                    self.assertTrue(all(not v.get("required") or k in supplied for k,v in schema.items()),(name,job_name))
+                for step in job.get("steps",[]):
+                    if "run" not in step: continue
+                    body=step["run"]
+                    self.assertLessEqual(len(body),21000)
+                    body=re.sub(r"\$\{\{.*?\}\}", "placeholder",body,flags=re.DOTALL)
+                    if step.get("shell")=="python": compile(body,name,"exec")
+                    elif step.get("shell","bash")=="bash":
+                        process=subprocess.run(["bash","-n"],input=body,text=True,capture_output=True)
+                        self.assertEqual(process.returncode,0,(name,job_name,step.get("name"),process.stderr))
 
     def test_inner_python_and_root_gate(self):
         for wf in (ARM,WORKER,CALLER):
