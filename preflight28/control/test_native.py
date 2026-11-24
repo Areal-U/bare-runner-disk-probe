@@ -112,6 +112,37 @@ class NativeTests(unittest.TestCase):
                         process=subprocess.run(["bash","-n"],input=body,text=True,capture_output=True)
                         self.assertEqual(process.returncode,0,(name,job_name,step.get("name"),process.stderr))
 
+    @unittest.skipUnless(os.environ.get("SISO"),"set SISO to the pinned Chromium Siso executable")
+    def test_restored_marker_planner_cannot_compile_dirty_work(self):
+        shell=next(s["run"] for s in ARM["jobs"]["compile-probe"]["steps"] if s.get("name")=="Verify restored inputs and completed targets")
+        self.assertEqual(shell.count("check_restored_targets "),3)
+        function=re.search(r"(?ms)^check_restored_targets\(\) \{.*?^\}",shell).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            (root/".gclient").touch()
+            out=root/"out/Bare"
+            out.mkdir(parents=True)
+            (out/"build.ninja").write_text("rule write\n  command = touch $out && touch compiler-invoked\nbuild marker.o: write\n")
+            auto=root/"autoninja"
+            auto.write_text('#!/bin/bash\nexec "$SISO" ninja -load= "$@"\n')
+            auto.chmod(0o755)
+            env={**os.environ,"PATH":str(root)+os.pathsep+os.environ["PATH"],"PYTHONPATH":str(HERE/"preflight28/graph")}
+            def plan():
+                return subprocess.run(["bash","-euo","pipefail","-c",function+"\ncheck_restored_targets marker.o"],
+                                      cwd=root,env=env,text=True,capture_output=True)
+            dirty=plan()
+            self.assertNotEqual(dirty.returncode,0)
+            self.assertIn("Restored target requires compilation",dirty.stderr)
+            self.assertFalse((out/"compiler-invoked").exists())
+            self.assertFalse((out/"marker.o").exists())
+            subprocess.run([str(auto),"-C",str(out),"marker.o"],env=env,cwd=root,check=True,capture_output=True)
+            (out/"compiler-invoked").unlink()
+            before=(out/".ninja_log").read_bytes()
+            clean=plan()
+            self.assertEqual(clean.returncode,0,clean.stderr)
+            self.assertFalse((out/"compiler-invoked").exists())
+            self.assertEqual(before,(out/".ninja_log").read_bytes())
+
     def test_inner_python_and_root_gate(self):
         for wf in (ARM,WORKER,CALLER):
             for job in wf["jobs"].values():

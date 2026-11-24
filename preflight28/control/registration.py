@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import sys
 
-from admission import BASE_REF, REPO, REPO_ID, S2_SHA, RELEASE_ID, admit, require
+from admission import BASE_REF, REPO, REPO_ID, S2_SHA, RELEASE_ID, PagedOwnerDraft, admit, require
 
 CAMPAIGN = "bare-personal-204-r28"
 CLAIM = CAMPAIGN + "-production-run-claim.json"
@@ -72,6 +72,7 @@ def bind(helper, env, event, now, *, verify_only=False):
             and api["path"] == WORKFLOW and api["event"] == "workflow_dispatch" and api["head_branch"] == BASE_REF
             and all(api["actor"].get(k) == v for k,v in OWNER.items())
             and api["repository"]["id"] == api["head_repository"]["id"] == REPO_ID, "Unconfirmed physical run")
+    helper = PagedOwnerDraft(helper)
     release = helper.draft(RELEASE_ID)
     expected_name = CAMPAIGN + "-collection-registration.json"
     found = [x for x in release["assets"] if x.get("name") == expected_name]

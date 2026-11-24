@@ -3,6 +3,7 @@ import json
 import unittest
 from unittest.mock import patch
 from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
 from registration import BASE_REF, CAMPAIGN, CLAIM, OWNER, RECIPIENT, RELEASE_ID, REPO, REPO_ID, S2_SHA, WORKFLOW, bind
 
 
@@ -31,7 +32,10 @@ class OwnerDraft:
         return {"assets":[dict(self.asset,size=len(self.data()),digest="sha256:"+hashlib.sha256(self.data()).hexdigest()),dict(self.ack_asset,size=len(self.data(812)))]}
     def asset_info(self, release, name, size, sha, aid):
         assert len(self.data(aid)) == size and aid in (901,812)
-    def metadata(self, path): return self.origin
+    def metadata(self, path):
+        if "/releases/" in path:
+            return self.draft(RELEASE_ID)["assets"]
+        return self.origin
     def download(self, aid, size, digest, target): target.write(self.data(aid))
 
 
@@ -46,6 +50,65 @@ class TicketTests(unittest.TestCase):
     def enter(self):
         self.env["REGISTRATION_SHA"]=hashlib.sha256(self.d.data()).hexdigest()
         return bind(self.d,self.env,self.event,self.now)
+
+    def test_late_page_registration_ack_and_lost_claim_response(self):
+        class Release(OwnerDraft):
+            UPLOAD = "uploads.github.com"
+
+            def __init__(self):
+                super().__init__()
+                ticket, ack = super().draft(RELEASE_ID)["assets"]
+                self.assets = [dict(id=i, name="old-"+str(i)) for i in range(1,101)] + [ticket, ack]
+                self.assets.extend(dict(id=i, name="old-"+str(i)) for i in range(101,199))
+                self.posts = 0
+                self.pages = []
+
+            def draft(self, ident):
+                self.assert_release(ident)
+                return {"assets": self.assets[:30]}
+
+            def assert_release(self, ident):
+                assert ident == RELEASE_ID
+
+            def metadata(self, path):
+                if "/releases/" not in path:
+                    return self.origin
+                uri = urlsplit(path)
+                assert uri.path.endswith(f"/releases/{RELEASE_ID}/assets")
+                query = parse_qs(uri.query)
+                assert query["per_page"] == ["100"]
+                page = int(query["page"][0])
+                self.pages.append(page)
+                return self.assets[(page-1)*100:page*100]
+
+            def request(self, host, method, path, **args):
+                assert host == self.UPLOAD and method == "POST" and args["auth"]
+                assert parse_qs(urlsplit(path).query)["name"] == [CLAIM]
+                self.posts += 1
+                self.claim = args["body"]
+                self.assets.append(dict(id=940, name=CLAIM, size=len(self.claim),
+                                        digest="sha256:"+hashlib.sha256(self.claim).hexdigest()))
+                raise ConnectionResetError("response lost after creation")
+
+            def asset_info(self, release, name, size, digest, aid=None):
+                matches = [a for a in release["assets"] if a["name"] == name]
+                assert len(matches) == 1
+                record = matches[0]
+                assert record["size"] == size and (aid is None or record["id"] == aid)
+                return record
+
+            def download(self, aid, size, digest, target):
+                data = self.claim if aid == 940 else self.data(aid)
+                assert len(data) == size and hashlib.sha256(data).hexdigest() == digest
+                target.write(data)
+
+        self.d=Release()
+        self.env.update(REGISTRATION_ASSET_ID="",REGISTRATION_SHA="")
+        self.assertEqual(bind(self.d,self.env,self.event,self.now)[0],940)
+        self.env["GITHUB_JOB"]="collection-lease"
+        self.assertEqual(bind(self.d,self.env,self.event,self.now,verify_only=True)[0],940)
+        self.assertEqual(self.d.posts,1)
+        self.assertGreaterEqual(self.d.pages.count(3),3)
     @patch("registration.admit",return_value=123)
     def test_prior_registration_and_binding(self, claim):
         self.assertEqual(self.enter()[0],123)

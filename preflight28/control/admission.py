@@ -72,6 +72,32 @@ def encode(holder):
     return (json.dumps(holder, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
+class PagedOwnerDraft:
+    """Keep the pinned Draft checks and enumerate the full owner asset inventory for each read."""
+    def __init__(self, helper):
+        self.helper = helper
+
+    def __getattr__(self, key):
+        return getattr(self.helper, key)
+
+    def draft(self, release_id):
+        require(release_id == RELEASE_ID, "Unexpected private release")
+        release = self.helper.draft(release_id)
+        assets = []
+        for page in range(1, 12):
+            batch = self.helper.metadata(f"{self.BASE}/releases/{release_id}/assets?per_page=100&page={page}")
+            require(isinstance(batch, list) and len(batch) <= 100, "Invalid private asset page")
+            assets.extend(batch)
+            if len(batch) < 100:
+                break
+        else:
+            raise ValueError("Private asset inventory exceeds the bounded listing")
+        ids = {a["id"]: a["name"] for a in assets}
+        require(len(ids) == len(assets) and all(ids.get(a["id"]) == a["name"] for a in release["assets"]),
+                "Private asset inventory changed during pagination")
+        return {**release, "assets": assets}
+
+
 def claim_info(helper, payload, name=CLAIM):
     release = helper.draft(RELEASE_ID)
     names = [a for a in release["assets"] if a["name"] == name]
