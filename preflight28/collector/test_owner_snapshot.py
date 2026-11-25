@@ -136,6 +136,24 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(self.collect(),receipt)
         self.assertEqual((self.root/"accepted"/p.apk_seal.CIPHER_FILE).read_bytes(),self.cipher)
 
+    def test_owner_intent_recovers_ticket_id_only_from_original_job(self):
+        self.delivery(); self.write()
+        intent = {k:v for k,v in self.locator.items() if k!="ticket_asset_id"}
+        capture = o.OwnerSnapshot(self.root,self.helper)
+        resolved = capture.resolve_original_ticket(intent)
+        self.assertEqual(resolved,self.locator)
+        receipt = p.collect(resolved,self.root/"accepted",capture,actions=capture,draft_rows=capture.draft_rows)
+        self.assertEqual(receipt["artifact_id"],self.cipher_asset["id"])
+        self.assertNotIn("ticket_asset_id",intent)
+        for extra in ({"ticket_sha":"f"*64}, {"ticket_asset_id":201}, {"owner_destination_id":"operator-only"},
+                      {"registration_id":"Automation_"+"f"*32}):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                capture.resolve_original_ticket(dict(intent,**extra))
+        with patch.dict(self.jobs[0], run_attempt=2):
+            self.write()
+            with self.assertRaises(ValueError):
+                o.OwnerSnapshot(self.root,self.helper).resolve_original_ticket(intent)
+
     def test_collect_private_terminal_without_actions_cipher_or_private_api(self):
         self.delivery(private=True);self.write()
         receipt=self.collect()

@@ -377,6 +377,8 @@ def main():
         if args.owner_snapshot:
             from owner_snapshot import OwnerSnapshot
             captured = OwnerSnapshot(args.owner_snapshot, transfer)
+            if "ticket_asset_id" not in locator:
+                locator = captured.resolve_original_ticket(locator)
             result = collect(locator,args.directory,captured,actions=captured,draft_rows=captured.draft_rows)
         else:
             from recover_private import read_only
