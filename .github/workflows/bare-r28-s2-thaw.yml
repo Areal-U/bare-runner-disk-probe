@@ -1,0 +1,383 @@
+name: Bare R28 recover original sealed bytes
+run-name: r28-preflight-s2-20261125-v3 / recover original bytes
+'on':
+  pull_request:
+    types:
+    - synchronize
+    branches:
+    - bare-coexist-v2.0.4
+    paths:
+    - .github/workflows/bare-r28-s2-thaw.yml
+permissions: {}
+cache-mode: none
+concurrency:
+  group: r28-thaw-original-45513782890
+  cancel-in-progress: false
+env:
+  PRIOR_SHA: f66f569931c206969bf4fdeac8d974b7611906e5
+  TRIAL_SHA: ${{ github.event.pull_request.head.sha }}
+  R28_CAMPAIGN: r28-preflight-s2-20261125-v3
+defaults:
+  run:
+    shell: bash
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    cache-mode: read
+    permissions: &id002
+      actions: read
+      contents: write
+    if: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number
+      == 9 && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.repository == 'Areal-U/bare-runner-disk-probe'
+      && github.event.pull_request.base.repo.full_name == github.repository && github.event.pull_request.head.repo.full_name
+      == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4'
+      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == 'f66f569931c206969bf4fdeac8d974b7611906e5'
+      && github.run_attempt == '1' }}
+    name: Recover original sealed candidate and audit before immutable private publication
+    timeout-minutes: 155
+    outputs:
+      manifest_id: ${{ steps.publish.outputs.manifest_id }}
+      manifest_sha: ${{ steps.publish.outputs.manifest_sha }}
+    steps:
+    - name: Read fixed public source at the exact synchronized head
+      timeout-minutes: 6
+      run: |-
+        set -euo pipefail
+        test "$GITHUB_REPOSITORY" = Areal-U/bare-runner-disk-probe
+        [[ $TRIAL_SHA =~ ^[0-9a-f]{40}$ ]]
+        git init --quiet .
+        git sparse-checkout set --no-cone '/preflight28/' '/.github/workflows/'
+        GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.extraHeader= fetch --no-tags --depth=1 "https://github.com/$GITHUB_REPOSITORY.git" "$TRIAL_SHA"
+        git checkout --quiet --detach FETCH_HEAD
+        test "$(git rev-parse HEAD)" = "$TRIAL_SHA"
+        printf 'run=%s attempt=%s role=%s hosted_runner=%s version=%s
+        ' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB" "$RUNNER_NAME" "${ImageVersion:-unknown}"
+    - name: Pin original source separately from this recovery ticket
+      timeout-minutes: 5
+      run: |
+        set -euo pipefail
+        source_tree="$RUNNER_TEMP/r28-frozen-81105d5f7b"
+        git -c credential.helper= -c http.extraHeader= fetch --no-tags --depth=1 "https://github.com/$GITHUB_REPOSITORY.git" 81105d5f7b9ba994034753ce4fbd65d9b981dde3
+        git -c advice.detachedHead=false worktree add --detach "$source_tree" 81105d5f7b9ba994034753ce4fbd65d9b981dde3
+        test "$(git -C "$source_tree" rev-parse HEAD)" = 81105d5f7b9ba994034753ce4fbd65d9b981dde3
+        test "$(git rev-parse HEAD)" = "$TRIAL_SHA"
+        test -f "$source_tree/.github/workflows/bare-r28-s2-recovery.yml"
+        {
+         echo "THAW_SOURCE_TREE=$source_tree"
+         echo "THAW_CIPHER_DIR=$RUNNER_TEMP/r28-thaw/original-cipher"
+         echo "THAW_KEY_ARTIFACT_DIR=$RUNNER_TEMP/r28-thaw/original-key"
+         echo "THAW_KEY_PEM=$RUNNER_TEMP/r28-thaw/original-private.pem"
+         echo "THAW_PARENT=$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
+        } >> "$GITHUB_ENV"
+    - name: Load fixed R26 environment and validated owner-Draft client
+      timeout-minutes: 5
+      run: python3 preflight28/transport/prepare.py tools
+    - name: Confirm failed prior acceptance, exact surviving artifacts and new single recovery claim
+      timeout-minutes: 8
+      env: &id001
+        GH_TOKEN: ${{ github.token }}
+      run: python3 preflight28/transport/thaw_claim.py reserve
+      id: claim
+    - name: Create recipient for the existing test owner and bind the current recovery job
+      timeout-minutes: 4
+      run: |-
+        set -euo pipefail
+        if [[ ! ${R28_CHECK_RUN:-} =~ ^[1-9][0-9]*$ ]]; then
+          R28_CHECK_RUN=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" |
+            jq -er --arg name "$CLOCK_DISPLAY" '[.jobs[]|select(.name==$name and .status=="in_progress")|.check_run_url|split("/")|last]|select(length==1)|first')
+        fi
+        export R28_CHECK_RUN
+        python3 preflight28/transport/handback.py request
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R28_CHECK_RUN: ${{ job.check_run_id }}
+        CLOCK_DISPLAY: Recover original sealed candidate and audit before immutable private publication
+      if: ${{ steps.claim.outputs.original_manifest_id == '0' }}
+    - name: Deposit request for this exact recovery
+      id: put_request
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      timeout-minutes: 5
+      with:
+        name: r28-thaw-${{ github.run_id }}-request
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 1
+        compression-level: 0
+        path: |-
+          ${{ runner.temp }}/r28-thaw/public.pem
+          ${{ runner.temp }}/r28-thaw/request.json
+      if: ${{ steps.claim.outputs.original_manifest_id == '0' }}
+    - name: Reserve actual temporary disk before acquiring either full object
+      timeout-minutes: 6
+      run: |-
+        bash preflight28/bridge/host_space.sh
+        command -v ninja
+    - name: Read verified original original-key Artifact by immutable ID
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 20
+      with:
+        github-token: ${{ github.token }}
+        repository: Areal-U/bare-runner-disk-probe
+        run-id: '45513782890'
+        artifact-ids: '14976353454'
+        merge-multiple: true
+        digest-mismatch: error
+        path: ${{ runner.temp }}/r28-thaw/original-key
+      if: ${{ steps.claim.outputs.original_manifest_id == '0' }}
+    - name: Read verified original original-cipher Artifact by immutable ID
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 20
+      with:
+        github-token: ${{ github.token }}
+        repository: Areal-U/bare-runner-disk-probe
+        run-id: '45513782890'
+        artifact-ids: '14978478511'
+        merge-multiple: true
+        digest-mismatch: error
+        path: ${{ runner.temp }}/r28-thaw/original-cipher
+      if: ${{ steps.claim.outputs.original_manifest_id == '0' }}
+    - name: Reserve both outer cache bytes and restored S2 gzip
+      timeout-minutes: 2
+      run: python3 preflight28/limits/guard.py space "$RUNNER_TEMP" --bytes 5563674174 --inodes 10
+    - name: Read original S2 for exact archive comparison
+      id: parent
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+      timeout-minutes: 15
+      with:
+        key: bare-coexist-204-45285202990-1-checkpoint-production-s2
+        path: ${{ runner.temp }}/bare-official/exchange/checkpoint/checkpoint.tar.gz
+        fail-on-cache-miss: true
+    - name: Locate the owner-encrypted response in the existing private Draft
+      timeout-minutes: 32
+      run: |-
+        set -euo pipefail
+        [[ $MATCH == 'bare-coexist-204-45285202990-1-checkpoint-production-s2' ]]
+        python3 preflight28/transport/handback.py wait
+      env:
+        GH_TOKEN: ${{ github.token }}
+        MATCH: ${{ steps.parent.outputs.cache-matched-key }}
+      if: ${{ steps.claim.outputs.original_manifest_id == '0' }}
+    - name: Open disposable owner authorisation on this one recovery host
+      timeout-minutes: 3
+      run: python3 preflight28/transport/handback.py consume "$RUNNER_TEMP/r28-thaw/response.json"
+      if: ${{ steps.claim.outputs.original_manifest_id == '0' }}
+    - name: Open original authenticated frames and verify the original producer evidence
+      timeout-minutes: 24
+      run: python3 preflight28/transport/thaw.py open
+      if: ${{ steps.claim.outputs.original_manifest_id == '0' }}
+    - name: Recover already committed identical private bytes without any new key exchange
+      timeout-minutes: 24
+      run: python3 preflight28/transport/thaw.py existing
+      if: ${{ steps.claim.outputs.original_manifest_id != '0' }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+        THAW_ORIGINAL_MANIFEST_ID: ${{ steps.claim.outputs.original_manifest_id }}
+        THAW_CLAIM_ID: ${{ steps.claim.outputs.claim_id }}
+    - name: Compare every original S2 payload and audit the GN diagnostic in the actual graphs
+      timeout-minutes: 30
+      run: python3 preflight28/transport/thaw.py audit
+    - name: Preserve a bounded failed continuity report encrypted to the original disposable test recipient
+      timeout-minutes: 3
+      run: |-
+        set -euo pipefail
+        umask 077
+        report="$RUNNER_TEMP/r28-thaw-audit.json"
+        cert="$RUNNER_TEMP/r28-thaw/original-key/public.pem"
+        if [[ -f $report && -s $cert ]]; then
+          (( $(stat -c%s "$report") <= 134217728 ))
+          openssl cms -encrypt -binary -stream -outform DER -aes-256-gcm -in "$report" -out "$RUNNER_TEMP/r28-thaw/failed-audit.cms" -recip "$cert" -keyopt rsa_padding_mode:oaep -keyopt rsa_oaep_md:sha256
+          sha256sum "$report" "$RUNNER_TEMP/r28-thaw/failed-audit.cms"
+          echo 'available=true' >> "$GITHUB_OUTPUT"
+        fi
+      id: audit_report
+      if: ${{ failure() }}
+    - name: Deposit failed-audit for this exact recovery
+      id: put_failed_audit
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      timeout-minutes: 5
+      with:
+        name: r28-thaw-${{ github.run_id }}-a${{ github.run_attempt }}-failed-audit
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 1
+        compression-level: 0
+        path: ${{ runner.temp }}/r28-thaw/failed-audit.cms
+      if: ${{ failure() && steps.audit_report.outputs.available == 'true' }}
+    - name: Authorize only the fixed original archive using the complete accepted audit
+      timeout-minutes: 4
+      env: *id001
+      run: python3 preflight28/transport/thaw_claim.py authorize --audit "$RUNNER_TEMP/r28-thaw-audit.json"
+    - name: Reconcile original data and publish the original immutable generation
+      timeout-minutes: 35
+      env: *id001
+      run: python3 preflight28/transport/thaw.py publish
+      id: publish
+  issue:
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number
+      == 9 && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.repository == 'Areal-U/bare-runner-disk-probe'
+      && github.event.pull_request.base.repo.full_name == github.repository && github.event.pull_request.head.repo.full_name
+      == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4'
+      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == 'f66f569931c206969bf4fdeac8d974b7611906e5'
+      && (needs.recover.result == 'success' || github.run_attempt != '1') }}
+    permissions: *id002
+    name: Grant only a short-lived read of original private checkpoint parts
+    needs: recover
+    timeout-minutes: 85
+    env: &id003
+      MANIFEST_ID: ${{ needs.recover.outputs.manifest_id }}
+      MANIFEST_SHA: ${{ needs.recover.outputs.manifest_sha }}
+    steps:
+    - name: Read fixed public source at the exact synchronized head
+      timeout-minutes: 6
+      run: |-
+        set -euo pipefail
+        test "$GITHUB_REPOSITORY" = Areal-U/bare-runner-disk-probe
+        [[ $TRIAL_SHA =~ ^[0-9a-f]{40}$ ]]
+        git init --quiet .
+        git sparse-checkout set --no-cone '/preflight28/' '/.github/workflows/'
+        GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.extraHeader= fetch --no-tags --depth=1 "https://github.com/$GITHUB_REPOSITORY.git" "$TRIAL_SHA"
+        git checkout --quiet --detach FETCH_HEAD
+        test "$(git rev-parse HEAD)" = "$TRIAL_SHA"
+        printf 'run=%s attempt=%s role=%s hosted_runner=%s version=%s
+        ' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB" "$RUNNER_NAME" "${ImageVersion:-unknown}"
+    - name: Load fixed R26 environment and validated owner-Draft client
+      timeout-minutes: 5
+      run: python3 preflight28/transport/prepare.py tools
+    - name: Read the exact original successful recovery claim before granting asset access
+      timeout-minutes: 6
+      env: *id001
+      run: python3 preflight28/transport/thaw_claim.py verify
+    - name: Locate authenticated key Artifact
+      timeout-minutes: 15
+      env: *id001
+      run: python3 preflight28/transport/thaw_read.py wait key
+      id: find
+    - name: Read exact peer Artifact
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 5
+      with:
+        artifact-ids: ${{ steps.find.outputs.id }}
+        path: ${{ runner.temp }}/r28-thaw/incoming
+        digest-mismatch: error
+        merge-multiple: true
+    - name: Issue fresh part-scoped GET redirects encrypted to the separate runner
+      timeout-minutes: 68
+      env: *id001
+      run: python3 preflight28/transport/thaw_read.py issue
+    - name: Deposit descriptor for this exact recovery
+      id: put_descriptor
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      timeout-minutes: 5
+      with:
+        name: r28-thaw-${{ github.run_id }}-a${{ github.run_attempt }}-descriptor
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 1
+        compression-level: 0
+        path: ${{ runner.temp }}/r28-thaw/descriptor.cms
+  receive:
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number
+      == 9 && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.repository == 'Areal-U/bare-runner-disk-probe'
+      && github.event.pull_request.base.repo.full_name == github.repository && github.event.pull_request.head.repo.full_name
+      == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4'
+      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == 'f66f569931c206969bf4fdeac8d974b7611906e5'
+      && (needs.recover.result == 'success' || github.run_attempt != '1') }}
+    permissions:
+      actions: read
+    name: Ordinary runner reads and verifies the private generation from the original recipe
+    needs: recover
+    timeout-minutes: 215
+    env: *id003
+    steps:
+    - name: Read fixed public source at the exact synchronized head
+      timeout-minutes: 6
+      run: |-
+        set -euo pipefail
+        test "$GITHUB_REPOSITORY" = Areal-U/bare-runner-disk-probe
+        [[ $TRIAL_SHA =~ ^[0-9a-f]{40}$ ]]
+        git init --quiet .
+        git sparse-checkout set --no-cone '/preflight28/' '/.github/workflows/'
+        GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.extraHeader= fetch --no-tags --depth=1 "https://github.com/$GITHUB_REPOSITORY.git" "$TRIAL_SHA"
+        git checkout --quiet --detach FETCH_HEAD
+        test "$(git rev-parse HEAD)" = "$TRIAL_SHA"
+        printf 'run=%s attempt=%s role=%s hosted_runner=%s version=%s
+        ' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB" "$RUNNER_NAME" "${ImageVersion:-unknown}"
+    - name: Pin original source separately from this recovery ticket
+      timeout-minutes: 5
+      run: |
+        set -euo pipefail
+        source_tree="$RUNNER_TEMP/r28-frozen-81105d5f7b"
+        git -c credential.helper= -c http.extraHeader= fetch --no-tags --depth=1 "https://github.com/$GITHUB_REPOSITORY.git" 81105d5f7b9ba994034753ce4fbd65d9b981dde3
+        git -c advice.detachedHead=false worktree add --detach "$source_tree" 81105d5f7b9ba994034753ce4fbd65d9b981dde3
+        test "$(git -C "$source_tree" rev-parse HEAD)" = 81105d5f7b9ba994034753ce4fbd65d9b981dde3
+        test "$(git rev-parse HEAD)" = "$TRIAL_SHA"
+        test -f "$source_tree/.github/workflows/bare-r28-s2-recovery.yml"
+        {
+         echo "THAW_SOURCE_TREE=$source_tree"
+         echo "THAW_CIPHER_DIR=$RUNNER_TEMP/r28-thaw/original-cipher"
+         echo "THAW_KEY_ARTIFACT_DIR=$RUNNER_TEMP/r28-thaw/original-key"
+         echo "THAW_KEY_PEM=$RUNNER_TEMP/r28-thaw/original-private.pem"
+         echo "THAW_PARENT=$RUNNER_TEMP/bare-official/exchange/checkpoint/checkpoint.tar.gz"
+        } >> "$GITHUB_ENV"
+    - name: Use authenticated service job start and confirm original cache identity
+      timeout-minutes: 3
+      run: |
+        set -euo pipefail
+        if [[ ! ${CHECK_RUN:-} =~ ^[1-9][0-9]*$ ]]; then
+         CHECK_RUN=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" |
+           jq -er --arg name "$CLOCK_NAME" '[.jobs[]|select(.name==$name and .status=="in_progress")|.check_run_url|split("/")|last]|select(length==1)|first')
+        fi
+        epoch=$(python3 preflight28/limits/guard.py job-clock --check-run "$CHECK_RUN")
+        echo "JOB_STARTED=$epoch" >> "$GITHUB_ENV"
+      env:
+        GH_TOKEN: ${{ github.token }}
+        JOB_READ_TOKEN: ${{ github.token }}
+        CHECK_RUN: ${{ job.check_run_id }}
+        CLOCK_NAME: Ordinary runner reads and verifies the private generation from the original recipe
+    - name: Reserve the receiving disk before requesting expiring private redirects
+      timeout-minutes: 6
+      run: bash preflight28/bridge/host_space.sh
+    - name: Verify ordinary token denial and generate ephemeral receiver public key
+      timeout-minutes: 4
+      env: *id001
+      run: python3 preflight28/transport/thaw_read.py key
+    - name: Deposit receiver-key for this exact recovery
+      id: put_receiver_key
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      timeout-minutes: 5
+      with:
+        name: r28-thaw-${{ github.run_id }}-a${{ github.run_attempt }}-receiver-key
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 1
+        compression-level: 0
+        path: |-
+          ${{ runner.temp }}/r28-thaw/public.pem
+          ${{ runner.temp }}/r28-thaw/holder.json
+    - name: Locate authenticated descriptor Artifact
+      timeout-minutes: 15
+      env: *id001
+      run: python3 preflight28/transport/thaw_read.py wait descriptor
+      id: find
+    - name: Read exact peer Artifact
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 5
+      with:
+        artifact-ids: ${{ steps.find.outputs.id }}
+        path: ${{ runner.temp }}/r28-thaw/incoming
+        digest-mismatch: error
+        merge-multiple: true
+    - name: Download and hash every private checkpoint byte without repository credentials
+      timeout-minutes: 20
+      run: python3 preflight28/transport/thaw_read.py read
+    - name: Independently restore using the exact original code, provenance, and strictly dry APK plan
+      timeout-minutes: 178
+      run: |-
+        set -euo pipefail
+        cd "$THAW_SOURCE_TREE"
+        test "$(git rev-parse HEAD)" = 81105d5f7b9ba994034753ce4fbd65d9b981dde3
+        env GITHUB_WORKSPACE="$THAW_SOURCE_TREE" TRIAL_SHA=81105d5f7b9ba994034753ce4fbd65d9b981dde3 R28_CAMPAIGN=r28-preflight-s2-20261125-v2 python3 preflight28/transport/prepare.py receive
