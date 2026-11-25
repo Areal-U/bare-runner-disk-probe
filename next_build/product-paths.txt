@@ -2,6 +2,10 @@
 .github/workflows/bare-checkpoint-transfer.yml
 .github/workflows/bare-r28-native-slot.yml
 build_trial.py
+next_build/source_artifact.py
+next_build/source_seed.py
+next_build/test_source_seed.py
+next_build/trials/source_reuse.py
 preflight28/bridge/test_arm_archive.py
 preflight28/bridge/test_normal.py
 preflight28/bridge/test_runtime_payload.py
