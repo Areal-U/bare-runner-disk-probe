@@ -88,6 +88,29 @@ class NativeTests(unittest.TestCase):
         n=inputs(13);n["read"]["result"]="skipped"
         self.assertEqual(record(n,13,True)[1]["status"],"limit-verified")
 
+    def test_canonical_same_vm_retry_never_advances_without_private_receipt(self):
+        steps = {s["id"]:s for s in ARM["jobs"]["compile-probe"]["steps"] if "id" in s}
+        first, retry = (steps[k] for k in ("peer_put_outcome","retry_relay"))
+        self.assertEqual(first["uses"],"./preflight28/bridge/normal_upload")
+        self.assertEqual(first["uses"],retry["uses"])
+        self.assertEqual(first["with"],retry["with"])
+        self.assertEqual((first["with"]["overwrite"],first["with"]["compression-level"],first["with"]["retention-days"]),
+                         (False,0,1))
+        self.assertIn("steps.resolve_relay_1.outputs.decision == 'retry'",retry["if"])
+        self.assertIn("== 'candidate'",CALLER["jobs"]["slot02"]["if"])
+        n=inputs(2); n["read"]["result"]="skipped"; o=n["arm"]["outputs"]
+        for reason in ("relay-quota-denied","relay-capacity-exceeded","relay-deadline","relay-missing","relay-ambiguous"):
+            o.update(relay_stop=reason,relay_no_receipt="true")
+            self.assertEqual(record(n,2,backend="draft")[1]["status"],reason)
+        o["relay_no_receipt"]="false"
+        self.assertNotEqual(record(n,2,backend="draft")[0].returncode,0)
+        o.update(private_readback_verified="true",checkpoint_manifest_id="483",checkpoint_manifest_sha="8"*64,checkpoint_bytes="12345")
+        self.assertEqual(record(n,2,backend="draft")[1]["status"],"candidate")
+        o.update(private_readback_verified="",relay_no_receipt="true",apk_delivery_status="sealed",
+                 apk_encrypted_sha="b"*64,apk_encrypted_bytes="421",apk_artifact_id="7")
+        n["apk"]["result"]="success"
+        self.assertEqual(record(n,2,backend="draft")[1]["status"],"apk")
+
     def test_exact_workflow_graph_and_embedded_scripts(self):
         workflows=("bare-checkpoint-transfer.yml","bare-r28-native-slot.yml","bare-arm64-probe.yml",
                    "bare-r28-replay-chain.yml","bare-r28-replay-worker.yml")

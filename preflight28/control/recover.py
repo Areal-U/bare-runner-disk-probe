@@ -53,7 +53,8 @@ def follow(receipts, run, sha):
                     (not cache or cache == f"bare-coexist-204-apk-v1-{run}-1-s{n}")
                     and (aid or cache), "Invalid archived APK location")
             terminal = r
-        elif state in {"no-progress", "apk-size-exceeded", "cipher-size-exceeded"}:
+        elif state in {"no-progress", "apk-size-exceeded", "cipher-size-exceeded",
+                       "relay-quota-denied","relay-capacity-exceeded","relay-deadline","relay-missing","relay-ambiguous"}:
             terminal = r
         elif state == "limit-verified":
             require(n == 13 and r["sha"] == current, "Unverified last parent")
@@ -202,7 +203,7 @@ def main():
         return page["actions_caches"]
     outcome = recover_fallback(outcome,jobs,run,log,caches)
     outcome = salvage(outcome, jobs, artifacts, run, sha, log)
-    if outcome["status"] == "recovery-no-terminal":
+    if outcome["status"] == "recovery-no-terminal" or outcome["status"].startswith("relay-"):
         outcome.update(last_private_slot(jobs, receipts, run, sha, artifacts))
     aid = outcome.get("cipher_id", "")
     if aid:
