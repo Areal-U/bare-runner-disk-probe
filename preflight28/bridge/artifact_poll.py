@@ -11,6 +11,11 @@ def require(value,message):
         raise ValueError(message)
 
 
+def backoff(index):
+    """Poll promptly at first, then limit service load during a long wait."""
+    return (8,15,30,60)[min(max(index,0),3)]
+
+
 def identity(row):
     return tuple(row.get(key) for key in ("id","name","size_in_bytes","digest","expired","expires_at"))
 
