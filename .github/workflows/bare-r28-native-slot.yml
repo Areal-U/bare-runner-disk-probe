@@ -253,7 +253,7 @@ jobs:
     needs: [collection-lease, arm, apk]
     if: ${{ !cancelled() && github.run_attempt == '1' && !inputs.verify_only && inputs.backend == 'draft' && needs.collection-lease.result == 'success' && needs.arm.result == 'success' && needs.apk.result == 'success' && needs.arm.outputs.apk_artifact_id == '' && needs.arm.outputs.apk_cache_key != '' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 45
     permissions:
       actions: read
       contents: write
@@ -275,6 +275,7 @@ jobs:
         key: ${{ needs.arm.outputs.apk_cache_key }}
         fail-on-cache-miss: true
     - name: Deposit and read back the owner-encrypted bytes and immutable receiver record
+      id: deposited
       timeout-minutes: 20
       env:
         GH_TOKEN: ${{ github.token }}
@@ -287,6 +288,59 @@ jobs:
         CIPHER_SHA: ${{ needs.arm.outputs.apk_encrypted_sha }}
         CIPHER_BYTES: ${{ needs.arm.outputs.apk_encrypted_bytes }}
       run: python3 preflight28/bridge/terminal_draft.py
+    - name: Bind the allowlisted private terminal identities for the registered owner
+      id: owner_witness
+      timeout-minutes: 2
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WITNESS_RECEIPT_ID: ${{ steps.deposited.outputs.receipt_id }}
+        WITNESS_RECEIPT_SHA: ${{ steps.deposited.outputs.receipt_sha }}
+        R28_SLOT: ${{ inputs.ordinal }}
+        R28_PARENT_SHA: ${{ inputs.parent_sha }}
+        R28_COLLECTION_CLAIM: ${{ needs.collection-lease.outputs.owner_claim_id }}
+      run: python3 preflight28/control/owner_witness.py terminal
+    - name: Preserve the registered owner terminal witness in the original Draft
+      id: private_witness
+      continue-on-error: true
+      timeout-minutes: 2
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WITNESS_NAME: ${{ steps.owner_witness.outputs.name }}
+        WITNESS_SHA: ${{ steps.owner_witness.outputs.sha }}
+        R28_SLOT: ${{ inputs.ordinal }}
+      run: python3 preflight28/control/owner_witness.py preserve terminal
+    - name: Attest registered owner terminal SHA256 ${{ steps.owner_witness.outputs.sha }}
+      env:
+        WITNESS_SHA: ${{ steps.owner_witness.outputs.sha }}
+      run: '[[ $WITNESS_SHA =~ ^[a-f0-9]{64}$ ]]'
+    - name: Check the free capacity for the optional owner witness Artifact
+      id: witness_budget
+      continue-on-error: true
+      timeout-minutes: 2
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R28_STORAGE_CEILING: ${{ needs.collection-lease.outputs.storage_ceiling }}
+        R28_STORAGE_UNTIL: ${{ needs.collection-lease.outputs.storage_until }}
+        R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
+      run: python3 preflight28/bridge/storage_admission.py witness --file "$RUNNER_TEMP/witness.json"
+    - name: Persist verified owner terminal identities
+      id: owner_witness_upload
+      if: ${{ steps.witness_budget.outcome == 'success' }}
+      continue-on-error: true
+      timeout-minutes: 2
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: ${{ steps.owner_witness.outputs.name }}
+        path: ${{ runner.temp }}/witness.json
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 30
+        compression-level: 0
+    - name: Attest registered owner terminal IDs ${{ steps.owner_witness.outputs.ids }}
+      env:
+        WITNESS_IDS: ${{ steps.owner_witness.outputs.ids }}
+        WITNESS_SHA: ${{ steps.owner_witness.outputs.sha }}
+      run: python3 preflight28/control/owner_witness.py attest terminal
   confirm-private:
     name: Confirm original private visibility for slot ${{ inputs.ordinal }}
     needs: arm
