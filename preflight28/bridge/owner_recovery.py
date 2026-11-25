@@ -121,11 +121,11 @@ def read_claim(api, release, name):
 
 
 def collection_claim(api,release,ctx):
-    genesis = read_claim(api,release,"bare-personal-204-r28-production-run-claim.json")
+    genesis = read_claim(api,release,"bare-personal-204-r29-production-run-claim.json")
     if not genesis:
         return None
     original_id, original = genesis
-    binding = {"schema":1,"campaign":"bare-personal-204-r28","repository_id":1450926240,
+    binding = {"schema":1,"campaign":"bare-personal-204-r29","repository_id":1450926240,
                "workflow":".github/workflows/bare-checkpoint-transfer.yml","branch":"bare-coexist-v2.0.4",
                "head":ctx["producer_sha"],"release_id":b.RELEASE,"recipient":RECIPIENT,"producer_attempt":1}
     b.require(original.get("initial_parent") == b.PARENT_SHA and
@@ -139,7 +139,7 @@ def collection_claim(api,release,ctx):
               (event.get("sender") or {}).get("id") == 292261483 and
               (event.get("repository") or {}).get("id") == binding["repository_id"],
               "Owner collection claim is for a different operation")
-    replacement = read_claim(api,release,"bare-personal-204-r28-loss-replacement-claim.json")
+    replacement = read_claim(api,release,"bare-personal-204-r29-loss-replacement-claim.json")
     b.require(replacement is not None, "No immutable replacement collection claim")
     claim_id, claim = replacement
     expected = dict(binding,run_id=ctx["run"],original_claim_id=original_id,origin_run=original["run_id"],

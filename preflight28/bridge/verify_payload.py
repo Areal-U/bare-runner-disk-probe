@@ -16,7 +16,11 @@ def check(file, record):
     spec = importlib.util.spec_from_file_location("current_checkpoint_validator",source)
     ck = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ck)
+    graph_spec = importlib.util.spec_from_file_location('checkpoint_retention', Path(__file__).resolve().parents[1] / 'graph/retained.py')
+    retention = importlib.util.module_from_spec(graph_spec)
+    graph_spec.loader.exec_module(retention)
     sampled = {}
+    stamps = {}
     payload_paths = set()
     bounds = {PROOF: 64*1024**2, ck.PROVENANCE_RECORD: 1024**2}
 
@@ -26,6 +30,9 @@ def check(file, record):
             class Sampler:
                 def __iter__(self):
                     for member in actual:
+                        # Let the pinned parser reject excessive unpacked bytes/member count
+                        # and unsafe headers before consuming even one candidate data block.
+                        yield member
                         name = ck.archive_relative(member.name).as_posix()
                         if member.isfile() or member.issym() or member.islnk():
                             payload_paths.add(name)
@@ -33,7 +40,13 @@ def check(file, record):
                             if name in sampled or not member.isfile() or not 0<member.size<=bounds[name]:
                                 raise ValueError("Invalid bounded private archive evidence")
                             sampled[name] = actual.extractfile(member).read(member.size)
-                        yield member
+                        if member.isfile() and (name.endswith(('.md5.stamp', '.desugardeps')) or
+                                (name.startswith(('out/Bare/gen/', 'out/Bare/obj/')) and name.endswith(('.jar','.dex','.zip','.json')))):
+                            digest = hashlib.sha256()
+                            with actual.extractfile(member) as stamp:
+                                for block in iter(lambda: stamp.read(1024**2), b''):
+                                    digest.update(block)
+                            stamps[name] = [member.size, digest.hexdigest()]
                 def extractfile(self, member):
                     return actual.extractfile(member)
             yield Sampler()
@@ -75,3 +88,11 @@ def check(file, record):
         ids.add(ck.canonical_hash(group))
     if ids != before - after:
         raise ValueError("Archived output groups do not match the complete APK frontier change")
+    for name, expected in retention.stamp_metadata(proof, ck.canonical_hash).items():
+        if stamps.get('out/Bare/' + name) != expected:
+            raise ValueError('Archived runtime stamp absent or changed')
+    for row in proof.get('runtime_stamps', {}).values():
+        for binding, digest in row['fileargs'].items():
+            source = 'out/Bare/' + binding.partition(':')[0]
+            if source not in stamps or stamps[source][1] != digest:
+                raise ValueError('Archived runtime output source absent or changed')

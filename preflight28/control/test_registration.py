@@ -27,15 +27,18 @@ class OwnerDraft:
         self.ack_asset = dict(name=CAMPAIGN+"-collector-ack-"+self.ticket["registration_nonce"]+".json",id=812,
                               created_at="2026-11-25T00:59:00Z")
         self.asset = dict(name=CAMPAIGN+"-collection-registration.json",id=901,uploader=OWNER,created_at="2026-11-25T01:00:00Z")
+        from registration import PREVIOUS_CAMPAIGN, PREVIOUS_HEAD
+        self.prior = dict(self.ticket, campaign=PREVIOUS_CAMPAIGN, head=PREVIOUS_HEAD,
+            collector_registration_id="Automation_"+"2"*32, registration_nonce="3"*32)
         self.origin = dict(id=81,run_attempt=1,head_sha="a"*40,path=WORKFLOW,event="workflow_dispatch",
                            head_branch=BASE_REF,actor=OWNER,repository={"id":REPO_ID},head_repository={"id":REPO_ID},
                            created_at="2026-11-25T01:03:00Z")
-    def data(self,n=901): return json.dumps(self.ticket if n==901 else self.ack).encode()
+    def data(self,n=901): return json.dumps(self.prior if n==700 else self.ticket if n==901 else self.ack).encode()
     def draft(self, rid):
         assert rid == RELEASE_ID
-        return {"assets":[dict(self.asset,size=len(self.data()),digest="sha256:"+hashlib.sha256(self.data()).hexdigest()),dict(self.ack_asset,size=len(self.data(812)))]}
+        return {"assets":[dict(self.asset,size=len(self.data()),digest="sha256:"+hashlib.sha256(self.data()).hexdigest()),dict(self.ack_asset,size=len(self.data(812))), dict(name=self.prior["campaign"]+"-collection-registration.json",id=700,state="uploaded",uploader=OWNER,size=len(self.data(700)),digest="sha256:"+hashlib.sha256(self.data(700)).hexdigest())]}
     def asset_info(self, release, name, size, sha, aid):
-        assert len(self.data(aid)) == size and aid in (901,812)
+        assert len(self.data(aid)) == size and aid in (901,812,700)
     def metadata(self, path):
         if path == "/repos/"+REPO:
             return dict(id=REPO_ID,full_name=REPO,private=False,fork=False,visibility="public")
@@ -52,6 +55,9 @@ class OwnerDraft:
 class TicketTests(unittest.TestCase):
     def setUp(self):
         self.d = OwnerDraft()
+        prior = patch("registration.PREVIOUS_TICKET_SHA", hashlib.sha256(self.d.data(700)).hexdigest())
+        prior.start()
+        self.addCleanup(prior.stop)
         self.env = dict(RUNNER_ENVIRONMENT="github-hosted",REGISTRATION_ASSET_ID="901",GITHUB_SHA="a"*40,GITHUB_JOB="bind-private-receiver",
                         GITHUB_RUN_ID="81",GITHUB_RUN_ATTEMPT="1",GITHUB_REPOSITORY=REPO,GITHUB_EVENT_NAME="workflow_dispatch",
                         GITHUB_REF="refs/heads/"+BASE_REF)
@@ -67,8 +73,8 @@ class TicketTests(unittest.TestCase):
 
             def __init__(self):
                 super().__init__()
-                ticket, ack = super().draft(RELEASE_ID)["assets"]
-                self.assets = [dict(id=i, name="old-"+str(i)) for i in range(1,101)] + [ticket, ack]
+                ticket, ack, prior = super().draft(RELEASE_ID)["assets"]
+                self.assets = [dict(id=i, name="old-"+str(i)) for i in range(1,101)] + [ticket, ack, prior]
                 self.assets.extend(dict(id=i, name="old-"+str(i)) for i in range(101,199))
                 self.posts = 0
                 self.pages = []
@@ -123,7 +129,7 @@ class TicketTests(unittest.TestCase):
     def test_nominal_ticket_cannot_reserve_a_legacy_or_alternate_build(self, claim):
         fixed = dict(checkpoint_key="bare-coexist-204-45285202990-1-checkpoint-production-s2",
                      checkpoint_sha=S2_SHA, checkpoint_identity="a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc")
-        for override in ({"checkpoint_backend":"cache"}, dict(fixed,build_segments="1"), dict(fixed,build_segments="2"),
+        for override in ({"checkpoint_backend":"cache"}, {"checkpoint_compression":"unknown"}, dict(fixed,build_segments="1"), dict(fixed,build_segments="2"),
                          dict(fixed,checkpoint_key="foreign"), {"checkpoint_sha":S2_SHA}, {"compile_minutes":"25"},
                          {"loss_origin_run":"42"}, {"retain_existing_caches":"true"}, {"jobs":"1"}, {"output_gib":"19"},
                          {"encrypted_apk_bytes":"859"}, {"apk_recipient":"other"}):
@@ -170,6 +176,17 @@ class TicketTests(unittest.TestCase):
         self.d.ack["valid_until"]="2026-11-28T04:00:00Z"
         with self.assertRaisesRegex(ValueError,"ACK bytes"):
             bind(self.d,self.env,self.event,self.now,verify_only=True)
+
+    @patch("registration.admit")
+    def test_conflicting_predecessor_reservation_cannot_claim(self, claim):
+        for change in (dict(owner_destination_id="different_owner_destination"),
+                       dict(registration_nonce=self.d.prior["registration_nonce"]),
+                       dict(collector_registration_id=self.d.prior["collector_registration_id"])):
+            with self.subTest(change=change), patch.dict(self.d.ticket,change), self.assertRaises(ValueError):
+                self.enter()
+        with patch.dict(self.d.prior,campaign="foreign"), self.assertRaises(ValueError):
+            self.enter()
+        claim.assert_not_called()
 
     def test_lease_includes_receiver_private_deposit_and_receipt(self):
         from registration import checked_ack, instant

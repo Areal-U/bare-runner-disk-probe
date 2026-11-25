@@ -66,7 +66,7 @@ class PrivateArchiveTests(unittest.TestCase):
         run = byid['pack-checkpoint']['run']
         # Exercise the actual shell used on the isolated volume, apart from the host codec.
         start = run.index("docker compose exec -T chromium-builder bash -euc '\n    cd /work/chromium/src\n    # This archive")
-        body = run[start:].split("bash -euc '\n",1)[1].split("' |\n",1)[0].replace('/work/chromium/src','.')
+        body = run[start:].split("bash -euc '\n",1)[1].split("'\n",1)[0].replace('/work/chromium/src','.')
         with tempfile.TemporaryDirectory() as tmp:
             work=Path(tmp); out=work/'out/Bare'
             (out/'apks').mkdir(parents=True); (out/'obj').mkdir()

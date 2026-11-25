@@ -25,6 +25,11 @@ run-name: ${{ inputs.mode == 'build-apk' && format('Bare ARM64 build (up to {0} 
         type: choice
         default: draft
         options: [draft]
+      checkpoint_compression:
+        description: Auto selects zstd -4 for a measured-size tree and -9 for larger trees; compact always uses -9
+        type: choice
+        default: auto
+        options: [auto, compact]
       apk_recipient:
         description: Pinned owner age public recipient for the encrypted APK
         type: string
@@ -81,6 +86,7 @@ jobs:
         JOBS: ${{ inputs.jobs }}
         OUTPUT_GIB: ${{ inputs.output_gib }}
         BACKEND: ${{ inputs.checkpoint_backend }}
+        COMPRESSION: ${{ inputs.checkpoint_compression }}
         LOSS_ORIGIN: ${{ inputs.loss_origin_run }}
         RECOVERY_BYTES: ${{ inputs.encrypted_apk_bytes }}
         PARENT_KEY: ${{ inputs.checkpoint_key }}
@@ -88,6 +94,7 @@ jobs:
         PARENT_IDENTITY: ${{ inputs.checkpoint_identity }}
       run: |
         [[ $SEGMENTS == 12 && $BACKEND == draft && -z $LOSS_ORIGIN$RECOVERY_BYTES ]]
+        [[ ${COMPRESSION:-auto} == auto || $COMPRESSION == compact ]]
         [[ $APK_RECIPIENT == age1t69raxytlqula36e8w0tm6p3ezt49ztwnrtz8k57h6mvpwfguy7sjmr4yx ]]
         [[ $OUTPUT_GIB == 18 && $JOBS == 2 && ($MINUTES == 180 || $MINUTES == 0) ]]
         if [[ -n $PARENT_KEY$PARENT_SHA$PARENT_IDENTITY ]]; then
@@ -645,6 +652,7 @@ jobs:
     with:
       ordinal: ${{ fromJSON(needs.loss-admission.outputs.ordinal) }}
       backend: draft
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       verify_only: false
       minutes: 0
       apk_recipient: ${{ inputs.apk_recipient }}
@@ -667,6 +675,7 @@ jobs:
     with:
       ordinal: ${{ fromJSON(needs.loss-admission.outputs.next_ordinal) }}
       backend: draft
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       verify_only: true
       minutes: 0
       apk_recipient: ${{ inputs.apk_recipient }}
@@ -690,6 +699,7 @@ jobs:
     with:
       ordinal: 1
       backend: ${{ inputs.checkpoint_backend }}
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       verify_only: false
       parent_key: bare-coexist-204-45285202990-1-checkpoint-production-s2
       parent_sha: 4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf
@@ -712,6 +722,7 @@ jobs:
     with:
       ordinal: 2
       backend: ${{ inputs.checkpoint_backend }}
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       parent_manifest_id: ${{ needs.slot01.outputs.manifest_id }}
       parent_manifest_sha: ${{ needs.slot01.outputs.manifest_sha }}
       verify_only: false
@@ -737,6 +748,7 @@ jobs:
     with:
       ordinal: 3
       backend: ${{ inputs.checkpoint_backend }}
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       parent_manifest_id: ${{ needs.slot02.outputs.manifest_id }}
       parent_manifest_sha: ${{ needs.slot02.outputs.manifest_sha }}
       verify_only: false
@@ -762,6 +774,7 @@ jobs:
     with:
       ordinal: 4
       backend: ${{ inputs.checkpoint_backend }}
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       parent_manifest_id: ${{ needs.slot03.outputs.manifest_id }}
       parent_manifest_sha: ${{ needs.slot03.outputs.manifest_sha }}
       verify_only: false
@@ -787,6 +800,7 @@ jobs:
     with:
       ordinal: 5
       backend: ${{ inputs.checkpoint_backend }}
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       parent_manifest_id: ${{ needs.slot04.outputs.manifest_id }}
       parent_manifest_sha: ${{ needs.slot04.outputs.manifest_sha }}
       verify_only: false
@@ -812,6 +826,7 @@ jobs:
     with:
       ordinal: 6
       backend: ${{ inputs.checkpoint_backend }}
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       parent_manifest_id: ${{ needs.slot05.outputs.manifest_id }}
       parent_manifest_sha: ${{ needs.slot05.outputs.manifest_sha }}
       verify_only: false
@@ -837,6 +852,7 @@ jobs:
     with:
       ordinal: 7
       backend: ${{ inputs.checkpoint_backend }}
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       parent_manifest_id: ${{ needs.slot06.outputs.manifest_id }}
       parent_manifest_sha: ${{ needs.slot06.outputs.manifest_sha }}
       verify_only: false
@@ -862,6 +878,7 @@ jobs:
     with:
       ordinal: 8
       backend: ${{ inputs.checkpoint_backend }}
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       parent_manifest_id: ${{ needs.slot07.outputs.manifest_id }}
       parent_manifest_sha: ${{ needs.slot07.outputs.manifest_sha }}
       verify_only: false
@@ -887,6 +904,7 @@ jobs:
     with:
       ordinal: 9
       backend: ${{ inputs.checkpoint_backend }}
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       parent_manifest_id: ${{ needs.slot08.outputs.manifest_id }}
       parent_manifest_sha: ${{ needs.slot08.outputs.manifest_sha }}
       verify_only: false
@@ -912,6 +930,7 @@ jobs:
     with:
       ordinal: 10
       backend: ${{ inputs.checkpoint_backend }}
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       parent_manifest_id: ${{ needs.slot09.outputs.manifest_id }}
       parent_manifest_sha: ${{ needs.slot09.outputs.manifest_sha }}
       verify_only: false
@@ -937,6 +956,7 @@ jobs:
     with:
       ordinal: 11
       backend: ${{ inputs.checkpoint_backend }}
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       parent_manifest_id: ${{ needs.slot10.outputs.manifest_id }}
       parent_manifest_sha: ${{ needs.slot10.outputs.manifest_sha }}
       verify_only: false
@@ -962,6 +982,7 @@ jobs:
     with:
       ordinal: 12
       backend: ${{ inputs.checkpoint_backend }}
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       parent_manifest_id: ${{ needs.slot11.outputs.manifest_id }}
       parent_manifest_sha: ${{ needs.slot11.outputs.manifest_sha }}
       verify_only: false
@@ -987,6 +1008,7 @@ jobs:
     with:
       ordinal: 13
       backend: ${{ inputs.checkpoint_backend }}
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       parent_manifest_id: ${{ needs.slot12.outputs.manifest_id }}
       parent_manifest_sha: ${{ needs.slot12.outputs.manifest_sha }}
       verify_only: true

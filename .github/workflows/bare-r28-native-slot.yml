@@ -2,6 +2,9 @@ name: Bare 2.0.4 verified build segment
 'on':
   workflow_call:
     inputs:
+      checkpoint_compression:
+        type: string
+        default: auto
       backend:
         type: string
         default: cache
@@ -118,6 +121,7 @@ jobs:
       storage_ceiling: ${{ needs.collection-lease.outputs.storage_ceiling }}
       storage_until: ${{ needs.collection-lease.outputs.storage_until }}
       backend: ${{ inputs.backend }}
+      checkpoint_compression: ${{ inputs.checkpoint_compression }}
       parent_run: ${{ inputs.parent_run }}
       parent_manifest_id: ${{ inputs.parent_manifest_id }}
       parent_manifest_sha: ${{ inputs.parent_manifest_sha }}

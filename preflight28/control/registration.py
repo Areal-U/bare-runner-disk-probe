@@ -10,7 +10,10 @@ import sys
 
 from admission import BASE_REF, REPO, REPO_ID, S2_SHA, RELEASE_ID, PagedOwnerDraft, admit, require
 
-CAMPAIGN = "bare-personal-204-r28"
+CAMPAIGN = "bare-personal-204-r29"
+PREVIOUS_CAMPAIGN = "bare-personal-204-r28"
+PREVIOUS_HEAD = "f3ed4479912a30959859d81328af3fd4dc6d8d00"
+PREVIOUS_TICKET_SHA = "f1d71505eecef0fc11af50dc5d411e17031fb903e6b85613a5aec559546e505b"
 CLAIM = CAMPAIGN + "-production-run-claim.json"
 WORKFLOW = ".github/workflows/bare-checkpoint-transfer.yml"
 OWNER = {"id": 292261483, "login": "Areal-U"}
@@ -20,6 +23,32 @@ RECIPIENT = "age1t69raxytlqula36e8w0tm6p3ezt49ztwnrtz8k57h6mvpwfguy7sjmr4yx"
 def instant(value):
     require(isinstance(value, str) and value.endswith("Z"), "Expected UTC timestamp")
     return datetime.fromisoformat(value[:-1] + "+00:00")
+
+
+
+def same_owner_as_previous(helper, release, ticket):
+    """Check the immutable earlier owner reservation before staging a new physical claim."""
+    earlier_name = PREVIOUS_CAMPAIGN + "-collection-registration.json"
+    found = [row for row in release["assets"] if row["name"] == earlier_name]
+    require(len(found) == 1, "Prior owner ticket missing or ambiguous")
+    row = found[0]
+    require(type(row["id"]) is int and row["id"] > 0 and row["state"] == "uploaded" and
+            0 < row["size"] <= 4096 and row["digest"] == "sha256:" + PREVIOUS_TICKET_SHA and
+            all(row["uploader"].get(k) == v for k, v in OWNER.items()), "Unconfirmed prior owner ticket")
+    helper.asset_info(release, earlier_name, row["size"], PREVIOUS_TICKET_SHA, row["id"])
+    raw = io.BytesIO()
+    helper.download(row["id"], row["size"], PREVIOUS_TICKET_SHA, raw)
+    require(len(raw.getvalue()) == row["size"] and hashlib.sha256(raw.getvalue()).hexdigest() == PREVIOUS_TICKET_SHA,
+            "Prior owner ticket changed")
+    prior = json.loads(raw.getvalue())
+    fields = dict(schema=1, campaign=PREVIOUS_CAMPAIGN, head=PREVIOUS_HEAD,
+                  initial_parent=S2_SHA, repository_id=REPO_ID, release_id=RELEASE_ID,
+                  workflow=WORKFLOW, branch=BASE_REF, recipient=RECIPIENT)
+    require(all(prior.get(k) == v for k,v in fields.items()) and
+            prior["owner_destination_id"] == ticket["owner_destination_id"] and
+            prior["registration_nonce"] != ticket["registration_nonce"] and
+            prior["collector_registration_id"] != ticket["collector_registration_id"] and
+            prior["head"] != ticket["head"], "Changed destination or reused prior owner registration")
 
 
 def checked_ack(helper, release, ticket, created, now):
@@ -70,6 +99,7 @@ def checked_build_route(inputs):
                 "apk_recipient": RECIPIENT, "jobs": "2", "output_gib": "18"}
     require(all(inputs.get(k, v) == v for k, v in required.items()) and
             inputs.get("compile_minutes", "0") in ("0", "180") and
+            inputs.get("checkpoint_compression", "auto") in ("auto", "compact") and
             inputs.get("retain_existing_caches", "false") in ("false", False) and
             not inputs.get("loss_origin_run") and not inputs.get("encrypted_apk_bytes"),
             "Dispatch differs from the R28 numbered Draft build")
@@ -120,6 +150,7 @@ def bind(helper, env, event, now, *, verify_only=False):
                     head=revision, initial_parent=S2_SHA, release_id=RELEASE_ID, recipient=RECIPIENT)
     require(all(ticket.get(k) == v for k,v in expected.items()),
             "Registration belongs to another campaign, owner, revision or initial parent")
+    same_owner_as_previous(helper, release, ticket)
     service = ticket["collector_registration_id"]
     require(re.fullmatch(r"Automation_[0-9a-f]{32}", service), "A separately registered collection target is required")
     created, issued, expires = instant(api["created_at"]), instant(ticket["issued_at"]), instant(ticket["expires_at"])

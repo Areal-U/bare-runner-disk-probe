@@ -105,7 +105,10 @@ class TestTransport(unittest.TestCase):
                 psha=hashlib.sha256(pf.read_bytes()).hexdigest()
                 tar=subprocess.run(["tar","-C",str(src),"-cf","-","out/Bare"],capture_output=True,check=True).stdout
                 candidate=n.ROOT/"new.tar.zst"
-                candidate.write_bytes(subprocess.run(["zstd","-qc","-9"],input=tar,capture_output=True,check=True).stdout)
+                # Exercise the ordinary packer before sealing and independently acquiring the generation.
+                packer = Path(__file__).resolve().parents[1] / "transport/pack_draft.py"
+                subprocess.run([sys.executable, str(packer), str(candidate), "auto", str(len(tar)), "--",
+                                "tar", "-C", str(src), "-cf", "-", "out/Bare"], check=True)
                 n.seal(candidate,ih,psha)
                 with patch.object(b,"api_json",side_effect=Provider().get),patch.dict(os.environ,
                       R28_STORAGE_CEILING=ENV["R28_STORAGE_CEILING"],R28_STORAGE_UNTIL=ENV["R28_STORAGE_UNTIL"],
@@ -181,12 +184,12 @@ class TestTransport(unittest.TestCase):
                 # The limited VM was lost before an intent or manifest. On a read-only
                 # retry the signed-in service can identify the original owner artifact.
                 c=n.context()
-                claim={"schema":1,"campaign":"bare-personal-204-r28","repository_id":1450926240,
+                claim={"schema":1,"campaign":"bare-personal-204-r29","repository_id":1450926240,
                        "workflow":".github/workflows/bare-checkpoint-transfer.yml","branch":"bare-coexist-v2.0.4",
                        "head":c["producer_sha"],"initial_parent":b.PARENT_SHA,"registration_id":"Automation_fixture","release_id":b.RELEASE,
                        "recipient":recipient,"run_id":c["run"],"producer_attempt":1}
                 raw=json.dumps(claim).encode()
-                row={"id":123,"name":"bare-personal-204-r28-production-run-claim.json","size":len(raw),
+                row={"id":123,"name":"bare-personal-204-r29-production-run-claim.json","size":len(raw),
                      "digest":"sha256:"+hashlib.sha256(raw).hexdigest(),"state":"uploaded"}
                 api.assets.append(row);api.data[123]=raw
                 artifact={"id":321,"name":"r28-1234-a1-s02-outcome","digest":"sha256:"+"7"*64,
@@ -243,7 +246,7 @@ class TestTransport(unittest.TestCase):
                                              initial_parent=rec["checkpoint_sha"],parent_sha=rec["checkpoint_sha"],
                                              parent_identity=rec["checkpoint_identity"])
                     raw=json.dumps(replacement_claim).encode()
-                    api.assets.append(dict(row,id=124,name="bare-personal-204-r28-loss-replacement-claim.json",
+                    api.assets.append(dict(row,id=124,name="bare-personal-204-r29-loss-replacement-claim.json",
                                            size=len(raw),digest="sha256:"+hashlib.sha256(raw).hexdigest()))
                     api.data[124]=raw
                     # The new input wrapper is also bound to the replacement claim.
