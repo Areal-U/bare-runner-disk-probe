@@ -2,6 +2,11 @@
 import argparse
 import contextlib
 import hashlib
+import base64
+import io
+import importlib.util
+from functools import lru_cache
+import posixpath
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -134,22 +139,58 @@ def graph_input(name):
             or re.fullmatch(r"\.(?:ninja_deps|siso_deps)(?:\.[\w.-]+)?", name) is not None)
 
 
+METRICS = ["siso_metrics.json"] + [f"siso_metrics.{i}.json" for i in range(10)]
+METRIC_TOKEN = re.compile(rb"siso_metrics(?:\.[0-9])?\.json")
+DESCRIPTORS = {"apks/ChromeAndWebView32.ssargs", "apks/ChromeAndWebView64.ssargs"}
+GN_DEPFILE_LIMIT = 8 * 1024**2
+GN_REVISION = "0035961837fbcfe875d855744b3eda4fd2eefb43"
+
+
+@lru_cache(maxsize=1)
+def metric_reader():
+    # Isolated Python does not add the script directory to its import path.
+    path = Path(__file__).resolve().with_name("metrics_evidence.py")
+    spec = importlib.util.spec_from_file_location("r28_fixed_metric_schema", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.inspect_metrics
+
+
+def regeneration_inputs(data):
+    # Match the one make-style statement emitted by the fixed GN writer.
+    lines = data.decode("utf-8").replace("\\\n", "").strip().splitlines()
+    if len(lines) != 1 or not lines[0].startswith("build.ninja.stamp: "):
+        raise ValueError("Unexpected GN regeneration depfile target or multiple rules")
+    rhs = lines[0].split(":", 1)[1]
+    words = re.findall(r"(?:\\.|[^\\\s])+", rhs)
+    root = "/work/chromium/src/out/Bare"
+    return [posixpath.relpath(posixpath.normpath(posixpath.join(root,
+                re.sub(r"\\(.)", r"\1", w))),root) for w in words]
+
+
 class ArchiveEvidence:
     def __init__(self, root):
         self.root = root
         self.members = {}
         self.references = set()
+        self.metric_references = {}
         self.unreadable_graph = set()
         self.aliases = set()
+        self.metric_aliases = set()
         self.log = None
+        self.samples = {}
+        self.gn_depfile = None
         self.manifests = {}
         self.proof = None
+        self.query_cache = set()
+        self.native_queries = {}
 
     def read(self, name, entry, source, capture_proof):
         h = hashlib.sha256()
         is_graph = graph_input(name)
         stage = name.endswith(".ninja")
-        capture = (name == DIAGNOSTIC and entry.size <= MAX_LOG) or capture_proof
+        tiny = name in [DIAGNOSTIC, *METRICS] and entry.size <= MAX_LOG
+        capture = tiny or (name == "build.ninja.d" and entry.size <= GN_DEPFILE_LIMIT) or capture_proof
         captured = bytearray()
         overlap = b""
         with contextlib.ExitStack() as stack:
@@ -164,22 +205,105 @@ class ArchiveEvidence:
                 if capture:
                     captured.extend(block)
                 if is_graph:
-                    if TOKEN in overlap + block:
+                    chunk = overlap + block
+                    if TOKEN in chunk:
                         self.references.add(name)
-                    overlap = block[-(len(TOKEN)-1):]
+                    if b"siso_metrics" in chunk:
+                        for token in METRIC_TOKEN.findall(chunk):
+                            self.metric_references.setdefault(token.decode("ascii"), set()).add(name)
+                    overlap = chunk[-32:]
         identity = record(entry.mode, entry.size, h.hexdigest())
         if stage:
             self.manifests[name] = identity
         if name == DIAGNOSTIC and capture and not entry.mode & 0o111:
             self.log = bytes(captured)
+        if tiny:
+            self.samples[name] = (entry.mode, bytes(captured))
+        if name == "build.ninja.d" and capture:
+            self.gn_depfile = bytes(captured)
         if capture_proof:
             self.proof = json.loads(captured)
         return identity
 
+    def unknown(self, name):
+        if name in self.query_cache:
+            return
+        cmd = [os.environ.get("NINJA", "ninja"), "-C", str(self.root), "-t", "query"]
+        if "build.ninja" not in self.manifests:
+            raise ValueError("no root Ninja manifest")
+        try:
+            if "chrome_public_apk" not in self.query_cache:
+                apk = subprocess.run(cmd+["chrome_public_apk"], capture_output=True, timeout=150)
+                self.native_queries["chrome_public_apk"]=self.query_sample(apk)
+                if apk.returncode or not re.search(rb"(?m)^chrome_public_apk:$", apk.stdout):
+                    raise ValueError("Ninja query could not resolve the pinned APK target")
+                self.query_cache.add("chrome_public_apk")
+            q = subprocess.run(cmd+[name], capture_output=True, timeout=150)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ValueError("could not run native read-only Ninja query") from exc
+        self.native_queries[name]=self.query_sample(q)
+        expected = rb"ninja: error: unknown target '" + re.escape(name.encode("ascii")) + rb"'(?:, did you mean '[^\r\n]+'\?)?"
+        if q.returncode != 1 or not re.fullmatch(expected,q.stderr.strip()):
+            raise ValueError("File is declared in Ninja graph or query failed: " + name)
+        self.query_cache.add(name)
+
+    @staticmethod
+    def query_sample(q):
+        return {"returncode":q.returncode, "stdout":q.stdout[:768].decode("utf-8","replace"),
+                "stderr":q.stderr[:1536].decode("utf-8","replace")}
+
+    def generator_input(self, name):
+        if self.gn_depfile is None:
+            raise ValueError("GN regeneration depfile missing or too large")
+        graph = (self.root / "build.ninja").read_bytes()
+        rule = b"build build.ninja.stamp: gn\n  generator = 1\n  depfile = build.ninja.d\n"
+        phony = b"build build.ninja: phony build.ninja.stamp\n  generator = 1\n"
+        inputs = regeneration_inputs(self.gn_depfile)
+        if (inputs.count(name) != 1 or graph.count(rule) != 1 or graph.count(phony) != 1
+                or self.gn_depfile.count(name.encode("ascii")) != 1):
+            raise ValueError("Input is not the exact sole normalized RHS entry of the fixed GN regeneration rule: " + name)
+        return {"path":"build.ninja.d","target":"build.ninja.stamp","role":"regeneration-input",
+                "references":1,"generator":"gn","token":name,"gn_revision":GN_REVISION,
+                "sha256":hashlib.sha256(self.gn_depfile).hexdigest()}
+
+    def prove_metric(self, name):
+        if (name not in self.samples or self.metric_aliases or self.metric_references.get(name)
+                or self.unreadable_graph):
+            raise ValueError("Missing regular metrics bytes or declared metrics dependency: "+name)
+        self.unknown(name)
+        mode, data = self.samples[name]
+        result = metric_reader()(name,mode,len(data),io.BytesIO(data),regular=True)
+        return {**result, "graph_references":0, "diagnostic_query":"unknown target"}
+
+    def forensic(self):
+        # Included only in the restricted report on rejection; it never goes to stdout.
+        dep=self.gn_depfile or b""
+        manifest=self.root/"build.ninja"
+        head=""
+        if manifest.is_file():
+            with manifest.open("rb") as f:
+                head=f.read(3200).decode("utf-8","replace")
+        try:
+            version=self.query_sample(subprocess.run([os.environ.get("NINJA","ninja"),"--version"],
+                                                      capture_output=True,timeout=8))
+        except (OSError,subprocess.TimeoutExpired) as exc:
+            version={"unavailable":str(exc)}
+        return {"regular_samples":{name:{"mode":mode,"size":len(raw),"sha256":hashlib.sha256(raw).hexdigest(),
+                    "base64":base64.b64encode(raw).decode("ascii") if len(raw)<=4096 else None}
+                    for name,(mode,raw) in self.samples.items()},
+                "gn_depfile":{"sha256":hashlib.sha256(dep).hexdigest(),"size":len(dep),
+                    "lhs":dep.split(b":",1)[0][:100].decode("utf-8","replace"),
+                    "near_tokens":[dep[max(0,m.start()-72):m.end()+72].decode("utf-8","replace")
+                                   for m in list(re.finditer(rb"gn_logs\.txt|ChromeAndWebView(?:32|64)\.ssargs",dep))[:8]]},
+                "ninja_references": sorted(self.references),"metrics_references":{
+                    k:sorted(v)[:30] for k,v in self.metric_references.items()},
+                "root_manifest_header":head,"native_queries":self.native_queries,"native_version":version, "ninja_rules_sha256":self.manifests.get("build.ninja"),"links":sorted(self.aliases|self.metric_aliases)[:30]}
+
     def prove_diagnostic(self):
-        if self.log is None or self.aliases or self.references or self.unreadable_graph:
+        if self.log is None or self.aliases or (self.references - {"build.ninja.d"}) or self.unreadable_graph:
             raise ValueError("unable to demonstrate isolated regular GN diagnostic: "
                              + repr(sorted(self.aliases | self.references | self.unreadable_graph)[:8]))
+        matches = self.generator_input(DIAGNOSTIC) if "build.ninja.d" in self.references else None
         try:
             lines = self.log.decode("utf-8").splitlines()
         except UnicodeDecodeError as exc:
@@ -187,19 +311,7 @@ class ArchiveEvidence:
         if (not lines or lines[0] != GN_HEADER or "\x00" in self.log.decode()
                 or not any("get_concurrent_links.py" in line and line.startswith("#") for line in lines)):
             raise ValueError("GN log lacks fixed producer markers")
-        if "build.ninja" not in self.manifests:
-            raise ValueError("no root manifest to demonstrate GN diagnostic independence")
-        cmd = [os.environ.get("NINJA", "ninja"), "-C", str(self.root), "-t", "query"]
-        try:
-            apk = subprocess.run(cmd+["chrome_public_apk"], capture_output=True, timeout=150)
-            log = subprocess.run(cmd+[DIAGNOSTIC], capture_output=True, timeout=150)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ValueError("failed to parse complete Ninja graph with the read-only query tool") from exc
-        if (apk.returncode != 0 or not re.search(rb"(?m)^chrome_public_apk:$", apk.stdout)
-                or log.returncode != 1 or not re.fullmatch(
-                    rb"ninja: error: unknown target 'gn_logs\.txt'(?:, did you mean '[^\r\n]+'\?)?",
-                    log.stderr.strip())):
-            raise ValueError("Ninja graph did not confirm the APK target and unknown GN diagnostic")
+        self.unknown(DIAGNOSTIC)
         sections = {}
         section = "<header>"
         for line in lines:
@@ -209,7 +321,7 @@ class ArchiveEvidence:
         return {"chromium":CHROMIUM, "build_gn_sha256":GN_BUILD_SHA,
                 "target":"chrome_public_apk", "diagnostic_query":"unknown target",
                 "manifest_content":commitment(self.manifests), "graph_references":0, "aliases":0,
-                "sections":{k:{"lines":len(v),"sha256":hashlib.sha256(
+                "regeneration_dependency":matches, "sections":{k:{"lines":len(v),"sha256":hashlib.sha256(
                     json.dumps(v, ensure_ascii=True,separators=(",",":")).encode("ascii")).hexdigest()}
                     for k,v in sections.items()}}
 
@@ -239,6 +351,8 @@ def archived(path, codec, expected, evidence, *, load_original_proof=False):
             elif entry.issym() or entry.islnk():
                 if DIAGNOSTIC in PurePosixPath(entry.linkname).parts or name == DIAGNOSTIC:
                     evidence.aliases.add(name)
+                if name in METRICS or set(METRICS).intersection(PurePosixPath(entry.linkname).parts):
+                    evidence.metric_aliases.add(name)
                 if graph_input(name):
                     evidence.unreadable_graph.add(name)
                 if entry.issym():
@@ -295,7 +409,31 @@ def archives(parent_path, child_path, parent_sha, child_sha, *, report_path=None
             issues.append("Archive differs from complete producer quiescent content commitment")
         counts = dict.fromkeys(("unchanged", "added", "removed", "completed_replacement", "gn_diagnostic",
                                 "unclassified", "bookkeeping", "directory"), 0)
-        differences, diagnostics, replacements = [], [], []
+        differences, diagnostics, replacements, metrics = [], [], [], []
+        counts["siso_metrics"] = 0
+        metric_rotation = None
+        metric_change = any(parent.get(k) != child.get(k) for k in METRICS)
+        if metric_change:
+            try:
+                if (proof["format"] != "bare-28-apk-frontier-2" or not all(k in parent and k in child for k in METRICS)
+                        or not all(parent[a]==child[b] for a,b in zip(METRICS, METRICS[3:]))):
+                    raise ValueError("Required original byte-for-byte three-step Siso rotation is missing")
+                for k in METRICS:
+                    metrics.append({"path":k,"parent":parent[k],"child":child[k],
+                                    "evidence":{"parent":pe.prove_metric(k),"child":ce.prove_metric(k)}})
+                metric_rotation={"steps":3,"matched":8,"bounded_files":11}
+            except ValueError as exc:
+                metrics=[]
+                issues.append(str(exc))
+        descriptors={}
+        for name in DESCRIPTORS & (child.keys()-parent.keys()):
+            try:
+                if (not child[name].startswith("f:0:") or not 0<int(child[name].split(":")[2])<=4096
+                        or pe.generator_input(name)!=ce.generator_input(name)):
+                    raise ValueError("Invalid or changed GN descriptor dependency: "+name)
+                descriptors[name]=ce.generator_input(name)
+            except (ValueError, OSError) as exc:
+                issues.append(str(exc))
         for name in sorted(pe.members.keys() | ce.members.keys()):
             old, new = pe.members.get(name), ce.members.get(name)
             if meta(name):
@@ -322,6 +460,8 @@ def archives(parent_path, child_path, parent_sha, child_sha, *, report_path=None
                     category = "gn_diagnostic"
                 except ValueError as exc:
                     issues.append(str(exc))
+            elif name in METRICS and metric_rotation:
+                category = "siso_metrics"
             elif name in approved:
                 category = "completed_replacement"
                 replacements.append(name)
@@ -335,15 +475,20 @@ def archives(parent_path, child_path, parent_sha, child_sha, *, report_path=None
                     row["parent_resolved"] = parent.get(name)
                 if new and new.startswith("h:"):
                     row["child_resolved"] = child.get(name)
+                if name in descriptors:
+                    row["role"]="gn-generated-packaging-descriptor"
+                    row["regeneration_dependency"]=descriptors[name]
                 differences.append(row)
         if counts["unclassified"] or counts["removed"]:
             names = [x["path"] for x in differences if x["classification"] in {"unclassified","removed"}]
             issues.append("Unaccounted retained replacement or disappearance: " + repr(names[:8]))
-        report = {"schema":"bare-r28-archive-continuity-v3", "status":"rejected" if issues else "passed",
+        report = {"schema":"bare-r28-archive-continuity-v4", "status":"rejected" if issues else "passed",
                   "parent_sha":parent_sha, "child_sha":child_sha, "parent_content":commitment(parent),
                   "child_content":child_content, "matched_before":counts["unchanged"], "replaced":replacements,
                   "new_files":counts["added"], "counts":counts, "diagnostics":diagnostics,
-                  "differences":differences, "issues":issues}
+                  "differences":differences, "issues":issues,"metrics":metrics,"metric_rotation":metric_rotation}
+        if issues:
+            report["forensic"]={"parent":pe.forensic(),"child":ce.forensic()}
         if report_path is not None:
             with open(report_path, "w", encoding="utf-8") as stream:
                 json.dump(report,stream,sort_keys=True)
@@ -362,4 +507,4 @@ if __name__ == "__main__":
     p.add_argument("--report",type=Path)
     args=parser.parse_args()
     result = archives(args.parent,args.child,args.parent_sha,args.child_sha,report_path=args.report)
-    print(json.dumps({k:v for k,v in result.items() if k not in {"differences","diagnostics"}},sort_keys=True))
+    print(json.dumps({k:v for k,v in result.items() if k not in {"differences","diagnostics","metrics","forensic"}},sort_keys=True))
