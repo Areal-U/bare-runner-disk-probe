@@ -20,7 +20,7 @@ WORKFLOW = "bare-disk-probe.yml"
 # ceiling covers the observed 1.75 GB inventory plus the optional 3.5 GiB source
 # trial, and caps the test even if an earlier inventory grows unexpectedly.
 DIAGNOSTIC_TOTAL_CAP = 6 * 1024**3
-MODES = {"source-v8": 192 * budget.MIB, "source-chromium": 7 * 1024**3 // 2,
+MODES = {"source-android": 0, "source-v8": 192 * budget.MIB, "source-chromium": 7 * 1024**3 // 2,
          "split": 8 * budget.MIB, "receiver": 6 * budget.MIB}
 
 def get(path):
