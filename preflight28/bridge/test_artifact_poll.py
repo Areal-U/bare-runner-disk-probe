@@ -1,6 +1,9 @@
 import unittest
+import os
 from unittest.mock import Mock
+os.environ.setdefault("RUNNER_TEMP","/tmp")
 import artifact_poll as poll
+import bridge
 
 RUN=45526428252
 REPO="Areal-U/bare-runner-disk-probe"
@@ -25,7 +28,7 @@ class PublicKeyInventory(unittest.TestCase):
 
     def test_eventual_inventory_is_never_absence_or_duplicate_proof(self):
         for replay in ([page([ROW],0)],[page([],1)],[page([]),page([ROW])],
-                       [page([ROW]),page([ROW]),ValueError("Scoped API returned HTTP 404")],
+                       [page([ROW]),page([ROW]),bridge.ScopedHTTPError(404)],
                        [page([ROW]),page([ROW]),{**ROW,"size_in_bytes":20}]):
             with self.subTest(replay=replay), self.assertRaises(poll.UnstableInventory):
                 lookup(Mock(side_effect=replay))

@@ -1,5 +1,6 @@
 """Resolve one physical, unexpired Actions Artifact from a complete run inventory."""
 import re
+import bridge
 
 
 class UnstableInventory(ValueError):
@@ -68,8 +69,8 @@ def lookup(run, name, get, *, repo, head=None):
     row,=again.values()
     try:
         direct=get(f"{base}/actions/artifacts/{row['id']}")
-    except ValueError as exc:
-        if "HTTP 404" in str(exc):
+    except bridge.ScopedHTTPError as exc:
+        if exc.status == 404:
             raise UnstableInventory("Listed Artifact is not yet visible by ID") from None
         raise
     if identity(direct)!=identity(row):

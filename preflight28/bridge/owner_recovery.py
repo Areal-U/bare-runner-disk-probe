@@ -92,7 +92,7 @@ def locate(run, ordinal, head, parent, claim, expect_id=None):
             time.sleep(delay)
         try:
             row = artifact_poll.lookup(run, name, b.api_json, repo=b.REPO, head=head)
-        except artifact_poll.UnstableInventory:
+        except (artifact_poll.UnstableInventory, b.TransientReadError):
             continue
         if row is not None:
             break

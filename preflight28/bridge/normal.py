@@ -107,6 +107,19 @@ def keygen(role,check_run,job_start=None):
        "fingerprint":b.fingerprint(ROOT/"public.pem")},sort_keys=True))
 
 
+def ordinary_job(run, get):
+    check=json.loads((ROOT/"peer.json").read_text())["check_run"]
+    for page in range(1, 11):
+        jobs=get(f"/repos/{b.REPO}/actions/runs/{run}/attempts/1/jobs?per_page=100&page={page}")["jobs"]
+        mine=[job for job in jobs if str(job["check_run_url"]).endswith("/"+str(check))]
+        b.require(len(mine)<=1,"Ambiguous ordinary job identity")
+        if mine:
+            return mine[0]
+        if len(jobs)<100:
+            return None
+    raise ValueError("Unbounded run jobs query")
+
+
 def wait(kind):
     require_kind = {"key":"-key","descriptor":"-descriptor","outcome":"-outcome"}
     b.require(kind in require_kind,"Unrecognized peer artifact")
@@ -115,16 +128,22 @@ def wait(kind):
     start=time.monotonic()
     cutoff = sender_deadline(info()) if kind == "outcome" else None
     deadline=start+(cutoff-time.time() if cutoff is not None else 20*60)
+    get=b.api_before(deadline)
     observed_done=None
     stable_absence = False
     polls = 0
     next_log = start
     while time.monotonic()<deadline:
         try:
-            a = artifact_poll.lookup(run, tag, b.api_json, repo=b.REPO, head=os.environ["R28_HEAD_SHA"])
+            a = artifact_poll.lookup(run, tag, get, repo=b.REPO, head=os.environ["R28_HEAD_SHA"])
+            peer = ordinary_job(run, get) if a is None and kind=="outcome" else None
+            if time.monotonic()>=deadline:
+                stable_absence=False
+                break
             stable_absence = a is None
-        except artifact_poll.UnstableInventory:
+        except (artifact_poll.UnstableInventory, b.TransientReadError):
             a = None
+            peer = None
             stable_absence = False
             observed_done = None
         if a:
@@ -137,23 +156,15 @@ def wait(kind):
             b.output(id=a["id"])
             print(f"found {tag} artifact={a['id']} bytes={a['size_in_bytes']} expires_at={a['expires_at']}",flush=True)
             return
-        if kind=="outcome" and stable_absence:
-            check=json.loads((ROOT/"peer.json").read_text())["check_run"]
-            mine=[]
-            for page in range(1, 11):
-                jobs=b.api_json(f"/repos/{b.REPO}/actions/runs/{run}/attempts/1/jobs?per_page=100&page={page}")
-                mine.extend(j for j in jobs["jobs"] if str(j["check_run_url"]).endswith("/"+str(check)))
-                if len(jobs["jobs"])<100 or mine:
-                    break
-            else:
-                raise ValueError("Unbounded run jobs query")
-            b.require(len(mine)<=1,"Ambiguous ordinary job identity")
-            if len(mine)==1 and mine[0]["status"]=="completed":
-                observed_done=observed_done or time.monotonic()
-                if time.monotonic()-observed_done>=75 and mine[0]["conclusion"]=="success":
-                    b.output(outcome_absent="true")
-                    return
-                b.require(time.monotonic()-observed_done<75,"Ordinary job terminated without a durable outcome")
+        if peer and peer["status"]=="completed":
+            if observed_done is None:
+                observed_done=time.monotonic()
+            if time.monotonic()-observed_done>=75 and peer["conclusion"]=="success":
+                b.output(outcome_absent="true")
+                return
+            b.require(time.monotonic()-observed_done<75,"Ordinary job terminated without a durable outcome")
+        else:
+            observed_done=None
         pause = min(artifact_poll.backoff(polls), max(0,deadline-time.monotonic()))
         now = time.monotonic()
         if now >= next_log:

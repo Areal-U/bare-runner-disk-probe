@@ -1,6 +1,7 @@
 import os
+from http.client import IncompleteRead, RemoteDisconnected
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("RUNNER_TEMP","/tmp")
 import apk_artifact
@@ -19,7 +20,7 @@ class NormalArtifactTests(TestCase):
                 "size_in_bytes":140,"digest":"sha256:"+"1"*64,"expired":False,"expires_at":"2099-01-01T00:00:00Z"}
 
     def service(self,replies,physical):
-        def get(path):
+        def get(path, **_options):
             if path.endswith(f"/artifacts/{self.identifier}"):
                 return physical
             self.assertTrue(path.endswith(f"/runs/{self.run_id}/artifacts?per_page=100&page=1"))
@@ -82,4 +83,74 @@ class NormalArtifactTests(TestCase):
              patch.object(normal.b,"output") as output:
             with self.assertRaisesRegex(ValueError,"unavailable"):
                 normal.wait("outcome")
+            output.assert_not_called()
+
+    def test_scoped_http_classification_at_the_actual_reader(self):
+        b=normal.b
+        client=Mock()
+        response=client.getresponse.return_value
+        path=f"/repos/{b.REPO}/actions/artifacts/1"
+        with patch.dict(os.environ,GH_TOKEN="fixture"), patch.object(b.http.client,"HTTPSConnection",return_value=client):
+            for status,headers,error_type in ((429,{},b.TransientReadError),(503,{},b.TransientReadError),
+                    (403,{"X-RateLimit-Remaining":"0"},b.TransientReadError),
+                    (403,{"Retry-After":"10"},b.TransientReadError),(403,{},b.ScopedHTTPError),
+                    (404,{},b.ScopedHTTPError),(401,{},b.ScopedHTTPError),(501,{},b.ScopedHTTPError)):
+                response.status=status
+                response.getheader.side_effect=headers.get
+                with self.subTest(status=status,headers=headers), self.assertRaises(error_type):
+                    b.api_json(path)
+            response.status=403
+            response.getheader.side_effect={"X-RateLimit-Remaining":"0"}.get
+            with self.assertRaises(b.TransientReadError):
+                b.api_json(path,expected="denied")
+            for broken in (TimeoutError(),RemoteDisconnected(),IncompleteRead(b"")):
+                client.getresponse.side_effect=broken
+                with self.assertRaises(b.TransientReadError):
+                    b.api_json(path)
+
+    def test_wait_retries_service_failures_but_never_retries_permission_or_identity(self):
+        row=self.row(f"r28-{self.run_id}-a1-s01-key")
+        for error in (normal.b.TransientReadError("timeout"),normal.b.TransientReadError("503"),
+                      normal.b.ScopedHTTPError(403),ValueError("foreign identity")):
+            with patch.dict(os.environ,GITHUB_RUN_ID=str(self.run_id),R28_SLOT="1",R28_HEAD_SHA=self.head), \
+                 patch.object(normal.artifact_poll,"lookup",side_effect=[error,row]), \
+                 patch.object(normal.b,"output") as output, patch.object(normal.time,"sleep") as sleep:
+                if isinstance(error,normal.b.TransientReadError):
+                    normal.wait("key")
+                    output.assert_called_once_with(id=self.identifier)
+                    sleep.assert_called_once_with(8)
+                else:
+                    with self.assertRaises(type(error)):
+                        normal.wait("key")
+                    sleep.assert_not_called()
+                    output.assert_not_called()
+
+    def test_jobs_outage_resets_the_completed_peer_and_absence_proof(self):
+        clock=[0.]
+        peer={"status":"completed","conclusion":"success"}
+        replies=[peer,peer,peer,normal.b.TransientReadError("429"),peer,peer,peer]
+        with patch.dict(os.environ,GITHUB_RUN_ID=str(self.run_id),R28_SLOT="1",R28_HEAD_SHA=self.head), \
+             patch.object(normal,"info",return_value={}), patch.object(normal,"sender_deadline",return_value=300), \
+             patch.object(normal.time,"time",return_value=0), patch.object(normal.time,"monotonic",side_effect=lambda:clock[0]), \
+             patch.object(normal.time,"sleep",side_effect=lambda sec:clock.__setitem__(0,clock[0]+sec)), \
+             patch.object(normal.artifact_poll,"lookup",return_value=None), patch.object(normal,"ordinary_job",side_effect=replies), \
+             patch.object(normal.b,"output") as output:
+            normal.wait("outcome")
+            output.assert_called_once_with(outcome_absent="true")
+            self.assertEqual(clock[0],233.)
+
+    def test_transient_get_cannot_extend_the_deadline_or_prove_absence(self):
+        clock=[0.]
+        timeouts=[]
+        def get(_path, *, timeout):
+            timeouts.append(timeout)
+            raise normal.b.TransientReadError("503")
+        with patch.dict(os.environ,GITHUB_RUN_ID=str(self.run_id),R28_SLOT="1",R28_HEAD_SHA=self.head), \
+             patch.object(normal,"info",return_value={}), patch.object(normal,"sender_deadline",return_value=45), \
+             patch.object(normal.time,"time",return_value=0), patch.object(normal.time,"monotonic",side_effect=lambda:clock[0]), \
+             patch.object(normal.time,"sleep",side_effect=lambda sec:clock.__setitem__(0,clock[0]+sec)), \
+             patch.object(normal.b,"api_json",side_effect=get), patch.object(normal.b,"output") as output:
+            with self.assertRaisesRegex(ValueError,"before bounded deadline"):
+                normal.wait("outcome")
+            self.assertEqual((clock[0], timeouts),(45.,[30,30,22]))
             output.assert_not_called()

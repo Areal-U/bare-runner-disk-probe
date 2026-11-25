@@ -65,7 +65,7 @@ def settled(name, size, returned_id, returned_digest, *, api, sleep, clock, abse
             sleep(delay)
         try:
             row = locate(name, size, returned_id, returned_digest, api=api, now=clock())
-        except artifact_poll.UnstableInventory:
+        except (artifact_poll.UnstableInventory, n.b.TransientReadError):
             empty = 0
             continue
         if row is not None:

@@ -1,6 +1,5 @@
 """Verify the single encrypted terminal APK Artifact before recording its ID."""
 from datetime import datetime, timezone
-from http.client import HTTPException
 import os
 from pathlib import Path
 import re
@@ -22,12 +21,8 @@ def receipt(run, attempt, suffix, head, size, sdk_id, sdk_digest, *, get, sleep)
             sleep(delay)
         try:
             row=artifact_poll.lookup(run, name, get, repo=b.REPO, head=head)
-        except (artifact_poll.UnstableInventory, OSError, HTTPException):
+        except (artifact_poll.UnstableInventory, b.TransientReadError):
             continue
-        except ValueError as error:
-            if re.fullmatch(r"Scoped API returned HTTP (?:40[34]|429|5[0-9]{2})",str(error)):
-                continue
-            raise
         if row:
             b.require((not sdk_id or sdk_id==str(row["id"])) and
                       (not sdk_digest or row["digest"]=="sha256:"+sdk_digest) and

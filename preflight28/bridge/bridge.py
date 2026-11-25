@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -54,23 +56,53 @@ def output(**items):
             print(f"{key}={value}", file=f)
 
 
-def api_json(path, expected=200):
+class ScopedHTTPError(ValueError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f"Scoped API returned HTTP {status}")
+
+
+class TransientReadError(OSError):
+    """A scoped GET could not establish whether the requested object exists."""
+
+
+def api_json(path, expected=200, *, timeout=30):
     require(path.startswith("/repos/" + REPO + "/"), "Unscoped API access")
-    conn = http.client.HTTPSConnection("api.github.com", timeout=30)
+    conn = http.client.HTTPSConnection("api.github.com", timeout=timeout)
     try:
         conn.request("GET", path, headers={"User-Agent":"r28-split-reader/1", "Accept":"application/vnd.github+json",
                      "Authorization":"Bearer " + os.environ["GH_TOKEN"], "X-GitHub-Api-Version":"2022-11-28"})
         response = conn.getresponse()
+        limited = response.status == 403 and (
+            response.getheader("X-RateLimit-Remaining") == "0" or bool(response.getheader("Retry-After")))
+        if limited or response.status in (408, 429, 500, 502, 503, 504):
+            raise TransientReadError(f"Scoped API temporarily returned HTTP {response.status}")
         if expected == "denied":
             require(response.status in (403,404), f"Ordinary job unexpectedly accessed private source (HTTP {response.status})")
             print("ordinary_draft_get_status=" + str(response.status))
             return {}
-        require(response.status == expected, f"Scoped API returned HTTP {response.status}")
+        if response.status != expected:
+            raise ScopedHTTPError(response.status)
         raw = response.read(4*1024**2 + 1)
         require(len(raw) <= 4*1024**2, "Oversized page")
         return json.loads(raw)
+    except (TimeoutError, ConnectionError, http.client.IncompleteRead, ssl.SSLEOFError) as error:
+        raise TransientReadError("Scoped API connection interrupted") from error
+    except socket.gaierror as error:
+        if error.errno != socket.EAI_AGAIN:
+            raise
+        raise TransientReadError("Scoped API DNS temporarily unavailable") from error
     finally:
         conn.close()
+
+
+def api_before(deadline):
+    def get(path):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TransientReadError("Scoped GET deadline reached")
+        return api_json(path, timeout=min(30, remaining))
+    return get
 
 
 def auth_api():
