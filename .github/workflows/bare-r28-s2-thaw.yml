@@ -14,7 +14,7 @@ concurrency:
   group: r28-read-original-789542812
   cancel-in-progress: false
 env:
-  PRIOR_SHA: e051ee53bae0b2ce885b778bb1ccf5beea0f7249
+  PRIOR_SHA: 142bac7a97c8279c0bf4c3adeaa8ba36cfac6e2f
   TRIAL_SHA: ${{ github.event.pull_request.head.sha }}
   R28_CAMPAIGN: r28-preflight-s2-20261125-v3
   R28_RESUME_PUBLISHED: '45522666298'
@@ -29,7 +29,7 @@ jobs:
       == 9 && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.repository == 'Areal-U/bare-runner-disk-probe'
       && github.event.pull_request.base.repo.full_name == github.repository && github.event.pull_request.head.repo.full_name
       == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4'
-      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == 'e051ee53bae0b2ce885b778bb1ccf5beea0f7249'
+      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == '142bac7a97c8279c0bf4c3adeaa8ba36cfac6e2f'
       }}
     permissions:
       actions: read
@@ -96,7 +96,7 @@ jobs:
       == 9 && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.repository == 'Areal-U/bare-runner-disk-probe'
       && github.event.pull_request.base.repo.full_name == github.repository && github.event.pull_request.head.repo.full_name
       == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4'
-      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == 'e051ee53bae0b2ce885b778bb1ccf5beea0f7249'
+      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == '142bac7a97c8279c0bf4c3adeaa8ba36cfac6e2f'
       }}
     permissions:
       actions: read
