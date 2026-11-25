@@ -72,42 +72,26 @@ runs:
       compression-level: 0
       overwrite: false
       if-no-files-found: error
-  - name: Find exact ticket in this run's finite window
+  - name: Receive the REST ZIP for ticket in this run's finite window
     shell: bash
     run: python3 "$GITHUB_ACTION_PATH/trial.py" lookup "$MODE" ticket
     if: ${{ inputs.role == 'producer' }}
-    id: lookup_ticket
     env:
       MODE: ${{ inputs.mode }}
       GH_TOKEN: ${{ github.token }}
-  - name: Download bound ticket
-    if: ${{ inputs.role == 'producer' }}
-    uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
-    with:
-      artifact-ids: ${{ steps.lookup_ticket.outputs.id }}
-      merge-multiple: true
-      path: ${{ steps.begin.outputs.root }}/ticket
   - name: Restore and verify the identical public Bare input
     shell: bash
     run: python3 "$GITHUB_ACTION_PATH/trial.py" claim-ticket "$MODE"
     if: ${{ inputs.role == 'producer' }}
     env:
       MODE: ${{ inputs.mode }}
-  - name: Find exact key in this run's finite window
+  - name: Receive the REST ZIP for key in this run's finite window
     shell: bash
     run: python3 "$GITHUB_ACTION_PATH/trial.py" lookup "$MODE" key
     if: ${{ inputs.role == 'producer' }}
-    id: lookup_key
     env:
       MODE: ${{ inputs.mode }}
       GH_TOKEN: ${{ github.token }}
-  - name: Download bound key
-    if: ${{ inputs.role == 'producer' }}
-    uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
-    with:
-      artifact-ids: ${{ steps.lookup_key.outputs.id }}
-      merge-multiple: true
-      path: ${{ steps.begin.outputs.root }}/key
   - name: Seal using the production frame implementation
     shell: bash
     run: python3 "$GITHUB_ACTION_PATH/trial.py" seal "$MODE"
@@ -131,21 +115,13 @@ runs:
       compression-level: 0
       overwrite: false
       if-no-files-found: error
-  - name: Find exact envelope in this run's finite window
+  - name: Receive the REST ZIP for envelope in this run's finite window
     shell: bash
     run: python3 "$GITHUB_ACTION_PATH/trial.py" lookup "$MODE" envelope
     if: ${{ inputs.role == 'receiver' }}
-    id: lookup_envelope
     env:
       MODE: ${{ inputs.mode }}
       GH_TOKEN: ${{ github.token }}
-  - name: Download bound envelope
-    if: ${{ inputs.role == 'receiver' }}
-    uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
-    with:
-      artifact-ids: ${{ steps.lookup_envelope.outputs.id }}
-      merge-multiple: true
-      path: ${{ steps.begin.outputs.root }}/envelope
   - name: Independently reconstruct the input and verify receipt
     shell: bash
     run: python3 "$GITHUB_ACTION_PATH/trial.py" receive "$MODE"

@@ -14,6 +14,7 @@ import artifact_poll
 import bridge
 import frames
 import storage_admission
+import rest_zip
 
 SAMPLE = [".github/workflows/bare-arm64-probe.yml", "preflight28/bridge"]
 MAX_SAMPLE = 1024**2
@@ -137,11 +138,13 @@ def receive(mode):
     write(directory("receipt") / "receipt.json", receipt)
 
 
-def lookup(mode, kind, wait=WAIT_SECONDS, lookup_artifact=artifact_poll.lookup):
+def lookup(mode, kind, wait=WAIT_SECONDS, lookup_artifact=artifact_poll.lookup,
+           read_zip=rest_zip.read_zip, expected_id=None, pause=4.0):
     b = binding(mode)
     tag = art(mode, kind)
     deadline = time.monotonic() + wait
     get = bridge.api_before(deadline)
+    expected = None
     while time.monotonic() < deadline:
         try:
             row = lookup_artifact(b["run"], tag, get, repo=bridge.REPO, head=b["head"])
@@ -152,9 +155,22 @@ def lookup(mode, kind, wait=WAIT_SECONDS, lookup_artifact=artifact_poll.lookup):
             valid_until = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
             bridge.require(0 < row["size_in_bytes"] <= ceiling and valid_until > datetime.now(timezone.utc),
                            "Peer artifact exceeds size/deadline")
-            bridge.output(id=row["id"])
-            return
-        time.sleep(max(0, min(4, deadline - time.monotonic())))
+            key = artifact_poll.identity(row)
+            bridge.require((expected_id is None or row["id"] == expected_id) and
+                           (expected is None or expected == key), "Artifact identity changed after discovery")
+            expected = key
+            try:
+                data = read_zip(row, deadline)
+            except bridge.TransientReadError:
+                pass
+            else:
+                bridge.require(time.monotonic() <= deadline and valid_until > datetime.now(timezone.utc),
+                               "Artifact download expired before receipt")
+                dest = ROOT / (mode if kind == "receipt" else kind)
+                rest_zip.unpack(data, dest, MEMBERS[kind], ceiling)
+                print(f"Received Artifact ID={row['id']} bytes={len(data)} {row['digest']}", flush=True)
+                return
+        time.sleep(max(0, min(pause, deadline - time.monotonic())))
     raise TimeoutError(f"No verified {tag} within {wait}s; no calculation retry")
 
 
@@ -245,7 +261,8 @@ def main():
         admit(a.mode, a.kind)
     elif a.operation == "lookup":
         bridge.require(a.kind is not None, "Artifact kind is required")
-        lookup(a.mode, a.kind)
+        expected_id = bridge.env_int("RECEIPT_ID") if a.kind == "receipt" else None
+        lookup(a.mode, a.kind, expected_id=expected_id)
     elif a.operation == "pause":
         time.sleep(STAGE_SECONDS)
     elif a.operation == "collect":
