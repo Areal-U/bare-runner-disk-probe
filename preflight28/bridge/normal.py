@@ -1,5 +1,6 @@
 """Per-slot checkpoint transport for the bounded Bare Personal Actions chain."""
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import http.client
 import io
@@ -9,6 +10,7 @@ from pathlib import Path
 import re
 import time
 from urllib.parse import quote, urlsplit
+import artifact_poll
 import bridge as b
 import frames
 import owner_recovery
@@ -114,21 +116,28 @@ def wait(kind):
     cutoff = sender_deadline(info()) if kind == "outcome" else None
     deadline=start+(cutoff-time.time() if cutoff is not None else 20*60)
     observed_done=None
+    stable_absence = False
+    polls = 0
+    next_log = start
     while time.monotonic()<deadline:
-        q=b.api_json(f"/repos/{b.REPO}/actions/runs/{run}/artifacts?name={quote(tag)}&per_page=100")
-        found=[a for a in q["artifacts"] if a["name"]==tag]
-        b.require(len(found)<=1,"Duplicate peer artifact")
-        if found:
-            a,=found
+        try:
+            a = artifact_poll.lookup(run, tag, b.api_json, repo=b.REPO, head=os.environ["R28_HEAD_SHA"])
+            stable_absence = a is None
+        except artifact_poll.UnstableInventory:
+            a = None
+            stable_absence = False
+            observed_done = None
+        if a:
             if cutoff is not None:
                 time_left(cutoff, 0, "outcome download")
             bound=b.CAP+32*1024**2 if kind=="outcome" else 256*1024
-            b.require(a["workflow_run"]["id"]==run and not a["expired"] and 0<a["size_in_bytes"]<=bound,
+            b.require(a["workflow_run"]["id"]==run and not a["expired"] and 0<a["size_in_bytes"]<=bound
+                      and datetime.fromisoformat(a["expires_at"].replace("Z","+00:00"))>datetime.now(timezone.utc),
                       "Mismatched or expired peer artifact")
             b.output(id=a["id"])
             print(f"found {tag} artifact={a['id']} bytes={a['size_in_bytes']} expires_at={a['expires_at']}",flush=True)
             return
-        if kind=="outcome":
+        if kind=="outcome" and stable_absence:
             check=json.loads((ROOT/"peer.json").read_text())["check_run"]
             mine=[]
             for page in range(1, 11):
@@ -145,8 +154,15 @@ def wait(kind):
                     b.output(outcome_absent="true")
                     return
                 b.require(time.monotonic()-observed_done<75,"Ordinary job terminated without a durable outcome")
-        time.sleep(max(0,min(deadline-time.monotonic(),8 if kind!="outcome" else 30)))
-    if kind=="outcome":
+        pause = min(artifact_poll.backoff(polls), max(0,deadline-time.monotonic()))
+        now = time.monotonic()
+        if now >= next_log:
+            print(f"waiting for {tag} inventory={'absent' if stable_absence else 'unsettled'}"
+                  f" next_poll_seconds={int(pause)} remaining_seconds={max(0,int(deadline-now))}", flush=True)
+            next_log = now + 300
+        polls += 1
+        time.sleep(pause)
+    if kind=="outcome" and stable_absence:
         # Only an explicit, matching ordinary stop is accepted by the caller.
         # Absence here never creates a readable checkpoint or triggers another slot.
         b.output(outcome_absent="true")

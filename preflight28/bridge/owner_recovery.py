@@ -12,12 +12,14 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import zipfile
 
 if __name__ == "__main__":
     # Offline owner recovery also runs on machines without the Actions environment.
     os.environ.setdefault("RUNNER_TEMP",tempfile.gettempdir())
 
+import artifact_poll
 import bridge as b
 import frames
 from verify_payload import check as verify_payload
@@ -85,10 +87,18 @@ def service_record(row, run, ordinal, head, parent, claim, *, expect_id=None):
 
 def locate(run, ordinal, head, parent, claim, expect_id=None):
     name=expected_name(run,ordinal)
-    response=b.api_json(f"/repos/{b.REPO}/actions/runs/{run}/artifacts?name={name}&per_page=100")
-    rows=[r for r in response["artifacts"] if r["name"]==name]
-    b.require(len(rows)==1 and response["total_count"]==len(response["artifacts"]), "Missing or duplicate outcome Artifact")
-    rec=service_record(rows[0],run,ordinal,head,parent,claim,expect_id=expect_id)
+    for delay in (0, 2, 5, 10, 20):
+        if delay:
+            time.sleep(delay)
+        try:
+            row = artifact_poll.lookup(run, name, b.api_json, repo=b.REPO, head=head)
+        except artifact_poll.UnstableInventory:
+            continue
+        if row is not None:
+            break
+    else:
+        raise ValueError("Missing or unsettled owner-recovery outcome Artifact")
+    rec=service_record(row,run,ordinal,head,parent,claim,expect_id=expect_id)
     # This line is printable; it contains no wrapped key, signed URL or unencrypted metadata payload.
     print("R28_OWNER_CHECKPOINT_ARTIFACT "+data(rec).decode("ascii"),flush=True)
     return rec

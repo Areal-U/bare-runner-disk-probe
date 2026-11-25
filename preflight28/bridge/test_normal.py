@@ -189,12 +189,12 @@ class TestTransport(unittest.TestCase):
                 artifact={"id":321,"name":"r28-1234-a1-s02-outcome","digest":"sha256:"+"7"*64,
                           "size_in_bytes":2048,"expired":False,"expires_at":"2099-12-01T00:00:00Z",
                           "workflow_run":{"id":1234,"head_sha":c["producer_sha"]}}
-                with patch.object(b,"api_json",return_value={"artifacts":[artifact],"total_count":1}):
+                with patch.object(b,"api_json",side_effect=lambda path: artifact if path.endswith("/artifacts/321") else {"artifacts":[artifact],"total_count":1}):
                     n.recover()
                     self.assertIn("recovery_status=owner_outcome_artifact_available",(work/"outputs").read_text())
                     self.assertIn("owner_outcome_artifact_id=321",(work/"outputs").read_text())
                     artifact["workflow_run"]["head_sha"]="8"*40
-                    with self.assertRaisesRegex(ValueError,"Unconfirmed immutable"):n.recover()
+                    with self.assertRaisesRegex(ValueError,"Foreign run or revision"):n.recover()
 
 
 if __name__=="__main__":unittest.main()

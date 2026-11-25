@@ -22,7 +22,9 @@ class OutcomeTests(unittest.TestCase):
                 patch.dict(os.environ, RUNNER_TEMP=work.name,GITHUB_JOB="compile-probe",
                            GITHUB_REPOSITORY=n.b.REPO,GITHUB_RUN_ID="497",GITHUB_RUN_ATTEMPT="1",R28_SLOT="1",
                            R28_HEAD_SHA="8"*40,R28_PARENT_SHA=n.PARENT["sha"],R28_PARENT_IDENTITY=n.PARENT["identity"]),
-                patch.object(n,"ROOT",self.root),patch.object(n.b,"inventory",return_value=[])):
+                patch.object(n,"ROOT",self.root),patch.object(n.b,"inventory",return_value=[]),
+                patch.object(n.b,"api_json",return_value={"total_count":0,"artifacts":[]}),
+                patch.object(relay.time,"sleep")):
             change.start()
             self.addCleanup(change.stop)
         self.now=int(time.time())
@@ -39,18 +41,30 @@ class OutcomeTests(unittest.TestCase):
         self.calls=[]
 
     def resolve(self, rows, sdk="transfer-unknown", attempt=1, rid="", sha="", clock=None):
+        replies=[]
+        for batch in rows:
+            if isinstance(batch, Exception) or isinstance(batch, dict):
+                replies.append(batch)
+            else:
+                replies.extend([dict(total_count=len(batch),artifacts=batch)]*2)
+        previous=[]
         def api(url):
             self.calls.append(url)
-            batch=rows.pop(0)
-            if isinstance(batch,Exception):raise batch
-            return dict(total_count=len(batch),artifacts=batch)
+            if url.endswith("/actions/artifacts/73"):
+                return next(row for row in previous if row["id"]==73)
+            answer=replies.pop(0)
+            if isinstance(answer,Exception):
+                raise answer
+            previous[:] = answer["artifacts"]
+            return answer
         return relay.resolve(attempt,sdk,rid,sha,api=api,sleep=lambda seconds:None,clock=clock or time.time)
 
     def test_lost_ack_then_observed_exact_original_no_retry(self):
         self.assertEqual(relay.plan()["decision"],"upload")
         result=self.resolve([[],[self.asset]])
         self.assertEqual((result["decision"],result["id"]),("present","73"))
-        self.assertEqual(len(self.calls),2)
+        self.assertEqual(len(self.calls),5)
+        self.assertTrue(self.calls[-1].endswith("/actions/artifacts/73"))
         self.assertEqual(self.resolve([[self.asset]],"uploaded",rid="73",sha="a"*64)["decision"],"present")
 
     def test_absence_permits_one_retry_of_same_bytes_and_final_stop(self):
@@ -58,15 +72,24 @@ class OutcomeTests(unittest.TestCase):
         self.assertEqual(self.resolve([[],[],[]])["decision"],"retry")
         self.assertEqual(self.resolve([[],[],[]],attempt=2)["decision"],"relay-missing")
         self.assertEqual(len(set(self.calls)),1)
-        self.assertIn("r28-497-a1-s01-outcome",self.calls[0])
+        self.assertIn("/actions/runs/497/artifacts?per_page=100&page=1",self.calls[0])
         self.assertEqual(self.resolve([[self.asset]],"uploaded",2,"73","a"*64)["decision"],"present")
         enc=self.root/"checkpoint.cms"
         enc.write_bytes(b"x"*enc.stat().st_size)
         self.assertEqual(self.resolve([[],[],[]])["decision"],"relay-ambiguous")
 
+    def test_propagating_rows_reset_absence_without_second_write(self):
+        relay.plan()
+        partial={"total_count":1,"artifacts":[]}
+        self.assertEqual(self.resolve([partial,[self.asset]])["id"],"73")
+        self.assertEqual(self.resolve([[],[],partial,[],[]])["decision"],"relay-ambiguous")
+        self.assertEqual(self.resolve([partial]*5)["decision"],"relay-ambiguous")
+        with patch.object(n.b,"api_json",return_value=partial):
+            self.assertEqual(relay.plan()["decision"],"relay-ambiguous")
+
     def test_unreadable_ambiguous_changed_receipt_and_quota_do_not_retry(self):
         relay.plan()
-        for rows,sdk,aid in (([[self.asset,self.asset]],"transfer-unknown",""),
+        for rows,sdk,aid in (([[self.asset,dict(self.asset,id=74)]],"transfer-unknown",""),
                  ([[dict(self.asset,expired=True)]],"transfer-unknown",""),([ValueError("service unavailable")],"transfer-unknown",""),
                  ([[self.asset]],"uploaded","44"),([[],[],[]],"uploaded","73")):
             self.assertEqual(self.resolve(rows,sdk,rid=aid)["decision"],"relay-ambiguous")
@@ -88,7 +111,7 @@ class OutcomeTests(unittest.TestCase):
 
     def test_preexisting_exact_outcome_is_reconciled_before_any_write(self):
         with patch.object(n.b,"inventory",return_value=[self.asset]):
-            with patch.object(n.b,"api_json",return_value=dict(total_count=1,artifacts=[self.asset])):
+            with patch.object(n.b,"api_json",side_effect=lambda p: self.asset if p.endswith("/artifacts/73") else dict(total_count=1,artifacts=[self.asset])):
                 self.assertEqual(relay.plan()["id"],"73")
             with patch.object(n.b,"api_json",return_value=dict(total_count=0,artifacts=[])):
                 self.assertEqual(relay.plan()["decision"],"relay-ambiguous")

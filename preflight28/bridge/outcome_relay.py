@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import re
 import time
-from urllib.parse import quote
+import artifact_poll
 
 import normal as n
 
@@ -44,12 +44,9 @@ def deadline():
 
 def locate(name, raw_size, returned_id, returned_digest, *, api, now):
     run=n.b.env_int("GITHUB_RUN_ID")
-    page=api(f"/repos/{n.b.REPO}/actions/runs/{run}/artifacts?name={quote(name)}&per_page=100")
-    rows=page["artifacts"]
-    n.b.require(len(rows)==page["total_count"] <= 1, "Conflicting or incomplete immutable Artifact listing")
-    if not rows:
+    a = artifact_poll.lookup(run, name, api, repo=n.b.REPO, head=os.environ["R28_HEAD_SHA"])
+    if a is None:
         return None
-    a=rows[0]
     digest=a.get("digest") or ""
     n.b.require(a["name"]==name and type(a["id"]) is int and a["id"]>0 and
                 a["workflow_run"]["id"]==run and a["workflow_run"]["head_sha"]==os.environ["R28_HEAD_SHA"] and
@@ -60,6 +57,25 @@ def locate(name, raw_size, returned_id, returned_digest, *, api, now):
     return a
 
 
+def settled(name, size, returned_id, returned_digest, *, api, sleep, clock, absence_samples=3):
+    # Stable absence matters after an upload with a lost acknowledgement.
+    empty = 0
+    for delay in (0, 4, 8, 12, 12):
+        if delay:
+            sleep(delay)
+        try:
+            row = locate(name, size, returned_id, returned_digest, api=api, now=clock())
+        except artifact_poll.UnstableInventory:
+            empty = 0
+            continue
+        if row is not None:
+            return row
+        empty += 1
+        if empty == absence_samples:
+            return None
+    raise artifact_poll.UnstableInventory("Timed out waiting for a settled outcome inventory")
+
+
 def resolve(round_no, sdk, returned_id, returned_digest, *, api, sleep, clock):
     try:
         record, size=payload()
@@ -68,11 +84,9 @@ def resolve(round_no, sdk, returned_id, returned_digest, *, api, sleep, clock):
                 returned_digest and not n.b.sha(returned_digest)):
             return {"decision":"relay-ambiguous"}
         cutoff=deadline()
-        for delay in (0,4,12):
-            if delay: sleep(delay)
-            a=locate(name,size,returned_id,returned_digest,api=api,now=clock())
-            if a:
-                return {"decision":"present","id":str(a["id"]),"digest":a["digest"],"expires_at":a["expires_at"]}
+        a = settled(name,size,returned_id,returned_digest,api=api,sleep=sleep,clock=clock)
+        if a:
+            return {"decision":"present","id":str(a["id"]),"digest":a["digest"],"expires_at":a["expires_at"]}
         if sdk not in SDK or returned_id or returned_digest or sdk=="uploaded":
             return {"decision":"relay-ambiguous"}
         if sdk=="quota-denied":
@@ -102,11 +116,16 @@ def plan():
         # capacity() is the existing normal-path simultaneity/inode/time gate.
         if record["status"]=="candidate":
             n.capacity()
+        # Even a zero-byte-status relay needs a checked first admission. A repo-wide
+        # capacity listing cannot establish canonical absence for this run and name.
+        existing = settled(n.stem()+"-outcome",size,"","",api=n.b.api_json,sleep=time.sleep,clock=time.time,absence_samples=1)
+        if existing is not None:
+            return {"decision":"present","id":str(existing["id"]),"digest":existing["digest"],"expires_at":existing["expires_at"]}
         if not can_upload(record,deadline(),time.time()):
             return {"decision":"relay-deadline"}
     except n.RelayPriorExists:
         try:
-            original = locate(n.stem()+'-outcome',size,'','',api=n.b.api_json,now=time.time())
+            original = settled(n.stem()+'-outcome',size,'','',api=n.b.api_json,sleep=time.sleep,clock=time.time)
             if original:
                 return {'decision':'present','id':str(original['id']),'digest':original['digest'],
                         'expires_at':original['expires_at']}

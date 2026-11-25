@@ -68,12 +68,12 @@ class SenderClockTests(unittest.TestCase):
         with patch.object(normal.time,"time",return_value=cutoff-(normal.UPLOAD_MINUTES+normal.VISIBILITY_MINUTES)*60+1):
             with self.assertRaisesRegex(ValueError,"time budget"):
                 normal.time_left(cutoff, (normal.UPLOAD_MINUTES+normal.VISIBILITY_MINUTES)*60, "upload")
-        env={"GITHUB_RUN_ID":"5","R28_SLOT":"1","GITHUB_RUN_ATTEMPT":"1"}
+        env={"GITHUB_RUN_ID":"5","R28_SLOT":"1","GITHUB_RUN_ATTEMPT":"1","R28_HEAD_SHA":"8"*40}
         with patch.dict(os.environ,env),patch.object(normal,"info",return_value=clock), \
              patch.object(normal.time,"time",side_effect=[cutoff-1,cutoff-1,cutoff+1]), \
-             patch.object(normal.b,"api_json",return_value={"artifacts":[{
+             patch.object(normal.artifact_poll,"lookup",return_value={
                  "id":20, "name":"r28-5-a1-s01-outcome", "workflow_run":{"id":5},
-                 "expired":False,"expires_at":"not-used","size_in_bytes":100}]}):
+                 "expired":False,"expires_at":"not-used","size_in_bytes":100}):
             with self.assertRaisesRegex(ValueError,"before outcome download"):
                 normal.wait("outcome")
         with patch.dict(os.environ,env),patch.object(normal,"info",return_value=clock), \
