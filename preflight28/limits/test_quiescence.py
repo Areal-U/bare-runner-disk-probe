@@ -4,6 +4,8 @@ import io
 import json
 import os
 from pathlib import Path
+import runpy
+import shutil
 import sys
 import tempfile
 import threading
@@ -117,6 +119,71 @@ class QuiescenceTests(unittest.TestCase):
             self.assertTrue(stopped_during_scan[0])
             self.assertFalse(report["ready_for_restore_test"])
 
+    def test_staged_production_entry_counts_scan_finished_after_child_exit(self):
+        # Stage the files side by side as the ordinary workflow does in /exchange.
+        # Only disk availability and scan completion timing are simulated.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "out/Bare"
+            output.mkdir(parents=True)
+            exchange = root / "exchange"
+            exchange.mkdir()
+            script = Path(shutil.copy(ROOT / "build_trial.py", exchange))
+            guard_path = Path(shutil.copy(ROOT / "preflight28/limits/guard.py", exchange))
+            staged = importlib.util.spec_from_file_location("staged_trial", script)
+            controller = importlib.util.module_from_spec(staged)
+            staged.loader.exec_module(controller)
+
+            compiler = root / "autoninja"
+            compiler.write_text(
+                f"#!{sys.executable}\n"
+                "import os, time\nfrom pathlib import Path\n"
+                "Path('compiler-pid').write_text(str(os.getpid()))\n"
+                "while not Path('scan-started').exists(): time.sleep(.01)\n"
+                "raise SystemExit(1)\n"
+            )
+            compiler.chmod(0o755)
+            actual_loader = runpy.run_path
+            completed = []
+
+            def load_guard(path):
+                self.assertEqual(Path(path), guard_path)
+                loaded = actual_loader(path)
+                scan = loaded["tree"]
+                def scan_after_exit(target):
+                    (root / "scan-started").touch()
+                    deadline = time.monotonic() + 8
+                    pid = root / "compiler-pid"
+                    while not pid.is_file() or Path("/proc", pid.read_text(), "stat").exists():
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("test child was not reaped")
+                        time.sleep(.01)
+                    observed = scan(target)
+                    completed.append(observed)
+                    return observed
+                loaded["tree"] = scan_after_exit
+                loaded["disk"] = lambda _: dict(device=1, free_bytes=50*guard.GIB, free_inodes=1_000_000)
+                return loaded
+
+            report = root / "report.json"
+            argv = [str(script), "--production", "--phase", "restore", "--jobs", "2",
+                    "--seconds", "15", "--result", str(report), "--log", str(root / "trial.log")]
+            environment = {"PATH": str(root) + os.pathsep + os.environ["PATH"], "COMPILE_STOP_EPOCH": ""}
+            with patch.object(controller, "SOURCE_ROOT", root), patch.object(Path, "cwd", return_value=root), \
+                 patch("runpy.run_path", side_effect=load_guard), patch.dict(os.environ, environment), \
+                 patch.object(controller.shutil, "disk_usage", return_value=SimpleNamespace(free=50*guard.GIB)), \
+                 patch.object(sys, "argv", argv), patch("builtins.print"):
+                self.assertEqual(controller.main(), 0)
+            saved = json.loads(report.read_text())
+            self.assertEqual(saved["reason"], "compile-error")
+            self.assertFalse(saved["artifact_ready"])
+            self.assertEqual(len(completed), 1)
+            costs = saved["measurements"]["scan_cost"]
+            self.assertEqual(costs["initial"]["count"], 1)
+            self.assertEqual(costs["30"]["count"], 1)
+            self.assertEqual(costs["30"]["wall_seconds"], completed[0]["scan_seconds"])
+            self.assertEqual(costs["30"]["cpu_seconds"], completed[0]["scan_cpu_seconds"])
+
     def test_only_a_recorded_unfinished_terminal_edge_needs_the_long_retry_window(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -126,16 +193,65 @@ class QuiescenceTests(unittest.TestCase):
             prior.write_text(json.dumps(report))
             self.assertEqual(trial.interrupted_terminal_retry(root, 8), [])
             progress = {}
-            trial.update_siso_status(progress, b"[1/20] 2s S ACTION build/dex/final\n[1/20] 2s S LINK libchrome.so\n")
+            final_dex = "ACTION //chrome/android:chrome_public_apk__final_dex"
+            trial.update_siso_status(progress, f"[1/20] 2s S {final_dex}\n[1/20] 2s S LINK libchrome.so\n".encode())
             trial.update_siso_status(progress, b"[2/20] 3s F LINK libchrome.so\n")
-            self.assertEqual(progress["terminal_actions"], {"ACTION build/dex/final"})
+            self.assertEqual(progress["terminal_actions"], {final_dex})
             report["interrupted_terminal_actions"] = sorted(progress["terminal_actions"])
             prior.write_text(json.dumps(report))
-            self.assertEqual(trial.interrupted_terminal_retry(root, 1799), ["ACTION build/dex/final"])
+            self.assertEqual(trial.interrupted_terminal_retry(root, 1799), [final_dex])
             self.assertEqual(trial.interrupted_terminal_retry(root, 1800), [])
             report["reason"] = "completed"
             prior.write_text(json.dumps(report))
             self.assertEqual(trial.interrupted_terminal_retry(root, 8), [])
+
+    def test_chrome_final_dex_outlives_native_link(self):
+        # Siso event payloads from completed job 133038781141 (old ARM64 APK).
+        link = b"SOLINK ./libchrome.so"
+        final_dex = b"ACTION //chrome/android:chrome_public_apk__final_dex(//build/toolchain/android:android_clang_arm64)"
+        progress = {}
+        android = b"(//build/toolchain/android:android_clang_arm64)"
+        for other in (b"ACTION //chrome/browser/resources/family_link_user_internals:lint_css" + android,
+                      b"ACTION //content/public/android:content_main_dex_jni_java__dex" + android,
+                      b"ACTION //chrome/android:chrome_public_apk__final_dex__build_config" + android,
+                      b"CXX obj/third_party/libunwindstack/libunwindstack/compact_dex_file.o",
+                      b"LINK clang_x64/proto_extras_plugin", b"SOLINK ./libchrome_inputs.so"):
+            trial.update_siso_status(progress, b"[2/54] 10s S " + other + b"\n")
+        self.assertFalse(progress.get("terminal_actions"))
+        trial.update_siso_status(progress, b"[7/1035] 20.15s S " + link + b"\n")
+        self.assertEqual(progress["terminal_actions"], {link.decode()})
+        trial.update_siso_status(progress, b"[15/30] 45.04s S " + final_dex[:31])
+        trial.update_siso_status(progress, final_dex[31:] + b"\n")
+        self.assertEqual(progress["terminal_actions"], {link.decode(), final_dex.decode()})
+        trial.update_siso_status(progress, b"[16/29] 23m00.16s F " + link + b"\n")
+        self.assertEqual(progress["terminal_actions"], {final_dex.decode()})
+        with tempfile.TemporaryDirectory() as tmp:
+            prior = Path(tmp) / "checkpoint-trial-restore.json"
+            prior.write_text(json.dumps({"format": trial.FORMAT, "target": trial.TARGET,
+                                         "reason": "time-limit",
+                                         "interrupted_terminal_actions": sorted(progress["terminal_actions"])}))
+            self.assertEqual(trial.interrupted_terminal_retry(prior.parent, 1799), [final_dex.decode()])
+            self.assertEqual(trial.interrupted_terminal_retry(prior.parent, 1800), [])
+        trial.update_siso_status(progress, b"[17/29] 26m50.35s F " + final_dex + b"\n")
+        self.assertFalse(progress["terminal_actions"])
+
+    def test_legacy_time_limit_report_filters_only_known_nonterminal_actions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prior = Path(tmp) / "checkpoint-trial-restore.json"
+            report = {"format": trial.FORMAT, "target": trial.TARGET, "reason": "time-limit"}
+            ordinary = [
+                "CXX obj/third_party/libunwindstack/libunwindstack/compact_dex_file.o",
+                "ACTION //chrome/browser/resources/family_link_user_internals:lint_css(//build/toolchain/android:android_clang_arm64)",
+                "ACTION //content/public/android:content_main_dex_jni_java__dex(//build/toolchain/android:android_clang_arm64)",
+                "LINK clang_x64/proto_extras_plugin", "SOLINK ./libchrome_inputs.so",
+            ]
+            for actions, expected in ((ordinary, []), (ordinary + ["SOLINK ./libchrome.so"], ["SOLINK ./libchrome.so"]),
+                                      (ordinary + ["unclassified legacy action"], ["unclassified legacy action"])):
+                with self.subTest(expected=expected):
+                    report["interrupted_terminal_actions"] = actions
+                    prior.write_text(json.dumps(report))
+                    self.assertEqual(trial.interrupted_terminal_retry(prior.parent, 1799), expected)
+                    self.assertEqual(trial.interrupted_terminal_retry(prior.parent, 1800), [])
 
     def test_sparse_growth_and_inode_predictions(self):
         fs = {"free_bytes":80*guard.GIB, "free_inodes":2_000_000}
