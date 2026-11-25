@@ -71,3 +71,32 @@ make_plan "$2" -y --no-install-recommends git
         self.assertIn('bash /tmp/bare-bootstrap-pool.sh -y --no-install-recommends git',result)
         with self.assertRaises(ValueError):
             android_sync.use_signed_pool(original.replace('-y --no-install-recommends','-y'))
+
+    def test_host_mode_reports_separately(self):
+        import os
+        import unittest.mock as mock
+        import io
+        import contextlib
+        # Use a fresh temporary root and the actual after() checks; no Android binaries are run.
+        with TemporaryDirectory() as name:
+            root=Path(name)
+            src=root/'chromium/src'
+            sdk=src/'third_party/android_sdk/public/build-tools/37.0.0/aapt2'
+            sdk.parent.mkdir(parents=True); sdk.touch();sdk.chmod(0o755)
+            ndk=src/'third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/api-level.h'
+            ndk.parent.mkdir(parents=True);ndk.touch()
+            dep={'src':'public','src/v8':'v8',**{f'src/dep{i}':'git' for i in range(120)}}
+            (src.parent/'.gclient_entries').write_text('entries = '+repr(dep))
+            ref=json.loads((Path(__file__).parent/'android-source-receipt.json').read_text())
+            def git(src,*args):
+                return ref['spec']['revision'] if src.name=='src' and args[-1]=='HEAD' else ref['tree'] if args[-1]=='HEAD^{tree}' else 'a'*40
+            original=Path.read_text
+            def contents(path,*args,**kwargs):
+                return 'VERSION_ID="24.04"' if path==Path('/etc/os-release') else original(path,*args,**kwargs)
+            buf=io.StringIO()
+            with mock.patch.dict(os.environ,{'BARE_HOST_SOURCE_ROOT':name}),mock.patch.object(Path,'read_text',contents), \
+                 mock.patch.object(os,'getuid',return_value=1000),mock.patch.object(android_sync,'git',git), \
+                 mock.patch.object(android_sync,'stat_disk',return_value={'free':85_000_000_000,'inodes':12_000_000}),contextlib.redirect_stdout(buf):
+                for phase in ('boot','pre','before','after'): android_sync.stage(phase)
+            self.assertIn('BARE_ANDROID_HOST_SOURCE_RESULT ',buf.getvalue())
+            self.assertNotIn('BARE_ANDROID_SOURCE_RESULT ',buf.getvalue())

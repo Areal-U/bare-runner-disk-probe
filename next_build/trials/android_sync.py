@@ -127,12 +127,17 @@ def pack_info(root):
 
 def stage(which):
     # All files here belong to the ephemeral builder UID. The normal owner/campaign state is never read.
-    root=Path('/work'); record=root/'source-diagnostic.json'; state=json.loads(record.read_text()) if record.exists() else {}
+    host_root=os.environ.get('BARE_HOST_SOURCE_ROOT')
+    root=Path(host_root) if host_root else Path('/work')
+    record=root/'source-diagnostic.json'; state=json.loads(record.read_text()) if record.exists() else {}
     src=root/'chromium/src'; rcpt=json.loads((Path(__file__).parent/'android-source-receipt.json').read_text())
     state[which] = {'time':time.time(), 'monotonic':time.monotonic(), **stat_disk(root)}
     if which in ('before','after'):
         state[which].update(head=git(src,'rev-parse','HEAD'), tree=git(src,'rev-parse','HEAD^{tree}'), packs=pack_info(src))
         require(state[which]['head'] == rcpt['spec']['revision'] and state[which]['tree'] == rcpt['tree'], 'Source commit or tree mismatch')
+    if host_root:
+        require(os.getuid()==1000 and 'VERSION_ID="24.04"' in Path('/etc/os-release').read_text(), 'Wrong host diagnostic identity')
+        state[which].update(uid=os.getuid(), runtime='Ubuntu 24.04 hosted runner', git=subprocess.check_output(['git','--version'],text=True).strip())
     if which == 'boot':
         require(state[which]['free'] >= 70_000_000_000 and state[which]['inodes'] >= 4_000_000, 'Builder /work too small for the measured source-only stage')
     if which=='after':
@@ -151,12 +156,13 @@ def stage(which):
                      seed_s=round(state['before']['monotonic']-state['pre']['monotonic'],3),
                      full_seeded_fetch_s=round(state['after']['monotonic']-state['boot']['monotonic'],3),
                      sync_only_s=round(state['after']['monotonic']-state['before']['monotonic'],3))
-        print('BARE_ANDROID_SOURCE_RESULT '+json.dumps(state,sort_keys=True),flush=True)
+        marker='BARE_ANDROID_HOST_SOURCE_RESULT' if host_root else 'BARE_ANDROID_SOURCE_RESULT'
+        print(marker+' '+json.dumps(state,sort_keys=True),flush=True)
     record.write_text(json.dumps(state,indent=2)+'\n')
 
 
-def watch(args):
-    root=Path(os.environ['ANDROID_TRIAL']); low=stat_disk(root); start=time.monotonic()
+def watch(args, *, host=False):
+    root=Path(os.environ['BARE_HOST_TRIAL'] if host else os.environ['ANDROID_TRIAL']); low=stat_disk(root); start=time.monotonic()
     proc=subprocess.Popen(args,start_new_session=True)
     try:
         while proc.poll() is None:
@@ -167,18 +173,22 @@ def watch(args):
         require(proc.returncode==0,'Normal Linux/Android source check failed')
     finally:
         if proc.poll() is None:
-            os.killpg(proc.pid,signal.SIGTERM)
-            # The hosted VM is disposable. Stop the container as well as its exec client.
-            subprocess.run(['docker','compose','stop','-t','3','chromium-builder'], check=False, timeout=25)
-        print('BARE_ANDROID_SOURCE_FLOOR '+json.dumps(low),flush=True)
+            if host:
+                subprocess.run(['sudo','-n','kill','-TERM','--','-'+str(proc.pid)],check=False,timeout=5)
+            else:
+                os.killpg(proc.pid,signal.SIGTERM)
+                subprocess.run(['docker','compose','stop','-t','3','chromium-builder'], check=False, timeout=25)
+        marker='BARE_ANDROID_HOST_SOURCE_FLOOR' if host else 'BARE_ANDROID_SOURCE_FLOOR'
+        print(marker+' '+json.dumps(low),flush=True)
 
 
 if __name__=='__main__':
     import argparse
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('op',choices=('setup','pool-dockerfile','watch','boot','pre','before','after'));p.add_argument('args',nargs=argparse.REMAINDER);ns=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('op',choices=('setup','pool-dockerfile','watch','host-watch','boot','pre','before','after'));p.add_argument('args',nargs=argparse.REMAINDER);ns=p.parse_args()
     if ns.op=='setup': setup()
     elif ns.op=='pool-dockerfile':
         dockerfile=Path('docker/Dockerfile')
         dockerfile.write_text(use_signed_pool(dockerfile.read_text()))
     elif ns.op=='watch': watch(ns.args)
+    elif ns.op=='host-watch': watch(ns.args,host=True)
     else: stage(ns.op)
