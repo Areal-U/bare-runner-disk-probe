@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "preflight28/bridge"))
 import storage_admission as budget
+import connector_gate
 
 BRANCH = "bare-next-build-prep-20261125"
 WORKFLOW = "bare-disk-probe.yml"
@@ -26,7 +27,10 @@ def get(path):
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "bare-next-trials"}
     if os.environ.get("GH_TOKEN"):
         headers["Authorization"] = "Bearer " + os.environ["GH_TOKEN"]
-    with urlopen(Request("https://api.github.com" + path, headers=headers), timeout=30) as response:
+    checking_runs = "/actions/runs?status=" in path
+    if checking_runs:
+        headers["Cache-Control"] = "no-cache, max-age=0"
+    with urlopen(Request("https://api.github.com" + path, headers=headers), timeout=6 if checking_runs else 30) as response:
         return json.load(response)
 
 def check(api, mode, head, run, snapshot_ceiling=None, snapshot_until=None, *, runner=None, now=None):
@@ -36,7 +40,7 @@ def check(api, mode, head, run, snapshot_ceiling=None, snapshot_until=None, *, r
     repository = api(budget.BASE)
     budget.public_host(repository, runner if run else "github-hosted")
     # Check before creating the dispatch itself; even an idle test job can block the build.
-    budget.check_active_runs(api, {"GITHUB_RUN_ID": str(run)})
+    budget.diagnostic_active_runs(api, {"GITHUB_RUN_ID": str(run)})
     workflow = api(f"{budget.BASE}/actions/workflows/{WORKFLOW}")
     ref = api(f"{budget.BASE}/git/ref/heads/{BRANCH}")
     if workflow["state"] != "active" or workflow["path"] != ".github/workflows/" + WORKFLOW or ref["object"]["sha"] != head:
@@ -67,11 +71,13 @@ def check(api, mode, head, run, snapshot_ceiling=None, snapshot_until=None, *, r
         ceiling = min(ceiling, budget.integer(int(os.environ["R28_RELAY_BYTE_CEILING"]), "existing repository ceiling"))
     if occupied + worst > ceiling:
         raise ValueError("Visible artifacts plus bounded test exceed today's ceiling")
-    return {"ceiling": str(ceiling), "until": str(until)}
+    return {"ceiling": str(min(ceiling,occupied + worst)), "until": str(until)}
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=MODES)
+    parser.add_argument("--connector-capture", type=Path,
+                        help="Fresh authenticated pre-dispatch-only JSON captured by the Bare operator")
     parser.add_argument("--recovery-clear", action="store_true",
                         help="Bare operator has checked that the prior independent recovery has no pending GitHub work")
     group = parser.add_mutually_exclusive_group()
@@ -80,6 +86,8 @@ def main():
     args = parser.parse_args()
     env = os.environ
     if args.inside_run:
+        if args.connector_capture:
+            raise ValueError("A running diagnostic must use the live service, never an offline capture")
         head = env["GITHUB_SHA"]
         if (env.get("GITHUB_EVENT_NAME") != "workflow_dispatch" or env.get("GITHUB_RUN_ATTEMPT") != "1"
             or env.get("GITHUB_REPOSITORY") != budget.REPO or env.get("GITHUB_REF_NAME") != BRANCH
@@ -95,7 +103,14 @@ def main():
                 print(f"{k}={v}", file=out)
         return
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    bounds = check(get, args.mode, head, 0)
+    if args.connector_capture:
+        if args.connector_capture.stat().st_size > 12*1024**2:
+            raise ValueError("Unexpected pre-dispatch capture size")
+        capture = json.loads(args.connector_capture.read_text())
+        bounds = connector_gate.initial(capture, args.mode, head, branch=BRANCH, workflow=WORKFLOW,
+                                        cost=MODES[args.mode] + budget.CONTROL_RESERVE, total_cap=DIAGNOSTIC_TOTAL_CAP)
+    else:
+        bounds = check(get, args.mode, head, 0)
     inputs = {"trial":args.mode, "expected_sha":head, "recovery_clear":str(args.recovery_clear).lower(),
               "storage_ceiling":bounds["ceiling"], "storage_until":bounds["until"]}
     payload = {"ref":BRANCH,"inputs":inputs}

@@ -144,6 +144,66 @@ def outcome(records, run, head, scope):
     return dict(disposition='reconcile-original-transfer-or-confirm-loss', stop=status)
 
 
+def graph_stop(jobs, artifacts, records, run, head, scope, captured):
+    """A failed classifier with no pack/terminal path is a diagnosed stop, not loss admission."""
+    journal = production.journal
+    n = scope.ordinal + len(records)
+    if n >= scope.last or n > 12:
+        return None
+    compiler = journal.original_job(jobs,run,head,n,f'Compile or verify authenticated APK slot {n}')
+    attestor = journal.original_job(jobs,run,head,n,journal.RESULT_JOB)
+    if not compiler or not attestor or compiler['conclusion'] != 'failure' or attestor['conclusion'] != 'failure':
+        return None
+    checks = {
+        'Verify the received APK frontier and establish the segment baseline':'success',
+        'Run the real APK target within its time and output budgets':'success',
+        'Stop every build writer before making the archive':'success',
+        'Classify progress on the fixed APK graph after all writers stop':'failure',
+        'Pack the completed intermediate outputs':'skipped',
+        'Certify an advanced checkpoint exists before transfer':'skipped',
+        'Save a new bounded generation without replacing the producer':'skipped',
+        'Persist the original sealed APK receipt':'skipped',
+        'Upload the encrypted APK bundle':'skipped',
+        'Save only the encrypted APK for retrieval retry':'skipped',
+        'Emit terminal peer outcome for this exact slot':'success',
+    }
+    def matches(job,name,want):
+        seen = [step for step in job['steps'] if step['name'] == name]
+        return len(seen) == 1 and seen[0]['conclusion'] == want
+    if not all(matches(compiler,name,want) for name,want in checks.items()):
+        return None
+    if not matches(attestor,journal.SLOT_STEP,'skipped'):
+        return None
+    base = f'r28-{run}-a1-s{n:02}'
+    if any(journal.one_artifact(artifacts,base + suffix) is not None for suffix in ('-receipt','-apk-seal')):
+        return None
+    decision = dict(disposition='correct-failed-frontier-before-new-campaign', slot=n, build_dispatch=False,
+                    successor=None, compiler_job_id=compiler['id'], journal_job_id=attestor['id'],
+                    exact_stop_reason='fixed APK graph classifier failed before packing; no accepted successor')
+    # Original step records establish that no candidate was packed. A live stop envelope
+    # can additionally identify the exact failed slot. Expiry never authorizes recalculation.
+    row = journal.one_artifact(artifacts, base + '-outcome')
+    if row is None:
+        return dict(decision, stop_artifact='no-longer-listed')
+    upload_steps = {'Deposit outcome in this run','Retry the same sealed files at the same immutable name once'}
+    created = journal.timestamp(row['created_at'])
+    put = [s['name'] for s in compiler['steps'] if s['name'] in upload_steps and s['conclusion']=='success'
+           and journal.timestamp(s['started_at']) <= created < journal.timestamp(s['completed_at']) + 1]
+    require(len(put)==1,'Stop artifact is not bound to one successful upload')
+    journal.checked_artifact(row,run,head,compiler,put[0],lambda aid:captured.metadata(f'actions/artifacts/{aid}'))
+    require(0 < row['size_in_bytes'] <= journal.MAX_ZIP,'Unexpected stop-only Artifact size')
+    if row['expired']:
+        return dict(decision,stop_artifact='expired-job-evidence-only',outcome_artifact_id=row['id'])
+    raw = captured.note(row['id'])
+    actual=journal.decode(raw,row,'outcome.json')
+    parent=(scope.sha,scope.identity) if not records else (records[-1]['sha'],records[-1]['identity'])
+    expected = dict(schema='bare-r28-checkpoint-private-v1',status='failed',ordinal=n,attempt=1,run=run,
+                    key=f'bare-coexist-204-{run}-1-checkpoint-production-s{n}',producer_sha=head,
+                    parent_sha=parent[0],parent_identity=parent[1])
+    require(actual==expected,'Stop envelope identity or status conflicts with original job and parent')
+    return dict(decision,stop_artifact='verified-stop-only',outcome_artifact_id=row['id'],stop_zip_digest=row['digest'])
+
+
 def campaign(locator, captured):
     if 'ticket_asset_id' not in locator:
         locator = captured.resolve_original_ticket(locator)
@@ -174,7 +234,9 @@ def campaign(locator, captured):
         possible |= any(r['name'].startswith(f'bare-personal-204-encrypted-{run}-1-s') for r in arts)
         if possible:
             decision = dict(disposition='collect-and-verify-owner-delivery')
-    return dict(basis, **decision)
+        elif diagnosed := graph_stop(jobs, arts, records, run, head, scope, captured):
+            decision = diagnosed
+    return {**basis, **decision}
 
 
 def delivered(locator, directory, aapt2, apksigner):

@@ -38,6 +38,7 @@ python3 next_build/inputs.py campaign "$private_locator" "$existing_owner_captur
 | `existing-operation-active` | 元の登録に任せる。新たな計算を起動しない。 |
 | `collect-and-verify-owner-delivery` | 既存の collect → clear → owner。暗号文があれば転送・回収の復旧を優先。 |
 | `reconcile-original-transfer-or-confirm-loss` | 原VMの最終状態、実Artifact／Draft・本人台帳を照合。存在不明では計算しない。両方の喪失を既存の `loss_resume.py` が認証した場合だけ既存の一回復旧。 |
+| `correct-failed-frontier-before-new-campaign` | 元コンパイルと静止は成功し、APKグラフの分類で停止、梱包・APK保管・正式受領の各書込はスキップ。実outcome ZIPが残るときは `artifacts/<id>.zip` と `actions/artifacts/<id>` の実GETをcaptureに含める。親SHA・ID・初回ジョブ時間・stop本体を照合する。既に期限切れなら同一ジョブの工程証拠から是正に進める。未受領の子は採用しない。復旧dispatchや同版の自動再計算を許可しない。 |
 | `correct-stop-before-any-new-build` | 無進展・サイズ上限は原因と対象工程を是正してから判断する。 |
 | `prepare-new-campaign-from-independently-verified-parent` | 12区間の後の検証専用区間（例外復旧は同じく検証済み末尾）の受領を確認した場合。出力の実run・元SHA・親key/sha/identity・manifest ID/SHAを新規案件の候補に固定。前のS2へ戻さない。新登録前にも同じ親を独立に読み直す。 |
 | 照合失敗・記録失効・変化 | 本人保存済み暗号文、署名結果、既存台帳・回収入口を照合。欠落、再実行、未照合の新着を根拠に新しいS2ビルドへ進めない。 |

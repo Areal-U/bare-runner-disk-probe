@@ -37,7 +37,7 @@ class AdmissionTests(unittest.TestCase):
             if "?status=in_progress" in path:
                 return dict(total_count=1, workflow_runs=[{"id":45549494619}])
             return api(path)
-        with self.assertRaisesRegex(ValueError,"Another"):
+        with patch("time.sleep"), self.assertRaisesRegex(ValueError,"Another"):
             trials.check(active,"source-v8",HEAD,0,now=NOW)
 
     def test_lower_limits_fail_including_missing_expired_inputs(self):
