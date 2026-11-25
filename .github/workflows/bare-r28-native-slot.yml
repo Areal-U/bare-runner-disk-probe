@@ -76,6 +76,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       latest_start: ${{ steps.lease.outputs.latest_start }}
+      owner_claim_id: ${{ steps.lease.outputs.claim_asset_id }}
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       with:
@@ -101,6 +102,7 @@ jobs:
     uses: ./.github/workflows/bare-arm64-probe.yml
     with:
       collector_latest_start: ${{ needs.collection-lease.outputs.latest_start }}
+      owner_claim_id: ${{ needs.collection-lease.outputs.owner_claim_id }}
       backend: ${{ inputs.backend }}
       parent_manifest_id: ${{ inputs.parent_manifest_id }}
       parent_manifest_sha: ${{ inputs.parent_manifest_sha }}
@@ -282,7 +284,16 @@ jobs:
         checked(o.get("producer_sha") == os.environ["GITHUB_SHA"] and o.get("checkpoint_ordinal") == str(ordinal), "Unbound producer/segment")
         if ordinal > 1:
             checked(o.get("parent_frontier_verified") == "true", "Unverified previous frontier")
-        if status in {"apk-size-exceeded","cipher-size-exceeded"}:
+        relay = o.get("relay_stop","")
+        if relay:
+            checked(relay in {"relay-quota-denied","relay-capacity-exceeded","relay-deadline","relay-missing","relay-ambiguous"}
+                    and os.environ['BACKEND'] == 'draft' and a['result'] == 'success' and
+                    (o.get('relay_no_receipt') == 'true' or o.get('private_readback_verified') == 'true'),
+                    "Unconfirmed transfer stop")
+        if relay and o.get('private_readback_verified') != 'true' and o.get('frontier_status') == 'candidate' and not status in {'sealed','apk-size-exceeded','cipher-size-exceeded'} and os.environ['VERIFY_ONLY'] != 'true':
+            checked(read['result'] == apk['result'] == 'skipped', "A missing checkpoint cannot authorize another slot")
+            result["status"] = relay
+        elif status in {"apk-size-exceeded","cipher-size-exceeded"}:
             checked(a["result"] == "success" and read["result"] == apk["result"] == "skipped",
                     "Size stop conflicts with unsuccessful or publishing jobs")
             result["status"] = status

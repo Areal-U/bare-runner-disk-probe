@@ -59,10 +59,17 @@ name: Bare Personal ARM64 checkpoint build
       parent_manifest_sha:
         type: string
         default: ''
+      owner_claim_id:
+        type: string
+        default: ''
       collector_latest_start:
         type: string
         default: ''
     outputs:
+      relay_stop:
+        value: ${{ jobs.compile-probe.outputs.relay_stop }}
+      relay_no_receipt:
+        value: ${{ jobs.draft-publisher.outputs.relay_no_receipt }}
       frontier_status:
         value: ${{ jobs.compile-probe.outputs.frontier_status }}
       parent_frontier_verified:
@@ -127,6 +134,7 @@ jobs:
       group: bare-coexist-204-compile
       cancel-in-progress: false
     outputs:
+      relay_stop: ${{ steps.relay_final.outputs.stop }}
       frontier_status: ${{ steps.frontier_finish.outputs.status }}
       parent_frontier_verified: ${{ steps.frontier.outputs.verified }}
       checkpoint_key: ${{ steps.identity.outputs.key }}
@@ -183,6 +191,8 @@ jobs:
       R28_PARENT_MANIFEST: ${{ inputs.parent_manifest_id }}
       R28_PARENT_MANIFEST_SHA: ${{ inputs.parent_manifest_sha }}
       R28_HEAD_SHA: ${{ github.sha }}
+      R28_OWNER_RECIPIENT: ${{ inputs.apk_recipient }}
+      R28_COLLECTION_CLAIM: ${{ inputs.owner_claim_id }}
       SEGMENT_ORDINAL: ${{ inputs.segment_ordinal }}
     defaults:
       run:
@@ -344,6 +354,20 @@ jobs:
     - name: Reserve the relay peak before acquiring a large peer artifact
       run: bash preflight28/bridge/host_space.sh
       if: ${{ inputs.backend == 'draft' }}
+    - name: Stage the pinned standard uploader before compiling
+      if: ${{ inputs.backend == 'draft' }}
+      timeout-minutes: 4
+      run: |
+        set -euo pipefail
+        tool="$RUNNER_TEMP/r28-uploader"
+        pin=cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        mkdir -m 700 "$tool"
+        git -C "$tool" init --quiet
+        git -C "$tool" sparse-checkout set --no-cone '/dist/upload/' '/package.json'
+        GIT_TERMINAL_PROMPT=0 git -C "$tool" -c credential.helper= -c http.extraHeader= fetch --no-tags --depth=1 https://github.com/actions/upload-artifact.git "$pin"
+        git -C "$tool" checkout --quiet --detach FETCH_HEAD
+        [[ $(git -C "$tool" rev-parse HEAD) == "$pin" ]]
+        [[ $(git hash-object "$tool/dist/upload/index.js") == 7b3f92ae681d6eeca5f5e5e4cf892ad0dfb254ea ]]
     - name: Bind peer artifacts to this run and logical slot
       id: peer_names
       run: python3 preflight28/bridge/normal.py names
@@ -995,21 +1019,22 @@ jobs:
         object=out/Bare/obj/base/third_party/cityhash/cityhash/city.o
         python3 /exchange/checkpoint.py verify-object "$object" out/Bare/checkpoint-object.json
         python3 /exchange/checkpoint.py verify-evidence out/Bare/checkpoint-evidence.json
-        # A recovery attempt cannot compile even if a legacy marker is dirty.
-        restored_ninja() {
-          if [[ $VERIFY_FRONTIER_ONLY == true ]]; then
-            autoninja -n "$@"
-          else
-            autoninja "$@"
-          fi
+        # Planning a restored marker must leave the compiler and restored Siso state untouched.
+        check_restored_targets() {
+          python3 - "$@" <<'CHECK_PARENT'
+        from pathlib import Path
+        import sys
+        sys.path.insert(0, "/exchange")
+        from graph import run
+        if run(Path("out/Bare").resolve(), ["autoninja"], sys.argv[1:], dry=True):
+            raise SystemExit("Restored target requires compilation")
+        CHECK_PARENT
         }
-        restored_ninja -C out/Bare -j 2 -v base/third_party/cityhash:cityhash | tee /exchange/checkpoint/cityhash-noop.log
-        grep -F 'ninja: no work to do.' /exchange/checkpoint/cityhash-noop.log
+        check_restored_targets base/third_party/cityhash:cityhash | tee /exchange/checkpoint/cityhash-noop.log
         python3 /exchange/checkpoint.py evidence-targets out/Bare/checkpoint-evidence.json > /exchange/checkpoint/evidence-targets.txt
         mapfile -t targets < /exchange/checkpoint/evidence-targets.txt
         (( ${#targets[@]} > 0 ))
-        restored_ninja -C out/Bare -j 2 -v "${targets[@]}" | tee /exchange/checkpoint/apk-objects-noop.log
-        grep -F 'ninja: no work to do.' /exchange/checkpoint/apk-objects-noop.log
+        check_restored_targets "${targets[@]}" | tee /exchange/checkpoint/apk-objects-noop.log
         python3 /exchange/checkpoint.py verify-object "$object" out/Bare/checkpoint-object.json
         python3 /exchange/checkpoint.py verify-evidence out/Bare/checkpoint-evidence.json
         if [[ $PROBE_MODE == checkpoint-production ]]; then
@@ -1018,14 +1043,10 @@ jobs:
           python3 /exchange/checkpoint.py verify-reuse-markers "$record" > /exchange/checkpoint/production-before.json
           mapfile -t targets < /exchange/checkpoint/production-targets.txt
           (( ${#targets[@]} == 3 ))
-          restored_ninja -C out/Bare -j 2 -v "${targets[@]}" 2>&1 | tee /exchange/checkpoint/production-noop.log
-          tr '\r' '\n' < /exchange/checkpoint/production-noop.log > /exchange/checkpoint/production-noop.txt
-          grep -Fx 'ninja: no work to do.' /exchange/checkpoint/production-noop.txt
-          summary=$(grep -F 'Build Succeeded:' /exchange/checkpoint/production-noop.txt | tail -n 1)
-          [[ $summary == *'Build Succeeded: 0 steps -'* ]]
+          check_restored_targets "${targets[@]}" | tee /exchange/checkpoint/production-noop.log
           python3 /exchange/checkpoint.py verify-reuse-markers "$record" > /exchange/checkpoint/production-after.json
           cmp /exchange/checkpoint/production-before.json /exchange/checkpoint/production-after.json
-          printf 'Verified production reuse: %s\n' "$summary"
+          echo 'Verified zero planned steps for all three production reuse markers.'
         elif [[ $PROBE_MODE == checkpoint-scale || $PROBE_MODE == checkpoint-large ]]; then
           for pass in before after; do
             python3 - "$pass" <<'PYTHON'
@@ -1118,6 +1139,7 @@ jobs:
       env:
         APK_JOBS: ${{ inputs.apk_jobs }}
         COLLECTOR_LATEST_START: ${{ inputs.collector_latest_start }}
+        SENDER_OUTCOME_DEADLINE: ${{ steps.peer_acquire.outputs.sender_outcome_deadline }}
       run: |
         cd "$RUNNER_TEMP/bare-official"
         # The clock starts before preparation and restore, not at compiler startup.
@@ -1150,6 +1172,12 @@ jobs:
           # independent readback run in the restricted job with its own bounded clock.
           [[ $CHECKPOINT_BACKEND != draft ]] || reserve=85
           deadline_epoch=$(( $(cat "$RUNNER_TEMP/bare-probe-start") + (350 - reserve) * 60 ))
+          if [[ $CHECKPOINT_BACKEND == draft ]]; then
+            [[ $SENDER_OUTCOME_DEADLINE =~ ^[1-9][0-9]{8,10}$ ]]
+            sender_stop=$((10#$SENDER_OUTCOME_DEADLINE - reserve * 60))
+            (( deadline_epoch <= sender_stop )) || deadline_epoch=$sender_stop
+            printf 'Sender outcome cutoff epoch=%s; effective compile stop epoch=%s\n' "$SENDER_OUTCOME_DEADLINE" "$deadline_epoch"
+          fi
           compile_seconds=$(( deadline_epoch - $(date +%s) ))
           (( compile_seconds > 0 ))
           requested_seconds=$((COMPILE_MINUTES * 60))
@@ -1968,16 +1996,17 @@ jobs:
         python3 preflight28/bridge/normal.py stop --reason "$reason"
     - name: Measure retained relay bytes before uploading the sealed checkpoint
       id: peer_capacity
-      if: ${{ !cancelled() && inputs.backend == 'draft' && steps.pack-checkpoint.outputs.checkpoint_advanced == 'true' }}
+      if: ${{ always() && !cancelled() && inputs.backend == 'draft' && (steps.peer_stop.outcome == 'success' || steps.pack-checkpoint.outputs.checkpoint_advanced == 'true') }}
       timeout-minutes: 3
       env:
         GH_TOKEN: ${{ github.token }}
         R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
-      run: python3 preflight28/bridge/normal.py capacity
+      run: python3 preflight28/bridge/outcome_relay.py plan
     - name: Deposit outcome in this run
       id: peer_put_outcome
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-      timeout-minutes: 18
+      uses: ./preflight28/bridge/normal_upload
+      continue-on-error: true
+      timeout-minutes: ${{ fromJSON(steps.peer_capacity.outputs.upload_minutes || '18') }}
       with:
         name: ${{ steps.peer_names.outputs.outcome_name }}
         path: ${{ steps.pack-checkpoint.outputs.checkpoint_advanced == 'true' && format('{0}/r28-normal/outcome.json{1}{0}/r28-normal/checkpoint.cms', runner.temp, fromJSON('"\n"'))
@@ -1986,8 +2015,60 @@ jobs:
         overwrite: false
         retention-days: 1
         compression-level: 0
-      if: ${{ always() && !cancelled() && inputs.backend == 'draft' && (steps.peer_stop.outcome == 'success' || steps.peer_capacity.outcome == 'success')
-        }}
+      if: ${{ !cancelled() && steps.peer_capacity.outputs.decision == 'upload' }}
+    - name: Reconcile sealed outcome upload number 1
+      id: resolve_relay_1
+      if: ${{ !cancelled() && (steps.peer_put_outcome.outcome == 'success' || steps.peer_put_outcome.outcome == 'failure') }}
+      timeout-minutes: 3
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SDK_STATUS: ${{ steps.peer_put_outcome.outputs.upload-status }}
+        RETURNED_ID: ${{ steps.peer_put_outcome.outputs.artifact-id }}
+        RETURNED_DIGEST: ${{ steps.peer_put_outcome.outputs.artifact-digest }}
+      run: python3 preflight28/bridge/outcome_relay.py resolve --round 1
+    - name: Retry the same sealed files at the same immutable name once
+      id: retry_relay
+      uses: ./preflight28/bridge/normal_upload
+      continue-on-error: true
+      timeout-minutes: ${{ fromJSON(steps.peer_capacity.outputs.upload_minutes || '18') }}
+      with:
+        name: ${{ steps.peer_names.outputs.outcome_name }}
+        path: ${{ steps.pack-checkpoint.outputs.checkpoint_advanced == 'true' && format('{0}/r28-normal/outcome.json{1}{0}/r28-normal/checkpoint.cms', runner.temp, fromJSON('"\n"'))
+          || format('{0}/r28-normal/outcome.json', runner.temp) }}
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 1
+        compression-level: 0
+      if: ${{ !cancelled() && steps.resolve_relay_1.outputs.decision == 'retry' }}
+    - name: Reconcile sealed outcome upload number 2
+      id: resolve_relay_2
+      if: ${{ !cancelled() && (steps.retry_relay.outcome == 'success' || steps.retry_relay.outcome == 'failure') }}
+      timeout-minutes: 3
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SDK_STATUS: ${{ steps.retry_relay.outputs.upload-status }}
+        RETURNED_ID: ${{ steps.retry_relay.outputs.artifact-id }}
+        RETURNED_DIGEST: ${{ steps.retry_relay.outputs.artifact-digest }}
+      run: python3 preflight28/bridge/outcome_relay.py resolve --round 2
+    - name: Record the final transfer decision for this slot
+      id: relay_final
+      if: ${{ always() && !cancelled() && inputs.backend == 'draft' && steps.peer_capacity.outcome == 'success' }}
+      env:
+        RELAY_STATE: ${{ steps.resolve_relay_2.outputs.decision || steps.resolve_relay_1.outputs.decision || steps.peer_capacity.outputs.decision }}
+        RELAY_ID: ${{ steps.resolve_relay_2.outputs.id || steps.resolve_relay_1.outputs.id || steps.peer_capacity.outputs.id }}
+      run: python3 preflight28/bridge/outcome_relay.py finish
+    - name: Record immutable owner-recoverable ciphertext and expiry
+      if: ${{ !cancelled() && inputs.backend == 'draft' && steps.pack-checkpoint.outputs.checkpoint_advanced == 'true' && steps.relay_final.outputs.decision == 'present' }}
+      timeout-minutes: 3
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RETURNED_ID: ${{ steps.relay_final.outputs.artifact_id }}
+      run: |
+        set -euo pipefail
+        args=()
+        [[ -z $RETURNED_ID ]] || args+=(--artifact-id "$RETURNED_ID")
+        python3 preflight28/bridge/owner_recovery.py locate --run "$GITHUB_RUN_ID" --ordinal "$R28_SLOT" \
+          --head "$R28_HEAD_SHA" --parent-sha "$R28_PARENT_SHA" --claim-id "$R28_COLLECTION_CLAIM" "${args[@]}"
     name: Compile or verify authenticated APK slot ${{ inputs.segment_ordinal }}
   draft-publisher:
     name: Private checkpoint receipt for slot ${{ inputs.segment_ordinal }}
@@ -2006,7 +2087,10 @@ jobs:
       R28_PARENT_MANIFEST: ${{ inputs.parent_manifest_id }}
       R28_PARENT_MANIFEST_SHA: ${{ inputs.parent_manifest_sha }}
       R28_HEAD_SHA: ${{ github.sha }}
+      R28_OWNER_RECIPIENT: ${{ inputs.apk_recipient }}
+      R28_COLLECTION_CLAIM: ${{ inputs.owner_claim_id }}
     outputs:
+      relay_no_receipt: ${{ steps.peer_wait_outcome.outputs.outcome_absent }}
       checkpoint_manifest_id: ${{ steps.publish.outputs.checkpoint_manifest_id }}
       checkpoint_manifest_sha: ${{ steps.publish.outputs.checkpoint_manifest_sha }}
       checkpoint_sha: ${{ steps.publish.outputs.checkpoint_sha }}
@@ -2045,7 +2129,8 @@ jobs:
           CHECK_RUN=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" | jq -er --arg suffix "$CLOCK_SUFFIX" '
             select(.total_count == (.jobs|length)) | [.jobs[]|select((.name|endswith($suffix)) and .status=="in_progress")|.check_run_url|split("/")|last] | select(length==1) | first')
         fi
-        python3 preflight28/bridge/normal.py keygen limited --check-run "$CHECK_RUN"
+        sender_start=$(JOB_READ_TOKEN="$GH_TOKEN" python3 -I preflight28/limits/guard.py job-clock --check-run "$CHECK_RUN")
+        python3 preflight28/bridge/normal.py keygen limited --check-run "$CHECK_RUN" --job-start "$sender_start"
     - name: Discover exact peer key
       id: peer_wait_key
       timeout-minutes: 12
@@ -2062,7 +2147,13 @@ jobs:
     - name: Issue time-limited parent read descriptors bound to the peer
       env:
         GH_TOKEN: ${{ github.token }}
-      run: python3 preflight28/bridge/normal.py issue
+      run: |
+        set -euo pipefail
+        if ! command -v age >/dev/null; then
+          sudo -n apt-get -qq -o Acquire::Retries=2 update
+          sudo -n apt-get -qq --no-install-recommends install -y age
+        fi
+        python3 preflight28/bridge/normal.py issue
     - name: Deposit descriptor in this run
       id: peer_put_descriptor
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -2076,11 +2167,12 @@ jobs:
         compression-level: 0
     - name: Discover exact peer outcome
       id: peer_wait_outcome
-      timeout-minutes: 330
+      timeout-minutes: 293
       env:
         GH_TOKEN: ${{ github.token }}
       run: python3 preflight28/bridge/normal.py wait outcome
     - name: Fetch authenticated outcome by immutable artifact ID
+      if: ${{ steps.peer_wait_outcome.outputs.id != '' }}
       uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
       timeout-minutes: 18
       with:
@@ -2088,6 +2180,7 @@ jobs:
         path: ${{ runner.temp }}/r28-normal/incoming
         merge-multiple: true
     - name: Receive bounded ciphertext and independently verify fixed private publication
+      if: ${{ steps.peer_wait_outcome.outputs.id != '' }}
       id: publish
       timeout-minutes: 34
       env:

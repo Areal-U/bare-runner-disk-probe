@@ -757,7 +757,8 @@ jobs:
                 child = o["sha"]
                 if child in seen or not re.fullmatch("[0-9a-f]{64}", child): raise SystemExit("Repeated or invalid child")
                 seen.add(child); parent=child
-            elif state in {"apk", "no-progress", "apk-size-exceeded", "cipher-size-exceeded", "limit-verified"}:
+            elif state in {"apk", "no-progress", "apk-size-exceeded", "cipher-size-exceeded", "limit-verified",
+                           "relay-quota-denied","relay-capacity-exceeded","relay-deadline","relay-missing","relay-ambiguous"}:
                 if state == "limit-verified" and (n != 13 or o["sha"] != parent): raise SystemExit("Unverified terminal parent")
                 if state == "apk" and not (o.get("cipher_id") or o.get("cipher_cache")): raise SystemExit("No recoverable APK")
                 end = dict(o, slot=n, verified_parent=verified_parent)
@@ -884,11 +885,15 @@ jobs:
       env:
         PRIVATE_VERIFIED: ${{ steps.recovered.outputs.private_readback_verified }}
         PARTIAL: ${{ steps.recovered.outputs.recovery_status }}
+        OWNER_OUTCOME_ARTIFACT_ID: ${{ steps.recovered.outputs.owner_outcome_artifact_id }}
         MANIFEST_ID: ${{ steps.recovered.outputs.checkpoint_manifest_id }}
         DIGEST: ${{ steps.recovered.outputs.checkpoint_sha }}
       run: |
         if [[ $PRIVATE_VERIFIED == false ]]; then
           case "$PARTIAL" in
+            owner_outcome_artifact_available)
+              printf 'Owner outcome Artifact %s. The preceding record contains its ZIP digest and expiry.\n' "$OWNER_OUTCOME_ARTIFACT_ID"
+              exit 0 ;;
             partial_private_parts|all_private_bytes_verified_manifest_absent)
               printf 'Original slot %s private recovery: %s. Immutable intent and verified part IDs are in the preceding evidence. Compilation remains stopped.\n' "$R28_SLOT" "$PARTIAL"
               exit 0 ;;
