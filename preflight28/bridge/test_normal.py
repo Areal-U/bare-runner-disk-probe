@@ -105,7 +105,10 @@ class TestTransport(unittest.TestCase):
                 psha=hashlib.sha256(pf.read_bytes()).hexdigest()
                 tar=subprocess.run(["tar","-C",str(src),"-cf","-","out/Bare"],capture_output=True,check=True).stdout
                 candidate=n.ROOT/"new.tar.zst"
-                candidate.write_bytes(subprocess.run(["zstd","-qc","-9"],input=tar,capture_output=True,check=True).stdout)
+                # Exercise the ordinary packer before sealing and independently acquiring the generation.
+                packer = Path(__file__).resolve().parents[1] / "transport/pack_draft.py"
+                subprocess.run([sys.executable, str(packer), str(candidate), "auto", str(len(tar)), "--",
+                                "tar", "-C", str(src), "-cf", "-", "out/Bare"], check=True)
                 n.seal(candidate,ih,psha)
                 with patch.object(b,"api_json",side_effect=Provider().get),patch.dict(os.environ,
                       R28_STORAGE_CEILING=ENV["R28_STORAGE_CEILING"],R28_STORAGE_UNTIL=ENV["R28_STORAGE_UNTIL"],
