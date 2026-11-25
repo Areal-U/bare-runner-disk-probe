@@ -178,6 +178,27 @@ class TicketTests(unittest.TestCase):
         latest, _ = checked_ack(self.d,self.d.draft(RELEASE_ID),self.d.ticket,created,created)
         self.assertEqual(int(expiry.timestamp())-latest,(350+25+45+7)*60+2*3600+900)
 
+    @patch("registration.admit", return_value=123)
+    def test_owner_ack_discovery_pins_immutable_id_and_bytes(self, claim):
+        del self.d.ticket["collector_ack_asset_id"]
+        self.d.ack_asset.update(state="uploaded", uploader=OWNER, digest="sha256:"+self.d.ticket["collector_ack_sha"])
+        self.assertEqual(self.enter()[0],123)
+        self.assertEqual(claim.call_args.args[1]["collector_ack_asset_id"],812)
+        claim.reset_mock()
+        for key, bad in (("name", "foreign.json"), ("id", True), ("uploader", {"login":"other","id":292261483}),
+                         ("digest","sha256:"+"9"*64),("state","starter"), ("created_at","2026-11-25T02:00:00Z")):
+            with self.subTest(key=key), patch.dict(self.d.ack_asset,{key:bad}), self.assertRaises(ValueError):
+                self.enter()
+        for bad in (None, False, "812", 999):
+            with self.subTest(pinned=bad), patch.dict(self.d.ticket,collector_ack_asset_id=bad), self.assertRaises(ValueError):
+                self.enter()
+        rows = self.d.draft(RELEASE_ID)["assets"]
+        with patch.object(self.d,"draft",return_value={"assets":[*rows,dict(rows[1],id=814)]}), self.assertRaises(ValueError):
+            self.enter()
+        with patch.dict(self.d.ack,head="f"*40), self.assertRaises(ValueError):
+            self.enter()
+        claim.assert_not_called()
+
     @patch("registration.admit")
     def test_ticket_not_prepared_earlier_or_wrong_actor_or_expired(self, claim):
         for target, key, bad in [(self.d.asset,"created_at","2026-11-25T01:04:00Z"),

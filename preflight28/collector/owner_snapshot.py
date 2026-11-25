@@ -301,6 +301,25 @@ class OwnerSnapshot:
             require(r["id"] not in self.by_id or self.by_id[r["id"]]==normalized,"Conflicting private immutable ID")
             self.by_id[r["id"]]=normalized
 
+    def resolve_original_ticket(self, intent):
+        """Complete an owner-pinned locator only from the original binder's evidence."""
+        self.visible()
+        ticket = p.CAMPAIGN + "-collection-registration.json"
+        self.private_file(ticket, 4096, intent["ticket_sha"])
+        origin = self.private_hint(p.CLAIM)["run_id"]
+        names, owners = [ticket,p.CLAIM], [ticket]
+        records = self.witness(origin,intent["head"],"claim",CLAIM_JOB,names=names,owners=owners)
+        self.merge(records,names,owners)
+        rows = [self.by_id[r["id"]] for r in records]
+        aid = p.private_row(rows,ticket)["id"]
+        if "ticket_asset_id" in intent:
+            require(type(intent["ticket_asset_id"]) is int and intent["ticket_asset_id"] == aid,
+                    "Different pre-registered ticket ID")
+        locator = dict(intent,ticket_asset_id=aid)
+        first, physical, _, scope = p.bind(self,rows,locator)
+        require(first == physical == origin and not scope.replacement, "Foreign original binder")
+        return locator
+
     def draft_rows(self,locator):
         self.visible()
         ticket=p.CAMPAIGN+"-collection-registration.json"

@@ -28,14 +28,23 @@ def checked_ack(helper, release, ticket, created, now):
     destination = ticket.get("owner_destination_id", "")
     require(re.fullmatch("[0-9a-f]{32,64}", nonce) and re.fullmatch("[A-Za-z0-9_-]{12,200}", destination),
             "Missing registration nonce or owner destination")
-    aid, sha = ticket.get("collector_ack_asset_id"), ticket.get("collector_ack_sha")
-    require(type(aid) is int and aid > 0 and isinstance(sha,str) and re.fullmatch("[0-9a-f]{64}",sha),
+    sha = ticket.get("collector_ack_sha")
+    require(isinstance(sha,str) and re.fullmatch("[0-9a-f]{64}",sha),
             "The independently registered collector has not acknowledged readiness")
-    found = [a for a in release["assets"] if a["id"] == aid]
+    name = CAMPAIGN + "-collector-ack-" + nonce + ".json"
+    found = [a for a in release["assets"] if a["name"] == name]
     require(len(found) == 1, "The exact pinned collector acknowledgement is unavailable")
     ack_asset = found[0]
-    name = CAMPAIGN + "-collector-ack-" + nonce + ".json"
-    require(ack_asset["name"] == name and 0 < ack_asset["size"] <= 4096 and instant(ack_asset["created_at"]) <= created,
+    aid = ack_asset["id"]
+    require(type(aid) is int and aid > 0, "Invalid immutable collector ACK ID")
+    if "collector_ack_asset_id" in ticket:
+        expected = ticket["collector_ack_asset_id"]
+        require(type(expected) is int and expected == aid, "Different pinned collector ACK ID")
+    else:
+        require(all((ack_asset.get("uploader") or {}).get(k) == v for k,v in OWNER.items()) and
+                ack_asset.get("state") == "uploaded" and ack_asset.get("digest") == "sha256:" + sha,
+                "Discovered ACK does not match the owner, upload state or pinned digest")
+    require(0 < ack_asset["size"] <= 4096 and instant(ack_asset["created_at"]) <= created,
             "The collector acknowledgement was not deposited before the original run")
     helper.asset_info(release, name, ack_asset["size"], sha, aid)
     raw=io.BytesIO()
@@ -52,7 +61,7 @@ def checked_ack(helper, release, ticket, created, now):
     latest = min(instant(ack["valid_until"]),instant(ticket["expires_at"])) - timedelta(seconds=(350+25+45+7)*60+2*period+retry)
     require(instant(ack["observed_at"]) <= created <= now <= latest,
             "Collector lease does not cover this segment and pickup")
-    return int(latest.timestamp()), ack
+    return int(latest.timestamp()), dict(ack, collector_ack_asset_id=aid)
 
 
 def checked_build_route(inputs):
@@ -127,6 +136,8 @@ def bind(helper, env, event, now, *, verify_only=False):
                             stage="lease", now=now.timestamp(), lead=350*60)
     holder = dict(expected, registration_id=service, ticket_asset_id=int(aid), ticket_sha=digest,
                   run_id=run, producer_attempt=1)
+    if "collector_ack_asset_id" not in ticket:
+        holder["collector_ack_asset_id"] = ack["collector_ack_asset_id"]
     # Independent of ticket ID: two concurrent dispatches cannot bind this campaign twice.
     return admit("recover" if verify_only else "compute", holder, helper, name=CLAIM), service, latest, ceiling, until
 
