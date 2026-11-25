@@ -11,7 +11,9 @@ import yaml
 
 from admission import S2_SHA
 from recover import follow, salvage, last_private_slot, recover_fallback
-from recover_private import read_only
+from recover_private import read_only, recovery_deadline, JOB_NAME, JOB_MINUTES, STEP_MINUTES, EXIT_MINUTES
+from datetime import datetime, timezone
+from unittest.mock import Mock
 
 HERE = Path(__file__).resolve().parents[2]
 if not (HERE/".github/workflows/bare-r28-native-slot.yml").exists():
@@ -76,6 +78,67 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(o["status"],"candidate")
         n["arm"]["outputs"]["parent_frontier_verified"]="false"
         self.assertNotEqual(record(n,2)[0].returncode,0)
+
+    def test_same_run_receipt_only_continuation(self):
+        state="manifest_present_visibility_pending"
+        n=inputs();n["read"]["result"]="skipped";o=n["arm"]["outputs"]
+        o.update(private_status=state, private_readback_verified="false", checkpoint_saved="false",
+                 checkpoint_manifest_id="716",checkpoint_manifest_sha="e"*64,checkpoint_bytes="1024")
+        fields=("checkpoint_manifest_id","checkpoint_manifest_sha","checkpoint_sha","checkpoint_identity",
+                "checkpoint_bytes","checkpoint_key","checkpoint_ordinal","producer_sha")
+        confirm={k:o[k] for k in fields}
+        confirm.update(recovery_status=state,private_readback_verified="false")
+        n["confirm-private"]={"result":"success","outputs":confirm}
+        p,ret=record(n,backend="draft")
+        self.assertEqual(p.returncode,0,p.stderr)
+        self.assertEqual((ret["status"],ret["manifest_id"],ret["sha"]),(state,"716",o["checkpoint_sha"]))
+        self.assertEqual(follow([dict(ret,ordinal=1)],77,REV)["status"],state)
+        jobs={f"slot{j:02}":{"result":"skipped","outputs":{}} for j in range(1,14)}
+        jobs["slot01"]={"result":"success","outputs":ret}
+        terminal=CALLER["jobs"]["terminal-12"]["steps"][0]["run"]
+        resolved,_=dispatch(terminal, {"NEEDS":json.dumps(jobs)})
+        self.assertNotEqual(resolved.returncode,0)
+        self.assertIn("R28_TERMINAL_RECEIPT",resolved.stdout)
+        confirm.update(recovery_status="verified",private_readback_verified="true")
+        self.assertEqual(record(n,backend="draft")[1]["status"],"candidate")
+        for k in fields:
+            old=confirm[k]; confirm[k]="wrong"
+            self.assertNotEqual(record(n,backend="draft")[0].returncode,0)
+            confirm[k]=old
+        n["confirm-private"]["result"]="failure"
+        self.assertNotEqual(record(n,backend="draft")[0].returncode,0)
+        del n["confirm-private"]
+        self.assertNotEqual(record(n,backend="draft")[0].returncode,0)
+        job=WORKER["jobs"]["confirm-private"]
+        self.assertIn(state,job["if"]);self.assertIn("github.run_attempt == '1'",job["if"])
+        self.assertEqual(job['needs'],'arm')
+        self.assertEqual(job["timeout-minutes"],JOB_MINUTES)
+        self.assertEqual(job["steps"][-1]["timeout-minutes"],STEP_MINUTES)
+        self.assertIn("recover_private.py",job["steps"][-1]["run"])
+        self.assertFalse(any('upload' in s.get('uses','') or 'publish' in s.get('run','') for s in job["steps"]))
+
+    def test_real_attempt_clock_cutoff_for_both_read_only_jobs(self):
+        step_start=1_800_000_000; now=step_start+3
+        api=Mock(BASE="base")
+        e=dict(GITHUB_JOB="recover-draft-checkpoint",GITHUB_RUN_ID="77",GITHUB_RUN_ATTEMPT="2",GITHUB_SHA=REV,
+               R28_CHECK_RUN="52",R28_STEP_START=str(step_start))
+        def row(offset):
+            return dict(id=14,run_id=77,run_attempt=int(e["GITHUB_RUN_ATTEMPT"]),head_sha=REV,status="in_progress",name=JOB_NAME,
+                        check_run_url="https://api.github.com/repos/Areal-U/bare-runner-disk-probe/check-runs/52",
+                        started_at=datetime.fromtimestamp(step_start-offset,timezone.utc).isoformat())
+        item=row(60);api.metadata.return_value=dict(total_count=1,jobs=[item])
+        self.assertEqual(recovery_deadline(api,e,now),step_start+(STEP_MINUTES-EXIT_MINUTES)*60)
+        item=row(35*60);api.metadata.return_value=dict(total_count=1,jobs=[item])
+        self.assertEqual(recovery_deadline(api,e,now),step_start+(JOB_MINUTES-35-EXIT_MINUTES)*60)
+        for key,val in (("R28_CHECK_RUN","3"),("GITHUB_SHA","b"*40),("GITHUB_RUN_ATTEMPT","3")):
+            with self.assertRaises(ValueError):recovery_deadline(api,{**e,key:val},now)
+        e.update(GITHUB_JOB='confirm-private',R28_SLOT='4',GITHUB_RUN_ATTEMPT='1',GITHUB_ACTOR='Areal-U',
+                 R28_EXPECTED_RECOVERY_MANIFEST='716',R28_EXPECTED_RECOVERY_MANIFEST_SHA='e'*64)
+        item=row(70);item["name"]="Bounded build segment 4 / Confirm original private visibility for slot 4"
+        fillers=[dict(item,id=1000+i,status='completed') for i in range(100)]
+        api.metadata.side_effect=[dict(total_count=101,jobs=fillers),dict(total_count=101,jobs=[item])]
+        self.assertEqual(recovery_deadline(api,e,now),step_start+(STEP_MINUTES-EXIT_MINUTES)*60)
+        with self.assertRaises(ValueError):recovery_deadline(api,dict(e,R28_EXPECTED_RECOVERY_MANIFEST=''),now)
 
     def test_no_progress_size_and_independent_verification(self):
         n=inputs(2);n["read"]["result"]="skipped"
@@ -207,9 +270,9 @@ class NativeTests(unittest.TestCase):
 
     def test_incomplete_manifest_reports_observed_partial_state(self):
         step=CALLER["jobs"]["recover-draft-checkpoint"]["steps"][-1]["run"]
-        def status(verified, partial, aid="", digest=""):
+        def status(verified, partial, aid="", digest="",manifest=""):
             return subprocess.run(["bash","-euo","pipefail","-c",step],env={**os.environ,
-                       "R28_SLOT":"4","PARTIAL":partial,"PRIVATE_VERIFIED":verified,"MANIFEST_ID":aid,"DIGEST":digest},
+                       "R28_SLOT":"4","PARTIAL":partial,"PRIVATE_VERIFIED":verified,"MANIFEST_ID":aid,"DIGEST":digest,"MANIFEST_SHA":manifest},
                        text=True,capture_output=True)
         for name in ("all_private_bytes_verified_manifest_absent","partial_private_parts"):
             result=status("false",name)
@@ -217,6 +280,9 @@ class NativeTests(unittest.TestCase):
             self.assertIn(name,result.stdout)
         self.assertNotEqual(status("true","").returncode,0)
         self.assertEqual(status("true","","701","e"*64).returncode,0)
+        unresolved=status("false","manifest_present_visibility_pending","716","f"*64,"e"*64)
+        self.assertNotEqual(unresolved.returncode,0)
+        self.assertIn("Anonymous visibility confirmation is pending",unresolved.stdout)
 
     def test_original_seal_can_be_salvaged_after_verifier_failed(self):
         initial=dict(status="recovery-no-terminal",accepted_parent=S2_SHA)

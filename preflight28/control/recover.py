@@ -53,6 +53,12 @@ def follow(receipts, run, sha):
                     (not cache or cache == f"bare-coexist-204-apk-v1-{run}-1-s{n}")
                     and (aid or cache), "Invalid archived APK location")
             terminal = r
+        elif state == "manifest_present_visibility_pending":
+            require(n <= 12 and r['key'] == f"bare-coexist-204-{run}-1-checkpoint-production-s{n}"
+                    and re.fullmatch(r"[1-9][0-9]*",r["manifest_id"]) and HEX.fullmatch(r["manifest_sha"])
+                    and HEX.fullmatch(r["sha"]) and HEX.fullmatch(r["identity"]) and r["sha"] not in seen and
+                    0 < int(r["archive_bytes"]) <= 7*1024**3//2,"Invalid pending private manifest receipt")
+            terminal = r
         elif state in {"no-progress", "apk-size-exceeded", "cipher-size-exceeded",
                        "relay-quota-denied","relay-capacity-exceeded","relay-deadline","relay-missing","relay-ambiguous"}:
             terminal = r
@@ -203,8 +209,10 @@ def main():
         return page["actions_caches"]
     outcome = recover_fallback(outcome,jobs,run,log,caches)
     outcome = salvage(outcome, jobs, artifacts, run, sha, log)
-    if outcome["status"] == "recovery-no-terminal" or outcome["status"].startswith("relay-"):
+    if outcome["status"] in ("recovery-no-terminal","manifest_present_visibility_pending") or outcome["status"].startswith("relay-"):
         outcome.update(last_private_slot(jobs, receipts, run, sha, artifacts))
+    if outcome["status"] == "manifest_present_visibility_pending":
+        require(outcome.get("private_ordinal") == outcome["ordinal"],"No physical original publisher for pending manifest")
     aid = outcome.get("cipher_id", "")
     if aid:
         artifact = json.loads(get("actions/artifacts/" + aid))
@@ -220,7 +228,7 @@ def main():
     print("R28_READ_ONLY_RECOVERY " + json.dumps(outcome, sort_keys=True))
     with open(os.environ["GITHUB_OUTPUT"], "a") as f:
         for k in ("status", "cipher_id", "cipher_cache", "cipher_sha", "cipher_bytes",
-                  "private_ordinal", "private_parent", "private_identity"):
+                  "private_ordinal", "private_parent", "private_identity", "manifest_id", "manifest_sha"):
             print(f"{k}={outcome.get(k,'')}",file=f)
 
 
