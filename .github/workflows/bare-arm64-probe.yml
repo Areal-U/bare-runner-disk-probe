@@ -315,6 +315,14 @@ jobs:
             "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/$source" \
             --output "$RUNNER_TEMP/bare-ci/$file"
         done
+        if [[ $PROBE_MODE == checkpoint-production ]]; then
+          mkdir -m 700 "$RUNNER_TEMP/r28-apk-receipt"
+          for file in bridge.py artifact_poll.py apk_artifact.py; do
+            curl --fail --location --retry 2 --max-time 40 \
+              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/preflight28/bridge/$file" \
+              --output "$RUNNER_TEMP/r28-apk-receipt/$file"
+          done
+        fi
         python3 -m py_compile "$RUNNER_TEMP/bare-ci/checkpoint.py" "$RUNNER_TEMP/bare-ci/build_trial.py"
         if [[ -n $COEXIST_PREDECESSOR_REV ]]; then
           mkdir "$RUNNER_TEMP/bare-ci/predecessor-workflows"
@@ -1469,30 +1477,10 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
         RETURNED_ID: ${{ steps.apk_upload.outputs.artifact-id }}
+        RETURNED_DIGEST: ${{ steps.apk_upload.outputs.artifact-digest }}
         ENCRYPTED_SHA: ${{ steps.apk_seal.outputs.sha }}
         ENCRYPTED_BYTES: ${{ steps.apk_seal.outputs.bytes }}
-      run: |
-        set -euo pipefail
-        [[ $ENCRYPTED_SHA =~ ^[0-9a-f]{64}$ && $ENCRYPTED_BYTES =~ ^[1-9][0-9]*$ ]]
-        name=bare-personal-204-encrypted-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT${SEGMENT_SUFFIX}
-        id=
-        if [[ $RETURNED_ID =~ ^[1-9][0-9]*$ ]]; then
-          id=$RETURNED_ID
-        else
-          if ! listing=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=$name&per_page=100"); then
-            echo 'Artifact receipt lookup inconclusive; try to preserve the same ciphertext.'
-            exit 0
-          fi
-          id=$(jq -er --arg name "$name" '
-            select(.total_count == (.artifacts|length)) |
-            [.artifacts[]|select(.name==$name and .expired==false)|.id]|unique|
-            if length == 1 then .[0]|tostring elif length == 0 then "" else error("multiple artifact receipts") end' <<<"$listing")
-        fi
-        if [[ -n $id ]]; then
-          [[ $id =~ ^[1-9][0-9]*$ ]]
-          echo "id=$id" >> "$GITHUB_OUTPUT"
-          echo "Candidate artifact $id, ciphertext $ENCRYPTED_SHA ($ENCRYPTED_BYTES B)." >> "$GITHUB_STEP_SUMMARY"
-        fi
+      run: python3 "$RUNNER_TEMP/r28-apk-receipt/apk_artifact.py"
     - name: Check temporary recovery capacity for the encrypted APK
       id: apk_fallback_budget
       if: ${{ always() && steps.apk_seal.outputs.ready == 'true' && steps.seal_receipt.outcome == 'success' && steps.seal_receipt.outputs.id == '' }}
