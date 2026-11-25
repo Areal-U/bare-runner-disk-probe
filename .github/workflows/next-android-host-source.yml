@@ -1,0 +1,65 @@
+name: Measure the pinned Linux and Android gclient on the existing standard Ubuntu host
+on:
+  workflow_call:
+permissions: {}
+jobs:
+  linux24-android-checkout:
+    if: ${{ github.repository == 'Areal-U/bare-runner-disk-probe' && !github.event.repository.private && !github.event.repository.fork && github.event_name == 'workflow_dispatch' && github.run_attempt == '1' && github.ref == 'refs/heads/bare-next-build-prep-20261125' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GIT_TERMINAL_PROMPT: '0'
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - name: Verify the same public source producer and normal checkout recipe
+      id: fixture
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 next_build/trials/android_sync.py setup
+    - name: Prepare only a temporary host working directory
+      id: host
+      run: |
+        set -euo pipefail
+        . /etc/os-release
+        [[ $ID == ubuntu && $VERSION_ID == 24.04 && $RUNNER_ENVIRONMENT == github-hosted && $RUNNER_ARCH == X64 ]]
+        base=$(mktemp -d /var/tmp/bare-source-host.XXXXXXXX)
+        chmod 0755 "$base"
+        mkdir -m 0755 "$base/exchange" "$base/exchange/seed"
+        cp -R "$ANDROID_TRIAL/bare/exchange/next_build" "$base/exchange/"
+        sudo -n install -d -m 0700 -o 1000 -g 1000 "$base/work" "$base/home"
+        # The command, original DEPS, depot revision and target_os stay identical.
+        # Only the paths of this VM's private work directory and public, read-only inputs differ.
+        sed -i "s|/exchange/|$base/exchange/|g; s|/work/chromium|$base/work/chromium|g" "$base/exchange/next_build/checkout.sh"
+        sudo -n setpriv --reuid 1000 --regid 1000 --clear-groups --no-new-privs test -r "$base/exchange/next_build/checkout.sh"
+        [[ $(df -B1 --output=avail "$base" | tail -1) -ge 80000000000 && $(df --output=iavail "$base" | tail -1) -ge 4000000 ]]
+        printf 'BARE_HOST_TRIAL=%s\nSEED_DOWNLOAD_START=%s\n' "$base" "$(date +%s%N)" >> "$GITHUB_ENV"
+        echo "seed=$base/exchange/seed" >> "$GITHUB_OUTPUT"
+    - name: Read the existing pack once by immutable ID
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 9
+      with:
+        github-token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        run-id: ${{ steps.fixture.outputs.run }}
+        artifact-ids: ${{ steps.fixture.outputs.id }}
+        merge-multiple: true
+        path: ${{ steps.host.outputs.seed }}
+    - name: Run the normal Linux and Android gclient with host tools as UID 1000
+      timeout-minutes: 45
+      run: |
+        set -euo pipefail
+        python3 -c 'import os,time; print("BARE_ANDROID_HOST_ARTIFACT_FETCH_S", round((time.time_ns()-int(os.environ["SEED_DOWNLOAD_START"]))/1e9, 3))'
+        base=$BARE_HOST_TRIAL
+        chmod 0644 "$base/exchange/seed/source.pack"
+        python3 next_build/trials/android_sync.py host-watch \
+          sudo -n setpriv --reuid 1000 --regid 1000 --clear-groups --no-new-privs env -i -C "$base/home" \
+          HOME="$base/home" USER=bare-source LOGNAME=bare-source LANG=C.UTF-8 \
+          PATH="$base/home/depot_tools:/usr/local/bin:/usr/bin:/bin" \
+          BARE_HOST_SOURCE_ROOT="$base/work" DEPOT_REV="$DEPOT_REV" CHROMIUM_REV="$CHROMIUM_REV" GIT_TERMINAL_PROMPT=0 \
+          timeout --kill-after=2m 40m bash -eu "$base/exchange/next_build/checkout.sh"
