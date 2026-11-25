@@ -14,7 +14,7 @@ concurrency:
   group: r28-thaw-original-45513782890
   cancel-in-progress: false
 env:
-  PRIOR_SHA: 7e6599d7c58e5597036fcc66432435e768fce762
+  PRIOR_SHA: 7f6dc6604a1da1844a7af5738acce3f26593f695
   TRIAL_SHA: ${{ github.event.pull_request.head.sha }}
   R28_CAMPAIGN: r28-preflight-s2-20261125-v3
 defaults:
@@ -31,7 +31,7 @@ jobs:
       == 9 && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.repository == 'Areal-U/bare-runner-disk-probe'
       && github.event.pull_request.base.repo.full_name == github.repository && github.event.pull_request.head.repo.full_name
       == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4'
-      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == '7e6599d7c58e5597036fcc66432435e768fce762'
+      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == '7f6dc6604a1da1844a7af5738acce3f26593f695'
       && github.run_attempt == '1' }}
     name: Recover original sealed candidate and audit before immutable private publication
     timeout-minutes: 155
@@ -219,7 +219,7 @@ jobs:
       == 9 && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.repository == 'Areal-U/bare-runner-disk-probe'
       && github.event.pull_request.base.repo.full_name == github.repository && github.event.pull_request.head.repo.full_name
       == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4'
-      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == '7e6599d7c58e5597036fcc66432435e768fce762'
+      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == '7f6dc6604a1da1844a7af5738acce3f26593f695'
       && (needs.recover.result == 'success' || github.run_attempt != '1') }}
     permissions: *id002
     name: Grant only a short-lived read of original private checkpoint parts
@@ -284,7 +284,7 @@ jobs:
       == 9 && github.actor == 'Areal-U' && github.triggering_actor == 'Areal-U' && github.repository == 'Areal-U/bare-runner-disk-probe'
       && github.event.pull_request.base.repo.full_name == github.repository && github.event.pull_request.head.repo.full_name
       == github.repository && github.head_ref == 'work-bare-27-storage-check' && github.base_ref == 'bare-coexist-v2.0.4'
-      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == '7e6599d7c58e5597036fcc66432435e768fce762'
+      && github.event.pull_request.base.sha == 'bf70ddbf474f3390a62220a076b8c43347fecc64' && github.event.before == '7f6dc6604a1da1844a7af5738acce3f26593f695'
       && (needs.recover.result == 'success' || github.run_attempt != '1') }}
     permissions:
       actions: read
