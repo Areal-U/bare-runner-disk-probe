@@ -51,7 +51,13 @@ class TerminalDraft(unittest.TestCase):
         rescue=jobs["deliver-recovered-cached-apk"]
         current=[s for s in rescue["steps"] if s.get("uses","").startswith("actions/cache/restore@")]
         self.assertEqual(current[0]["with"]["path"],"${{ runner.temp }}/bare-apk-delivery")
-        self.assertFalse(any("upload-artifact@" in s.get("uses","") for s in rescue["steps"]))
+        uploads=[s for s in rescue["steps"] if "upload-artifact@" in s.get("uses","")]
+        self.assertEqual([s["name"] for s in uploads],["Persist verified owner terminal identities"])
+        self.assertEqual((uploads[0]["with"]["path"],uploads[0]["with"]["retention-days"],uploads[0]["with"]["compression-level"]),
+                         ("${{ runner.temp }}/witness.json",30,0))
+        self.assertIn("witness_budget.outcome",uploads[0]["if"])
+        self.assertTrue(uploads[0]["continue-on-error"])
+        self.assertIn("prior_id",current[0]["if"])
 
     def test_transfer_only_authorization_refuses_foreign_cache_and_existing_artifact(self):
         import sys
@@ -77,7 +83,7 @@ class TerminalDraft(unittest.TestCase):
                 return json.dumps(dict(id=run,run_attempt=1,path=owner.WORKFLOW,head_sha=head,event="workflow_dispatch",head_branch=owner.BASE_REF,
                                   repository={"id":owner.REPO_ID},head_repository={"id":owner.REPO_ID},actor=owner.OWNER,status="completed" if run==9 else "in_progress"))
             ss.enter_context(patch.object(owner,"PagedOwnerDraft",lambda a:a))
-            ss.enter_context(patch.object(owner,"private_row",return_value={"id":4,"digest":"sha256:"+"e"*64}))
+            ss.enter_context(patch.object(owner,"private_row",side_effect=lambda *a,**kw: None if kw.get("optional") else {"id":4,"digest":"sha256:"+"e"*64}))
             ss.enter_context(patch.object(owner,"private_document",return_value={"owner_destination_id":"owner","collector_registration_id":"registered"}))
             ss.enter_context(patch.object(owner,"bind",return_value=(9,9,22,d.recover.ChainStart())))
             ss.enter_context(patch.object(d.recover,"get",side_effect=physical))
@@ -97,6 +103,43 @@ class TerminalDraft(unittest.TestCase):
             out["cipher_id"]="37"
             with self.assertRaises(ValueError): d.authorize_rescue(env,Api())
             self.assertEqual(capture.call_count,1)
+
+    def test_private_pair_reread_needs_neither_cache_nor_another_encrypted_write(self):
+        import owner_witness
+        class Remote:
+            def __init__(self):
+                self.data={}
+                self.rows=[]
+                self.read=[]
+            def add(self,name,buf):
+                i=len(self.rows)+1
+                self.rows.append(dict(name=name,id=i,digest="sha256:"+hashlib.sha256(buf).hexdigest(),size=len(buf),state="uploaded"))
+                self.data[i]=buf
+                return self.rows[-1]
+            def download(self,i,size,sha,target):
+                buf=self.data[i]
+                assert len(buf)==size and hashlib.sha256(buf).hexdigest()==sha
+                self.read.append(i)
+                if target is not None: target.write(buf)
+        api=Remote()
+        head="a"*40
+        parent="b"*64
+        part=api.add("r28-9-a1-s02-apk.age",b"age-encryption.org/v1\nretained")
+        checksum=part["digest"][7:]
+        seal=dict(schema=d.apk_seal.SCHEMA,run=9,ordinal=2,attempt=1,producer_sha=head,accepted_parent=parent,
+                  recipient=d.apk_seal.RECIPIENT,sha=checksum,bytes=part["size"])
+        proof=dict(schema="bare-r28-private-apk-v1",seal=seal,source_cache_key="bare-coexist-204-apk-v1-9-1-s2",
+                   collection_claim_id=31,depositor_run=9,cipher=dict(id=part["id"],name=part["name"],sha256=checksum,bytes=part["size"]))
+        receipt=api.add("r28-9-a1-s02-apk-owner-receipt.json",json.dumps(proof).encode())
+        env=dict(GITHUB_JOB="deliver-recovered-cached-apk",GITHUB_RUN_ID="22",R28_SLOT="2",GITHUB_SHA=head,
+                 R28_PARENT_SHA=parent,R28_COLLECTION_CLAIM="31",R28_SOURCE_RUN="9",CIPHER_SHA=checksum,
+                 CIPHER_BYTES=str(part["size"]),PRIOR_RECEIPT_ID=str(receipt["id"]),PRIOR_RECEIPT_SHA=receipt["digest"][7:])
+        with patch.object(d.recover,"current_caches",side_effect=AssertionError("cache must not be needed")):
+            actual,meta=d.confirmed_private_pair(api,api.rows,env,read_bytes=True)
+            self.assertEqual((actual,meta),(receipt,proof))
+            self.assertIn(part["id"],api.read)
+            with self.assertRaises(ValueError): d.confirmed_private_pair(api,api.rows,dict(env,PRIOR_RECEIPT_ID="4"),read_bytes=True)
+            with self.assertRaises(ValueError): d.confirmed_private_pair(api,api.rows,dict(env,CIPHER_SHA="c"*64),read_bytes=True)
 
     def test_checked_cache_only_and_idempotent_retry(self):
         with TemporaryDirectory() as temp:

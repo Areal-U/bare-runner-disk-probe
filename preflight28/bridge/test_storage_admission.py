@@ -1,5 +1,9 @@
 import contextlib
+import hashlib
 import io
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -89,11 +93,31 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(self.admit(s.lease_size(env),stage="lease",lead=350*60),"admitted")
         with self.assertRaises(s.StorageFull):
             self.admit(s.lease_size(self.env),stage="lease",lead=350*60)
-        s.draft_room({"assets":[{}]*991}, self.env, claim=True)
+        s.draft_room({"assets":[{}]*990}, self.env, claim=True)
         with self.assertRaisesRegex(ValueError,"Release asset slots"):
-            s.draft_room({"assets":[{}]*992},self.env,claim=True)
+            s.draft_room({"assets":[{}]*991},self.env,claim=True)
         s.draft_room({"assets":[{}]*992},self.env,claim=False)
         s.draft_room({"assets":[{}]*1000},env,claim=False)
+
+    def test_full_private_release_reuses_exact_witness_and_skips_new_write(self):
+        import sys
+        from unittest.mock import Mock
+        with patch.object(sys,"path",[str(Path(s.__file__).resolve().parents[1]/"control"), *sys.path]):
+            import admission as gate
+        name="r28-81-a1-owner-terminal.json"
+        value={"version":1,"terminal":81}
+        data=gate.encode(value)
+        api=Mock()
+        row={"id":123,"name":name}
+        others=[{"id":i+2000,"name":f"other-{i}.json"} for i in range(1000)]
+        api.draft.return_value={"assets":others[:999]+[row]}
+        api.asset_info.return_value=row
+        api.download.side_effect=lambda aid,size,sha,out:out.write(data)
+        self.assertEqual(gate.admit("compute",value,api,name=name),123)
+        api.draft.return_value={"assets":others}
+        with self.assertRaisesRegex(ValueError,"no remaining asset slot"):
+            gate.admit("compute",value,api,name=name)
+        api.request.assert_not_called()
 
     def test_actual_receive_time_covers_all_retention_and_sender_timeout(self):
         self.env["R28_STORAGE_UNTIL"] = str(self.now + s.DAY + 7*60 - 1)
@@ -101,6 +125,60 @@ class GuardTests(unittest.TestCase):
             self.admit()
         self.env["R28_STORAGE_UNTIL"] = str(self.now + s.DAY + 7*60)
         self.assertEqual(self.admit(),"admitted")
+
+    def test_witness_reserves_30_days_and_rejects_oversized_or_uncertain_upload(self):
+        minimum = self.now + 30*s.DAY + 10*60
+        budget = s.CONTROL_RESERVE + 16*1024
+        self.env.update(R28_STORAGE_UNTIL=str(minimum), R28_STORAGE_CEILING=str(budget))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/"witness.json"
+            path.write_bytes(b"x"*8192)
+            self.assertEqual(s.admit_witness(self.p.get,self.env,path,now=self.now),"admitted")
+            for change in (dict(R28_STORAGE_UNTIL=str(minimum-1)),
+                           dict(R28_STORAGE_CEILING=str(budget-1)), dict(R28_STORAGE_CEILING="")):
+                with patch.dict(self.env,change), self.assertRaises(ValueError):
+                    s.admit_witness(self.p.get,self.env,path,now=self.now)
+            self.p.runs = [dict(id=82)]
+            with self.assertRaisesRegex(ValueError,"Another"):
+                s.admit_witness(self.p.get,self.env,path,now=self.now)
+            self.p.runs = []
+            path.write_bytes(b"x"*8193)
+            with self.assertRaisesRegex(ValueError, "oversized"):
+                s.admit_witness(self.p.get,self.env,path,now=self.now)
+            other=path.with_name("unrelated.json")
+            path.rename(other)
+            path.symlink_to(other)
+            with self.assertRaisesRegex(ValueError, "oversized"):
+                s.admit_witness(self.p.get,self.env,path,now=self.now)
+
+    def test_rescue_recovers_only_storage_policy_from_original_immutable_ack(self):
+        start = "2026-11-25T01:03:00Z"
+        common = dict(campaign="bare-personal-204-r28", branch="bare-coexist-v2.0.4",
+                      head="2"*40, collector_registration_id="Automation_"+"b"*32,
+                      owner_destination_id="libfile_private_owner", registration_nonce="a"*32, recipient="test",
+                      storage_policy=s.POLICY, artifact_ceiling_bytes=12345, storage_valid_until="2027-01-01T00:00:00Z")
+        ack = dict(common, schema=1, state="collector-read-back-owner-reservation",
+                   observed_at="2026-11-25T00:55:00Z", valid_until="2026-11-30T00:00:00Z",
+                   poll_seconds=3600, pickup_retry_seconds=900)
+        data = json.dumps(ack).encode()
+        digest = hashlib.sha256(data).hexdigest()
+        ticket = dict(common, collector_ack_asset_id=102, collector_ack_sha=digest, expires_at=ack["valid_until"])
+        row = dict(id=102, name="bare-personal-204-r28-collector-ack-"+"a"*32+".json",
+                   created_at="2026-11-25T00:56:00Z", size=len(data))
+        class Draft:
+            def asset_info(self, release, name, size, sha, aid):
+                if (name, size, aid) != (row["name"],len(data),102):
+                    raise ValueError("Wrong asset")
+            def download(self, aid, size, sha, out):
+                out.write(data)
+        api = Draft()
+        self.assertEqual(s.private_witness_policy(api,{"assets":[row]},ticket,start),s.policy(ticket,ack))
+        for bad in (ticket | {"collector_ack_sha":"0"*64}, ticket | {"artifact_ceiling_bytes":12346},
+                    ticket | {"collector_ack_asset_id":900}):
+            with self.assertRaises(ValueError):
+                s.private_witness_policy(api,{"assets":[row]},bad,start)
+        with self.assertRaisesRegex(ValueError,"before the original run"):
+            s.private_witness_policy(api,{"assets":[row]},ticket,"2026-11-25T00:54:00Z")
 
     def test_wrong_scope_and_unsettled_repository_stop(self):
         for field, value in (("id",11),("fork",True),("private",True),("visibility","private")):

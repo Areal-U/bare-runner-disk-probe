@@ -183,7 +183,7 @@ def normal_binding(registration_dir, workflows):
     expect_reject(lambda:bind(verify_only=True),"No first-attempt receipt to recover")
     assert helper.writes==0
     end=min(gate.instant(ack["valid_until"]),gate.instant(ticket["expires_at"]))
-    last=end-timedelta(seconds=(350+25+35+7)*60+2*ack["poll_seconds"]+ack["pickup_retry_seconds"])
+    last=end-timedelta(seconds=(350+25+45+7)*60+2*ack["poll_seconds"]+ack["pickup_retry_seconds"])
     expected=(52,ticket["collector_registration_id"],int(last.timestamp()),storage["artifact_ceiling_bytes"],
               int(gate.instant(storage["storage_valid_until"]).timestamp()))
     assert bind()==expected and bind()==expected and helper.writes==1

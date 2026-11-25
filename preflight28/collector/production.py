@@ -156,7 +156,26 @@ def unwrap(outer, row, cipher, **binding):
     return seal
 
 
-def decide(jobs, arts, rows, chain, run, head, scope):
+class ActionsGET:
+    @staticmethod
+    def metadata(path):
+        return json.loads(recover.get(path))
+
+    @staticmethod
+    def inventory(path, key):
+        return recover.inventory(path,key)
+
+    @staticmethod
+    def note(aid):
+        return recover.download_note(aid)
+
+    @staticmethod
+    def copy_artifact(row, stream):
+        subprocess.run(["gh","api","--method","GET",f"repos/{REPO}/actions/artifacts/{row['id']}/zip"],
+                       stdout=stream,check=True,timeout=900)
+
+
+def decide(jobs, arts, rows, chain, run, head, scope, actions=ActionsGET):
     # Slot journals pin the accepted parent; individual terminal bytes can predate the last journal.
     outcome = recover.follow(chain, run, head, scope)
     terminal = outcome["status"] == "apk"
@@ -170,7 +189,7 @@ def decide(jobs, arts, rows, chain, run, head, scope):
     if artifact:
         job = journal.original_job(jobs, run, head, n, f"Compile or verify authenticated APK slot {n}")
         journal.checked_artifact(artifact, run, head, job, "Upload the encrypted APK bundle",
-                                 lambda aid: json.loads(recover.get(f"actions/artifacts/{aid}")))
+                                 lambda aid: actions.metadata(f"actions/artifacts/{aid}"))
         require(not terminal or outcome["cipher_id"] in ("", str(artifact["id"])), "Different accepted Artifact ID")
         if artifact["expired"] or journal.timestamp(artifact["expires_at"]) <= datetime.now(timezone.utc).timestamp():
             artifact = None
@@ -178,7 +197,7 @@ def decide(jobs, arts, rows, chain, run, head, scope):
     return n, parent, outcome if terminal else {}, artifact, private
 
 
-def private_depositor(record, row, jobs, run, head, n):
+def private_depositor(record, row, jobs, run, head, n, actions=ActionsGET):
     depositor = record["depositor_run"]
     require(type(depositor) is int and depositor > 0, "No physical private depositor")
     if depositor == run:
@@ -186,8 +205,8 @@ def private_depositor(record, row, jobs, run, head, n):
         require(job is not None, "No original private terminal handoff")
     else:
         base=f"actions/runs/{depositor}/attempts/1"
-        physical_run(json.loads(recover.get(base)),depositor,head)
-        rescue = [j for j in recover.inventory(base+"/jobs", "jobs")
+        physical_run(actions.metadata(base),depositor,head)
+        rescue = [j for j in actions.inventory(base+"/jobs", "jobs")
                   if j["name"] == "Transfer the original cached ciphertext to its registered owner" and
                   j["status"] == "completed" and j["run_attempt"] == 1 and j["run_id"] == depositor and
                   j["head_sha"] == head]
@@ -198,18 +217,21 @@ def private_depositor(record, row, jobs, run, head, n):
     recover.same_time_as_upload(row,job,DRAFT_STEP)
 
 
-def collect(locator, directory, api):
-    api = PagedOwnerDraft(api)
-    rows = api.draft(RELEASE_ID)["assets"]
+def collect(locator, directory, api, *, actions=ActionsGET, draft_rows=None):
+    if draft_rows is None:
+        api = PagedOwnerDraft(api)
+        rows = api.draft(RELEASE_ID)["assets"]
+    else:
+        rows = draft_rows(locator)
     origin, run, claim_id, scope = bind(api, rows, locator)
     head = locator["head"]
     base = f"actions/runs/{run}/attempts/1"
-    physical_run(json.loads(recover.get(base)), run, head)
-    jobs = recover.inventory(base+"/jobs", "jobs")
-    arts = recover.inventory(f"actions/runs/{run}/artifacts", "artifacts")
+    physical_run(actions.metadata(base), run, head)
+    jobs = actions.inventory(base+"/jobs", "jobs")
+    arts = actions.inventory(f"actions/runs/{run}/artifacts", "artifacts")
     chain = recover.slot_chain(jobs, arts, run, head,
-            lambda aid: json.loads(recover.get(f"actions/artifacts/{aid}")), recover.download_note, scope, terminal_salvage=True)
-    n, parent, receipt, artifact, private = decide(jobs, arts, rows, chain, run, head, scope)
+            lambda aid: actions.metadata(f"actions/artifacts/{aid}"), actions.note, scope, terminal_salvage=True)
+    n, parent, receipt, artifact, private = decide(jobs, arts, rows, chain, run, head, scope, actions)
     binding = dict(run=run, ordinal=n, head=head, parent=parent)
     directory.mkdir(exist_ok=True, mode=0o700)
     with tempfile.TemporaryDirectory(dir=directory) as temp:
@@ -219,7 +241,7 @@ def collect(locator, directory, api):
         locations = {}
         if private:
             record = private_document(api, private)
-            private_depositor(record,private,jobs,run,head,n)
+            private_depositor(record,private,jobs,run,head,n,actions)
             seal = apk_seal.validate(record["seal"], **binding)
             key = f"bare-coexist-204-apk-v1-{run}-1-s{n}"
             require(record["schema"] == "bare-r28-private-apk-v1" and record["collection_claim_id"] == claim_id and
@@ -237,8 +259,7 @@ def collect(locator, directory, api):
         if artifact:
             outer = temp/"terminal.zip"
             with outer.open("xb") as target:
-                subprocess.run(["gh", "api", "--method", "GET", f"repos/{REPO}/actions/artifacts/{artifact['id']}/zip"],
-                               stdout=target, check=True, timeout=900)
+                actions.copy_artifact(artifact,target)
             second = temp/"artifact.age"
             note = unwrap(outer, artifact, second, **binding)
             require(seal is None or seal == note, "Durable terminal sources disagree")
@@ -340,6 +361,7 @@ def main():
     src = sub.add_parser("collect")
     src.add_argument("locator", type=Path)
     src.add_argument("directory", type=Path)
+    src.add_argument("--owner-snapshot", type=Path, help="Trusted signed-in owner capture directory")
     clear = sub.add_parser("clear")
     for name in ("tar", "pickup", "directory", "aapt2", "apksigner_jar"):
         clear.add_argument(name, type=Path)
@@ -351,9 +373,15 @@ def main():
     if args.operation == "collect":
         sys.path.insert(0, str(Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)))
         import transfer
-        from recover_private import read_only
-        transfer.request = read_only(transfer.request)
-        result = collect(json.loads(args.locator.read_bytes()), args.directory, transfer)
+        locator = json.loads(args.locator.read_bytes())
+        if args.owner_snapshot:
+            from owner_snapshot import OwnerSnapshot
+            captured = OwnerSnapshot(args.owner_snapshot, transfer)
+            result = collect(locator,args.directory,captured,actions=captured,draft_rows=captured.draft_rows)
+        else:
+            from recover_private import read_only
+            transfer.request = read_only(transfer.request)
+            result = collect(locator, args.directory, transfer)
     elif args.operation == "clear":
         result = clear_bundle(args.tar,json.loads(args.pickup.read_bytes()),args.directory,args.aapt2,args.apksigner_jar)
     else:

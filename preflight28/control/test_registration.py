@@ -176,7 +176,7 @@ class TicketTests(unittest.TestCase):
         created = instant(self.d.origin["created_at"])
         expiry = instant(self.d.ticket["expires_at"])
         latest, _ = checked_ack(self.d,self.d.draft(RELEASE_ID),self.d.ticket,created,created)
-        self.assertEqual(int(expiry.timestamp())-latest,(350+25+35+7)*60+2*3600+900)
+        self.assertEqual(int(expiry.timestamp())-latest,(350+25+45+7)*60+2*3600+900)
 
     @patch("registration.admit")
     def test_ticket_not_prepared_earlier_or_wrong_actor_or_expired(self, claim):

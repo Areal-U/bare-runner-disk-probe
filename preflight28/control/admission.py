@@ -49,10 +49,12 @@ class PagedOwnerDraft:
         return {**release, "assets": assets}
 
 
-def claim_info(helper, payload, name):
+def claim_info(helper, payload, name, *, before_write=False):
     release = helper.draft(RELEASE_ID)
     names = [a for a in release["assets"] if a["name"] == name]
     if not names:
+        if before_write:
+            require(len(release["assets"]) < 1000, "Private Release has no remaining asset slot")
         return None
     digest = hashlib.sha256(payload).hexdigest()
     asset = helper.asset_info(release, name, len(payload), digest)
@@ -65,7 +67,7 @@ def claim_info(helper, payload, name):
 def admit(mode, holder, helper, pause=time.sleep, *, name):
     require(re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,125}\.json", name), "Invalid claim name")
     payload = encode(holder)
-    found = claim_info(helper, payload, name)
+    found = claim_info(helper, payload, name, before_write=(mode == "compute"))
     if found:
         return found
     require(mode == "compute", "No first-attempt receipt to recover")

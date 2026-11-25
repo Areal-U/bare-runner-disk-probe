@@ -1,5 +1,6 @@
-"""Verify both observed URLs against the actual staged release helper and immutable historical claims."""
+"""Exercise private release alias matching with synthetic tag names and the original claim bytes."""
 import contextlib
+import hashlib
 import importlib.util
 import os
 from pathlib import Path
@@ -11,8 +12,8 @@ from unittest.mock import patch
 
 
 ROOT=Path(__file__).resolve().parents[2]
-OLD="untagged-4e46aa84296f036ef72f"
-NEW="untagged-03bbaa7687da7bb37da9"
+OLD="test-original-release-alias"
+NEW="test-rotated-release-alias"
 
 
 def load(name,path):
@@ -31,6 +32,8 @@ class AliasTests(unittest.TestCase):
         self.anchor=load("r28_verified_draft",work/"r28_verified_draft.py")
         self.stack.enter_context(patch.dict(sys.modules,r28_verified_draft=self.anchor))
         self.helper=load("transfer",work/"transfer.py")
+        self.stack.enter_context(patch.object(self.helper,"DRAFT_TAG_SHA256",hashlib.sha256(OLD.encode()).hexdigest()))
+        self.stack.enter_context(patch.object(self.anchor,"TAG_SHA",hashlib.sha256(NEW.encode()).hexdigest()))
         h=self.helper
         self.claim_bytes={ident:(Path(__file__).with_name("fixtures")/f"claim-{ident}.json").read_bytes()
                           for _,ident,_,_ in self.anchor.CLAIMS}
@@ -51,7 +54,7 @@ class AliasTests(unittest.TestCase):
     def url(self,tag):
         self.release.update(tag_name=tag,html_url="https://github.com/"+self.helper.REPO+"/releases/tag/"+tag)
 
-    def test_both_observed_aliases_original_private_anchors_and_exact_bytes(self):
+    def test_both_aliases_require_original_private_anchors_and_exact_bytes(self):
         self.url(OLD);self.lookup();self.get.assert_not_called()
         self.url(NEW);self.lookup();self.assertEqual(self.get.call_count,2)
         self.release["tag_name"]="";self.lookup();self.assertEqual(self.get.call_count,2)

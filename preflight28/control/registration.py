@@ -49,7 +49,7 @@ def checked_ack(helper, release, ticket, created, now):
     period, retry = ack.get("poll_seconds"), ack.get("pickup_retry_seconds")
     require(type(period) is int and period>0 and type(retry) is int and retry>0,
             "Pickup cadence and retry window must be measured and declared by the collector")
-    latest = min(instant(ack["valid_until"]),instant(ticket["expires_at"])) - timedelta(seconds=(350+25+35+7)*60+2*period+retry)
+    latest = min(instant(ack["valid_until"]),instant(ticket["expires_at"])) - timedelta(seconds=(350+25+45+7)*60+2*period+retry)
     require(instant(ack["observed_at"]) <= created <= now <= latest,
             "Collector lease does not cover this segment and pickup")
     return int(latest.timestamp()), ack

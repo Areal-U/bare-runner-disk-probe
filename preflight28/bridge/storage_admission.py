@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +54,21 @@ def policy(ticket, ack):
     return ceiling, int(datetime.fromisoformat(expiry[:-1]+"+00:00").timestamp())
 
 
+def private_witness_policy(api, release, ticket, origin_created):
+    """Read the original authenticated storage grant after a cache-only rescue.
+
+    The caller has already verified the exact owner-issued original or replacement
+    ticket from its immutable claim. The original grant was for this specific
+    physical run. Eligibility for a *new* retained ZIP is checked at upload.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "control"))
+    import registration
+
+    created = registration.instant(origin_created)
+    _, ack = registration.checked_ack(api, release, ticket, created, created)
+    return policy(ticket, ack)
+
+
 def config(env):
     def number(key):
         value = env.get(key, "")
@@ -72,10 +88,14 @@ def lease_size(env):
 
 
 def draft_room(release, env, *, claim):
-    # Normal publication consists of intent, up to two parts, and manifest;
-    # each may use one alternate name only for a confirmed empty starter.
+    # Checkpoint and terminal are mutually exclusive. The checkpoint's intent,
+    # up to two parts and manifest can each leave one alternate-name starter
+    # (8 total). The terminal's cipher and receipt can similarly occupy 4 slots;
+    # its immutable private witness needs one more (5 total). The initial claim
+    # and claim witness each use one canonical name without a starter retry.
     count = len(release["assets"])
-    extra = (0 if lease_size(env) != MAX_RELAY_ZIP else 8) + int(claim)
+    product_slots = 8 if lease_size(env) == MAX_RELAY_ZIP else 0
+    extra = product_slots + (2 if claim else 0)
     require(count + extra <= 1000, "Insufficient private Release asset slots")
 
 
@@ -133,7 +153,7 @@ def admit(get, env, size, days, *, stage, now=None, lead=0, exact_name=None):
     guarantee_days = max(days, JOURNAL_DAYS) if stage == "lease" else days
     # Include the remaining upload step(s) after the fresh gate. The slot
     # journal rechecks its own timestamp immediately before its 7-minute job ends.
-    dispatch_margin = {"lease":JOURNAL_TAIL, "peer":6*60, "control":10*60, "terminal":10*60, "outcome":7*60}[stage]
+    dispatch_margin = {"lease":JOURNAL_TAIL, "peer":6*60, "control":10*60, "terminal":10*60, "witness":10*60, "outcome":7*60}[stage]
     require(until >= now + lead + dispatch_margin + guarantee_days * DAY, "Storage policy expires before retained bytes")
     public_host(get(BASE), env.get("RUNNER_ENVIRONMENT"))
     # Every normal workflow uses ubuntu-24.04 literally. All numbered slots
@@ -157,6 +177,14 @@ def admit(get, env, size, days, *, stage, now=None, lead=0, exact_name=None):
     if projected > ceiling:
         raise StorageFull("Candidate exceeds configured repository Artifact storage ceiling")
     return "admitted"
+
+
+def admit_witness(get, env, file, *, now=None):
+    require(file.name == "witness.json" and file.is_file() and not file.is_symlink() and
+            0 < file.stat().st_size <= 8*1024, "Invalid or oversized owner witness")
+    # One stored ZIP member; the receiver independently enforces the same outer
+    # and inner limits. A denied witness does not invalidate a private deposit.
+    return admit(get, env, 16*1024, JOURNAL_DAYS, stage="witness", now=now)
 
 
 def cache_fallback(get, env, encrypted):
@@ -203,10 +231,14 @@ def main():
     import argparse
     import bridge
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("terminal","lease","control","cache","peer"))
+    parser.add_argument("stage", choices=("terminal","lease","control","cache","peer","witness"))
     parser.add_argument("--terminal-bytes", type=int)
     parser.add_argument("--file", type=Path, action="append")
     args = parser.parse_args()
+    if args.stage == "witness":
+        require(args.file is not None and len(args.file) == 1, "One owner witness file required")
+        admit_witness(bridge.api_json, os.environ, args.file[0])
+        return
     if args.stage == "cache":
         cache_fallback(bridge.api_json, os.environ, args.terminal_bytes)
         return
