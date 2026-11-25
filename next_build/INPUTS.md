@@ -65,3 +65,24 @@ python3 next_build/test_render_inputs.py verify-preview "$new_preview_directory"
 `rendered/` が通常producer・同居GN生成・回収APK検査の版依存設定を置換したコピー、`product-assertions.patch` が元のCIコミットへの差分、`args.gn` が同居版の実入力。元の検査行の欠落・重複や異なるChromium指定は出力前に拒否する。完了時の `review.json` は元/先のGitオブジェクト、差分ファイル、未解決の受入条件を記録する。再現試験のcollector検査は公式CRXの実バイトと小さなELFヘッダを使い、aapt2の版名・版コード出力だけを固定した対照。公式APKの署名検査を通したことにはならない。
 
 同じ版の生成は差分0バイト。異なる版で生成した部分差分は新キャンペーン側のソース検査向けレビュー材料で、稼働中のR28の回収を担当するコードに適用しない。新しい版のBUILD.gnまたはOS依存インストーラーが変わった場合は実Gitオブジェクトを示して止める。輸送ファイル名やR28のbranch/claim/回収の名前を一括置換せず、別キャンペーンの承認後に対象の宛先とともに拘束する。どの場合も `dispatch_ready` はfalse。
+
+### 同じ2.0.4、固定R27 S2から新案件を準備する場合
+
+```sh
+python3 next_build/render_campaign.py "$prior_private_locator" "$new_preview_directory" \
+  --ci-head "$reviewed_next_source_sha" --campaign "$unused_campaign_name"
+```
+
+担当が以前の登録時に保管したR28の本人専用locatorを使う。生成先はcheckout外の新しいディレクトリ。元SHA・distinguished owner ticket digestだけを新しいコードへ固定し、秘匿の宛先ID・登録ID・鍵を出力しない。元owner発行のticketを固定Draftから読み戻し、新ticketの宛先が同じ、登録ID・nonce・HEADが新しい、古いClaimを照会しないことを通常入口で検査する。`registration-forms.unissued.json` は未発行の構造見本。未定項目はnullで、本人の予約や回収登録を表さない。新しい名前が未使用かは実際のowner台帳・Draftで後日確認する。
+
+| いつ・誰が | 使う実装と条件 |
+|---|---|
+| **反映候補を作る担当** | 実際の新しいcampaignを一件選び、`campaign.patch` を隔離テストcheckoutに適用する。通常の `registration.CAMPAIGN` と checkpoint救済 `owner_recovery.collection_claim` の原claim・例外claimを新名前に固定する。元R28のGit SHA・元登録・元回収は保持。過去のproducerを再計算する許可は付与しない。実際の第28回停止はこの文書のgraph_stop判定・静止/梱包前の修正を前提に扱う。 |
+| **同じ担当と本人向け回収担当** | 原版の `production.bind`・`owner_snapshot`・`owner_witness`・`terminal_draft`・`loss_resume` は選択したSHAのregistrationからcampaignを派生。これらをそのSHAで一緒に読み込む。実runごとの暗号文、途中成果、Artifact、witnessはrun ID/attempt/slot固有。schemaやR28という接頭辞だけを理由に改名しない。R28の旧branchでの手動再実行や回収は必ず元の実コミットと元の登録を使う。新campの例外入口に古いorigin/ticketを渡さない。 |
+| **本番反映が別途認められた後、起動前の成果担当** | 反映後のbranch HEAD・固定S2 key/SHA/identity・公開受取鍵・本人宛先と信頼済み証明書・既存結果・二重起動なし・無料条件を再照合。先行する同じ宛先の署名／掲載／回収が未解決なら新たな受取を登録しない。新APKを作る必要があっても旧claimを外したり削除したりしない。 |
+| **登録を担当する本人向け回収担当** | 同じ宛先と正しい現在versionを本人用経路から実読。対象を限定した新登録ID・新nonce、応答と有効期限、回収間隔・再試行秒、実確定した料金条件／容量／期限、最終のSHAをフォームに結び付ける。新campaignのACK保存とversion付き読戻しを行い、成果担当がその実ID／SHAで新ticketを発行し再取得する。新しいlocatorには同一宛先・新登録ID・新SHA・新ticket SHAを記録。別の試験値・今の空欄を流用しない。 |
+| **別途の本番開始後** | 従来の通常12区間入口でのみ新規計算runを受付、専用名のclaimに初回run/attemptを1回だけ確定。APK救済・紛失例外・回収は新しいclaim/台帳へだけ結ぶ。元run照合には元のSHAを使う。旧runの記録を新しいrunの入力に読み替えない。 |
+
+**本番枝を切り替える前の境界**　旧runの手動再実行は元SHAの回収専用、回収担当の私的GET・署名は元の固定checkoutと元locatorを使える。一方、元キャンペーンの新規dispatchで行う `recover-encrypted-apk`／`recover-lost-slot` は特定branchと元HEADをコード上で照合する。新HEADに進めた枝へ旧originを渡すと拒否され、過去コミットのファイルを手元に持つだけでは復旧dispatchを代行できない。旧キャンペーンにこの経路の必要が残れば、切替前にその復旧を完了するか、旧権利を維持する別の正式対応が必要である。今回の実graph-stopは保存経路の前で止まったので、その通知自体は失われた生成物を救済する根拠ではない。
+
+同じ公開鍵でも異なる宛先IDは拒否。本人側の実効アクセス・最終署名証明書・回収期限は既存登録/引渡し系で個別確認する。入力親がR27 S2から変わる場合は実際のmanifest、生成者と検証済み依存状態、限定URL／復元と初回leaseを別途拘束する。上流版が変わる場合は同版専用rendererを使用しない。

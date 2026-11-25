@@ -4,8 +4,16 @@
 build_trial.py
 preflight28/bridge/test_arm_archive.py
 preflight28/bridge/test_normal.py
+preflight28/bridge/test_runtime_payload.py
+preflight28/bridge/verify_payload.py
 preflight28/control/registration.py
 preflight28/control/test_registration.py
+preflight28/graph/android_outputs.py
+preflight28/graph/graph.py
+preflight28/graph/retained.py
+preflight28/graph/segment_graph.py
+preflight28/graph/test_runtime_restat.py
+preflight28/graph/test_segment_graph.py
 preflight28/limits/test_quiescence.py
 preflight28/transport/pack_draft.py
 preflight28/transport/stream.py
