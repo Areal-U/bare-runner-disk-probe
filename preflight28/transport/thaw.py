@@ -161,13 +161,8 @@ def open_source():
 
 def checked_report():
     path=report_path()
-    row=json.loads(small(path,128*MIB))
-    need(row.get("schema",row.get("format"))=="bare-r28-archive-continuity-v3" and row.get("status")=="passed"
-         and row["parent_sha"]==b.PARENT_SHA and row["child_sha"]==REC["sha256"]
-         and row["counts"]["unclassified"]==0 and row["counts"]["removed"]==0
-         and {d["path"] for d in row["diagnostics"]}=={"gn_logs.txt"}
-         and b.sha(row["child_content"]["sha256"]),"Retrospective audit has not passed for the exact original pair")
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    import thaw_claim
+    return thaw_claim.passed_audit(path)
 
 
 def audit():

@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 import thaw_claim as t
 from test_recovery_claim import GitHub, OWNER, REPO, context, run as base_run
 
-RID=t.ROTATED_RUN+100
+RID=t.AUDITED_RUN+100
 WHEAD="6"*40
 WHEN=datetime(2026,11,25,0,35,tzinfo=timezone.utc)
 
@@ -63,6 +63,24 @@ class Service(GitHub):
         super().__init__()
         self.add(t.v2.CLAIM,t.a.encode(t.v2_holder()),t.CLAIM_ID)
         self.add(t.PREVIOUS_CLAIM,t.a.encode(t.previous_holder()),t.ROTATED_CLAIM_ID)
+        stop=t.HISTORY[-1]
+        self.add(stop.claim_name,t.a.encode(t.next_holder(stop.run,stop.head,stop.before,t.HISTORY[0],4)),stop.claim_id)
+        self.audited=accepted_history()
+        for job,(ident,name) in zip(self.audited,((t.AUDITED_RECOVER,self.audited[0]["name"]),
+                    (t.AUDITED_RECEIVE,self.audited[1]["name"]),(t.AUDITED_ISSUE,self.audited[2]["name"]))):
+            job.update(run_id=stop.run,id=ident,name=name)
+        steps=self.audited[0]["steps"]
+        for i in (6,7,8):
+            steps[i]["conclusion"]="success"
+        steps[10]["conclusion"]="failure"
+        steps[11:11]=[dict(name=n,conclusion="success",status="completed") for n in
+                    ("Preserve a bounded failed continuity report encrypted to the original disposable test recipient",
+                     "Deposit failed-audit for this exact recovery")]
+        for i,step in enumerate(steps,1):step["number"]=i
+        self.audit_arts=[dict(id=artifact.ident,name=f"r28-thaw-{stop.run}-{artifact.stage}",size_in_bytes=artifact.size,
+                         digest="sha256:"+artifact.digest,workflow_run=dict(id=stop.run,head_sha=stop.head,
+                         head_branch=t.a.BRANCH,repository_id=t.a.REPO_ID,head_repository_id=t.a.REPO_ID))
+                        for artifact in stop.artifacts]
         self.rotated=accepted_history()
         self.challenges=[dict(id=t.ROTATED_CHALLENGE,name=f"r28-thaw-{t.ROTATED_RUN}-request",size_in_bytes=t.CHALLENGE_SIZE,
              digest="sha256:"+t.CHALLENGE_SHA,workflow_run=dict(id=t.ROTATED_RUN,head_sha=t.ROTATED_HEAD,head_branch=t.a.BRANCH,
@@ -83,6 +101,11 @@ class Service(GitHub):
         route=urlsplit(url).path.removeprefix(self.BASE)
         if route.startswith("/actions/runs/"):
             rid=int(route.split("/")[3])
+            if rid==t.AUDITED_RUN:
+                if route.endswith("/jobs"): return dict(total_count=len(self.audited),jobs=self.audited)
+                if route.endswith("/artifacts"): return dict(total_count=len(self.audit_arts),artifacts=self.audit_arts)
+                return {**base_run(rid),"run_attempt":1,"head_sha":t.AUDITED_HEAD,"path":t.WORKFLOW,
+                        "status":"completed","conclusion":"failure"}
             if rid==t.ROTATED_RUN:
                 if route.endswith("/jobs"): return dict(total_count=len(self.rotated),jobs=self.rotated)
                 if route.endswith("/artifacts"): return dict(total_count=len(self.challenges),artifacts=self.challenges)
@@ -120,15 +143,29 @@ def apply(h,mode="reserve",rid=RID,attempt=1,role=None,audit=None,now=WHEN):
 
 
 def report():
+    def ident(i):return "f:0:123:"+hashlib.sha256(str(i).encode()).hexdigest()
+    def metric(name,i):
+        return {"name":name,"version":"1.6.5","producer_revision":"b521b230cb7c56c821235e498285cf8e548a73ee",
+                "schema":"siso.StepMetric.jsonl","graph_references":0,"diagnostic_query":"unknown target",
+                "mode":0o644,"size":123,"sha256":ident(i).rsplit(":",1)[-1],"step_rows":1,"summary_rows":0,"error_steps":0}
+    def regen(name):
+        return {"path":"build.ninja.d","target":"build.ninja.stamp","role":"regeneration-input","references":1,
+             "generator":"gn","token":name,"gn_revision":"0035961837fbcfe875d855744b3eda4fd2eefb43","sha256":"c"*64}
+    metrics=[{"path":name,"parent":ident(i),"child":ident(i-3),"evidence":{"parent":metric(name,i),"child":metric(name,i-3)}}
+             for i,name in enumerate(t.METRIC_PATHS)]
+    diffs=[{"path":name,"classification":"added","parent":None,"child":f"f:0:{size}:"+("3"*64),
+            "role":"gn-generated-packaging-descriptor","regeneration_dependency":regen(name)} for name,size in t.ADDED_OUTPUTS.items()]
     e={"chromium":"800628ad1ca1fd0c51e3b43b5b2bca081e81c3f6","build_gn_sha256":"31f8205fe64264c5b4f9638eb6552e558ccf78a4839413a7c1a194116f26e72e",
+       "regeneration_dependency":regen("gn_logs.txt"),
        "target":"chrome_public_apk","diagnostic_query":"unknown target","graph_references":0,"aliases":0,
        "manifest_content":{"files":101,"sha256":"f"*64},"sections":{"<header>":{}}}
-    return {"schema":"bare-r28-archive-continuity-v3","status":"passed","parent_sha":t.a.S2_SHA,"child_sha":t.CHILD,
-            "parent_content":{"files":195432,"sha256":"a"*64},"child_content":{"files":195433,"sha256":"b"*64},
-            "counts":{"added":1,"removed":0,"unclassified":0,"gn_diagnostic":1},
+    return {**t.COMMITMENTS,"schema":"bare-r28-archive-continuity-v4","status":"passed","issues":[],
+            "parent_sha":t.a.S2_SHA,"child_sha":t.CHILD,"new_files":3,"metrics":metrics,
+            "metric_rotation":{"steps":3,"matched":8,"bounded_files":11},
+            "counts":{"unchanged":252012,"added":3,"completed_replacement":0,"removed":0,"unclassified":0,"gn_diagnostic":1,"siso_metrics":11},
             "diagnostics":[dict(path="gn_logs.txt",producer="//BUILD.gn:1662-1672",parent="f:0:50:aaa",
                                 child="f:0:51:bbb",evidence={"parent":dict(e),
-                                "child":dict(e),"changed_sections":["timing"]})],"differences":[]}
+                                "child":dict(e),"changed_sections":["timing"]})],"differences":diffs}
 
 
 class Tests(unittest.TestCase):
@@ -199,18 +236,62 @@ class Tests(unittest.TestCase):
         self.assertNotEqual(cid,t.ROTATED_CLAIM_ID)
         self.assertEqual(h.posts,1)
 
+    def test_audit_failure_cannot_be_substituted_or_treated_as_publication(self):
+        stop=t.HISTORY[-1]
+        for change in ("old claim","old id","source head","wrong stopped stage","original open skipped",
+                       "claimed authorize","claimed publish","missing rejected evidence","foreign recipient",
+                       "another digest","unlisted artifact","unknown v3 intent"):
+            h=Service()
+            if change=="old claim":h.files[stop.claim_id]=b"another claim"
+            if change=="old id":h.rows[stop.claim_name]["id"]+=1;h.files[stop.claim_id+1]=h.files[stop.claim_id]
+            if change=="source head":h.audit_arts[0]["workflow_run"]["head_sha"]="7"*40
+            if change=="wrong stopped stage":h.audited[0]["steps"][10]["conclusion"]="success"
+            if change=="original open skipped":h.audited[0]["steps"][8]["conclusion"]="skipped"
+            if change=="claimed authorize":h.audited[0]["steps"][-2]["conclusion"]="success"
+            if change=="claimed publish":h.audited[0]["steps"][-1]["conclusion"]="success"
+            if change=="missing rejected evidence":h.audit_arts.pop()
+            if change=="foreign recipient":h.audit_arts[1]["name"]="another-name"
+            if change=="another digest":h.audit_arts[1]["digest"]="sha256:"+"0"*64
+            if change=="unlisted artifact":h.audit_arts.append(dict(h.audit_arts[0],id=90))
+            if change=="unknown v3 intent":h.add(t.CAMPAIGN+"-unexpected",b"x",53)
+            with self.subTest(change=change),self.assertRaises((ValueError,KeyError)):apply(h)
+            self.assertEqual(h.posts,0)
+        h=Service()
+        expected=[(entry.claim_id,h.files[entry.claim_id]) for entry in t.HISTORY]
+        self.assertEqual(apply(h),(810,0));self.assertEqual(apply(h),(810,0))
+        self.assertEqual(h.posts,1)
+        self.assertEqual([len(raw) for _,raw in expected],[1125,1550])
+        self.assertEqual([hashlib.sha256(raw).hexdigest() for _,raw in expected],[r.claim_sha for r in t.HISTORY])
+        for ident,raw in expected:self.assertEqual(h.files[ident],raw)
+        new=json.loads(h.files[810]);self.assertEqual(new["supersedes_claim_id"],stop.claim_id)
+        self.assertEqual(new["supersedes_claim_sha256"],stop.claim_sha)
+        self.assertEqual(new["supersedes_outcome"],stop.outcome)
+        self.assertEqual(new["supersedes_artifacts"][1]["id"],14980236546)
+
     def test_bad_audit_cannot_authorize(self):
         h=Service();apply(h)
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/"result"
-            for kind in ("missing","failed","another-child","loss","wrong-diagnostic"):
+            for kind in ("missing","failed","another-child","loss","wrong-diagnostic","old-schema","changed-commitment",
+                         "unresolved","regen-as-compile-input","short-rotation","misordered-bytes","untyped","metric_alias","descriptor_role","descriptor_hash","wrong_guest_object"):
                 r=report()
                 if kind=="failed":r["status"]="rejected"
                 if kind=="another-child":r["child_sha"]="f"*64
                 if kind=="loss":r["counts"]["unclassified"]=1
                 if kind=="wrong-diagnostic":r["diagnostics"][0]["path"]="subdir/gn_logs.txt"
+                if kind=="old-schema":r["schema"]="bare-r28-archive-continuity-v3"
+                if kind=="changed-commitment":r["child_content"]={**r["child_content"],"files":252026}
+                if kind=="unresolved":r["issues"]=["unverified"]
+                if kind=="regen-as-compile-input":r["diagnostics"][0]["evidence"]["parent"]["regeneration_dependency"]["role"]="compile-input"
+                if kind=="short-rotation":r["metric_rotation"]["matched"]=7
+                if kind=="misordered-bytes":r["metrics"][-1]["child"]=r["metrics"][-2]["child"]
+                if kind=="untyped":r["metrics"][3]["evidence"]["child"]={}
+                if kind=="metric_alias":r["metrics"][0]["path"]="obj/siso_metrics.json"
+                if kind=="descriptor_role":r["differences"][0]["regeneration_dependency"]["role"]="compiler input"
+                if kind=="descriptor_hash":r["differences"][1]["regeneration_dependency"]["sha256"]="a"*64
+                if kind=="wrong_guest_object":r["differences"][2]["path"]="obj/not_required.o"
                 if kind!="missing":path.write_text(json.dumps(r))
-                with self.subTest(kind=kind),self.assertRaises((ValueError,FileNotFoundError)):
+                with self.subTest(kind=kind),self.assertRaises((ValueError,FileNotFoundError,KeyError)):
                     apply(h,"authorize",audit=path)
             self.assertEqual(h.posts,1)
 

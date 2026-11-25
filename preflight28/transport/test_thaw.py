@@ -129,9 +129,12 @@ class ThawTest(unittest.TestCase):
         (self.cipher/"cipher-receipt.json").write_bytes(raw(self.rec))
 
     def audited(self):
-        report={"schema":"bare-r28-archive-continuity-v3","status":"passed","parent_sha":t.b.PARENT_SHA,
-            "child_sha":self.rec["sha256"],"counts":{"unclassified":0,"removed":0},
-            "child_content":{"files":2,"sha256":"2"*64},"diagnostics":[{"path":"gn_logs.txt"}]}
+        import thaw_claim
+        from test_thaw_claim import report as full_report
+        check=patch.object(thaw_claim,"CHILD",self.rec["sha256"])
+        check.start()
+        self.addCleanup(check.stop)
+        report=full_report()
         t.report_path().write_bytes(raw(report))
         t.stamp("r28-thaw-audited.json",{**t.physical(),"report_sha256":t.checked_report()})
 
@@ -173,7 +176,7 @@ class ThawTest(unittest.TestCase):
     def test_failed_audit_refuses_publication(self):
         t.open_source();self.audited()
         p=t.report_path();r=json.loads(p.read_bytes());r["counts"]["unclassified"]=1;p.write_bytes(raw(r))
-        with self.assertRaisesRegex(ValueError,"audit has not passed"):t.publish()
+        with self.assertRaisesRegex(ValueError,"[Uu]nresolved|[Ii]nvalid|[Uu]nexpected"):t.publish()
         self.assertEqual(self.private.writes,0)
 
     def test_conflicting_completed_part_rejected(self):

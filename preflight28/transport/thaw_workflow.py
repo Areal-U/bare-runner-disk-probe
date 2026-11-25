@@ -149,9 +149,10 @@ fi""",3,id="audit_report",**{"if":"${{ failure() }}"}),
             orig.sh("Download and hash every private checkpoint byte without repository credentials",REVERSE+" read",20),
             orig.sh("Independently restore using the exact original code, provenance, and strictly dry APK plan",
                    f'''set -euo pipefail
+observer="$GITHUB_WORKSPACE/preflight28/transport/thaw_observe.py"
 cd "$THAW_SOURCE_TREE"
 test "$(git rev-parse HEAD)" = {HEAD}
-env GITHUB_WORKSPACE="$THAW_SOURCE_TREE" TRIAL_SHA={HEAD} R28_CAMPAIGN=r28-preflight-s2-20261125-v2 python3 preflight28/transport/prepare.py receive''',178)]}
+env GITHUB_WORKSPACE="$THAW_SOURCE_TREE" TRIAL_SHA={HEAD} R28_CAMPAIGN=r28-preflight-s2-20261125-v2 python3 -I "$observer"''',178)]}
     jobs={"recover":recover,"issue":issue,"receive":recv}
     for j in jobs.values():
         assert all(len(s.get("run",""))<21000 for s in j["steps"])

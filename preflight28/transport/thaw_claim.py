@@ -1,5 +1,6 @@
 """Authorize one private transfer of the original already-computed Run 28 S2 child."""
 import argparse
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -34,7 +35,15 @@ ROTATED_CHALLENGE = 14979437645
 CHALLENGE_SHA = "32aa86fcdc869288aeccc651e420393b8d12fb65ed73d737de6af1dce1f34687"
 CHALLENGE_SIZE = 2906
 ROTATED_TRANSCRIPT_SHA = "e4713d82f521e4b30fa8eedc873a458adef3a328ca1129ce564aaf751ba0a9ce"
-CLAIM = CAMPAIGN + "-frozen-s2-after-45519704241.json"
+AUDIT_CLAIM = CAMPAIGN + "-frozen-s2-after-45519704241.json"
+AUDITED_RUN = 45520568170
+AUDITED_RECOVER = 138891044806
+AUDITED_ISSUE = 138894333675
+AUDITED_RECEIVE = 138894334894
+AUDITED_HEAD = "380f7b517eb7f0cff7e15944133e4a3fea43cffa"
+AUDITED_BEFORE = "7f6dc6604a1da1844a7af5738acce3f26593f695"
+AUDITED_CLAIM_ID = 789476019
+CLAIM = CAMPAIGN + f"-frozen-s2-after-{AUDITED_RUN}.json"
 STEM = f"{v2.CAMPAIGN}-run{SOURCE}-a1-seg01-"
 CHILD = "532ca75915583a89e2830d062076e3d7130f1edabbe5c03159ce6b1e3c76c1ba"
 SIZE = 1745316602
@@ -50,6 +59,44 @@ AUDIT_FAIL = "Compare all retained APK payloads from original S2 against the sec
 PRIVATE_SEND = "Verify full ciphertext, authenticated private payload, and put new bounded draft parts"
 
 
+@dataclass(frozen=True)
+class FrozenArtifact:
+    stage: str
+    ident: int
+    size: int
+    digest: str
+
+
+@dataclass(frozen=True)
+class HistoricalStop:
+    outcome: str
+    run: int
+    head: str
+    before: str
+    jobs: tuple
+    claim_name: str
+    claim_id: int
+    claim_size: int
+    claim_sha: str
+    artifacts: tuple
+    transcript_size: int
+    transcript_sha: str
+
+
+HISTORY = (
+    HistoricalStop("owner-response-unopened", ROTATED_RUN, ROTATED_HEAD, ROTATED_BEFORE,
+        (ROTATED_RECOVER,ROTATED_ISSUE,ROTATED_RECEIVE), PREVIOUS_CLAIM,ROTATED_CLAIM_ID,1125,
+        "fc68bc4b80b30dfe115e6bbe2dc205c177416bb5188e5cb44e0056aa88a83eb9",
+        (FrozenArtifact("request",ROTATED_CHALLENGE,CHALLENGE_SIZE,CHALLENGE_SHA),),32333,ROTATED_TRANSCRIPT_SHA),
+    HistoricalStop("opened-continuity-audit-rejected", AUDITED_RUN, AUDITED_HEAD, AUDITED_BEFORE,
+        (AUDITED_RECOVER,AUDITED_ISSUE,AUDITED_RECEIVE), AUDIT_CLAIM,AUDITED_CLAIM_ID,1550,
+        "a5eca017083007e209c52e967093509707c6b9fc2b82bab221ec60a1ec8f9665",
+        (FrozenArtifact("request",14979996609,2906,"835effc0ab17aedba3874a46bb162d8a1d8bfff442fc474d1618b24ab9ad0f43"),
+         FrozenArtifact("a1-failed-audit",14980236546,17383,"725cec32a4677e8c52a69186a612f5aa6389928d8f71e5f05bdc5efa283d1c11")),
+        42111,"9c6b5286153a0e50f5ea0f292255a7bf04f62e12a5775b12f5aa95abc4ab9b26"),
+)
+
+
 def v2_holder():
     previous = v2.old_holder()
     return {**previous, "schema":2, "campaign":v2.CAMPAIGN, "workflow":v2.WORKFLOW, "run_id":SOURCE,
@@ -61,7 +108,7 @@ def v2_holder():
 def check_event(api, env, event, checkout, mode):
     attempt, rid = int(env["GITHUB_RUN_ATTEMPT"]), int(env["GITHUB_RUN_ID"])
     head, before, pr = env["TRIAL_SHA"], env["PRIOR_SHA"], event["pull_request"]
-    require(rid>ROTATED_RUN and attempt>=1 and env["GITHUB_JOB"] == ("issue" if mode=="verify" else "recover") and
+    require(rid>HISTORY[-1].run and attempt>=1 and env["GITHUB_JOB"] == ("issue" if mode=="verify" else "recover") and
             (mode=="verify" or attempt==1) and env["GITHUB_ACTOR"]==env["GITHUB_TRIGGERING_ACTOR"]==v2.OWNER and
             env["GITHUB_REPOSITORY"]==a.REPO and env["GITHUB_EVENT_NAME"]=="pull_request" and
             env["GITHUB_REF"]=="refs/pull/9/merge", "Forbidden transfer attempt, role, or actor")
@@ -76,11 +123,8 @@ def check_event(api, env, event, checkout, mode):
     current=original if attempt==1 else api.metadata(f"{api.BASE}/actions/runs/{rid}/attempts/{attempt}")
     v2.pinned_run(current,rid,head,WORKFLOW,attempt)
     require(current["status"]=="in_progress" and current["conclusion"] is None,"Inactive transfer attempt")
-    prior = previous_holder()
-    return {**base_holder(rid,head,before),"schema":4,"supersedes_run":ROTATED_RUN,
-            "supersedes_claim_id":ROTATED_CLAIM_ID,"supersedes_claim_sha256":hashlib.sha256(a.encode(prior)).hexdigest(),
-            "supersedes_recover_job":ROTATED_RECOVER,"supersedes_challenge_id":ROTATED_CHALLENGE,
-            "supersedes_challenge_sha256":CHALLENGE_SHA,"supersedes_transcript_sha256":ROTATED_TRANSCRIPT_SHA}
+    return next_holder(rid,head,before,HISTORY[-1],5)
+
 
 
 def base_holder(rid, head, before):
@@ -94,6 +138,32 @@ def base_holder(rid, head, before):
 def previous_holder():
     return base_holder(ROTATED_RUN,ROTATED_HEAD,ROTATED_BEFORE)
 
+
+
+def next_holder(rid, head, before, previous, schema):
+    challenge=previous.artifacts[0]
+    holder={**base_holder(rid,head,before),"schema":schema,"supersedes_run":previous.run,
+            "supersedes_claim_id":previous.claim_id,"supersedes_claim_sha256":previous.claim_sha,
+            "supersedes_recover_job":previous.jobs[0],"supersedes_challenge_id":challenge.ident,
+            "supersedes_challenge_sha256":challenge.digest,"supersedes_transcript_sha256":previous.transcript_sha}
+    # Schema 4 was written by the earlier exact executable. Never rewrite these
+    # historical bytes to retrofit a later typed outcome.
+    if schema>=5:
+        holder["supersedes_outcome"]=previous.outcome
+        holder["supersedes_artifacts"]=[{"id":r.ident,"bytes":r.size,"sha256":r.digest,"stage":r.stage}
+                                        for r in previous.artifacts]
+    return holder
+
+
+def held_history(api):
+    previous=None
+    for schema,stop in enumerate(HISTORY,3):
+        holder=(base_holder(stop.run,stop.head,stop.before) if previous is None else
+                next_holder(stop.run,stop.head,stop.before,previous,schema))
+        raw=a.encode(holder)
+        require(len(raw)==stop.claim_size and hashlib.sha256(raw).hexdigest()==stop.claim_sha and
+                a.claim_info(api,raw,stop.claim_name)==stop.claim_id, "A prior accepted reservation has different bytes or ID")
+        previous=stop
 
 
 # Immutable provider transcripts read independently with the existing owner
@@ -141,48 +211,61 @@ def previous_gate(api):
     print(f"prior_unclaimed_gate={FAILED_GATE} prior_publication=skipped prior_artifacts=0")
 
 
-def previous_accepted(api):
-    root=f"{api.BASE}/actions/runs/{ROTATED_RUN}"
+def previous_accepted(api, stop):
+    root=f"{api.BASE}/actions/runs/{stop.run}"
     run=api.metadata(root)
-    v2.pinned_run(run,ROTATED_RUN,ROTATED_HEAD,WORKFLOW)
+    v2.pinned_run(run,stop.run,stop.head,WORKFLOW)
     require(run["status"]=="completed" and run["conclusion"]=="failure","Prior accepted recovery is still active or changed")
     page=api.metadata(root+"/attempts/1/jobs?per_page=100")
     jobs={j["id"]:j for j in page["jobs"]}
-    expected={ROTATED_RECOVER:("Recover original sealed candidate and audit before immutable private publication","failure"),
-              ROTATED_RECEIVE:("Ordinary runner reads and verifies the private generation from the original recipe","skipped"),
-              ROTATED_ISSUE:("Grant only a short-lived read of original private checkpoint parts","skipped")}
+    recover,issue,receive=stop.jobs
+    expected={recover:("Recover original sealed candidate and audit before immutable private publication","failure"),
+              receive:("Ordinary runner reads and verifies the private generation from the original recipe","skipped"),
+              issue:("Grant only a short-lived read of original private checkpoint parts","skipped")}
     require(set(jobs)==set(expected) and page["total_count"]==len(page["jobs"])==3 and
-            all(j["status"]=="completed" and j["run_id"]==ROTATED_RUN and
+            all(j["status"]=="completed" and j["run_id"]==stop.run and
                 (j["name"],j["conclusion"])==expected[jid] for jid,j in jobs.items()),"Prior downstream recovery changed")
-    steps=jobs[ROTATED_RECOVER]["steps"]
+    steps=jobs[recover]["steps"]
     by_name={s["name"]:s for s in steps if s["status"]=="completed"}
-    fail="Locate the owner-encrypted response in the existing private Draft"
+    lookup="Locate the owner-encrypted response in the existing private Draft"
+    unlock="Open disposable owner authorisation on this one recovery host"
+    opened="Open original authenticated frames and verify the original producer evidence"
+    reuse="Recover already committed identical private bytes without any new key exchange"
+    audit="Compare every original S2 payload and audit the GN diagnostic in the actual graphs"
+    authorize="Authorize only the fixed original archive using the complete accepted audit"
+    publish="Reconcile original data and publish the original immutable generation"
     before=("Confirm failed prior acceptance, exact surviving artifacts and new single recovery claim",
             "Create recipient for the existing test owner and bind the current recovery job","Deposit request for this exact recovery",
             "Read verified original original-key Artifact by immutable ID","Read verified original original-cipher Artifact by immutable ID",
             "Read original S2 for exact archive comparison")
-    after=("Open disposable owner authorisation on this one recovery host",
-           "Open original authenticated frames and verify the original producer evidence",
-           "Recover already committed identical private bytes without any new key exchange",
-           "Compare every original S2 payload and audit the GN diagnostic in the actual graphs",
-           "Authorize only the fixed original archive using the complete accepted audit",
-           "Reconcile original data and publish the original immutable generation")
-    require(len(by_name)==len(steps) and {k for k,s in by_name.items() if s["conclusion"]=="failure"}=={fail} and
-            all(by_name[k]["conclusion"]=="success" and by_name[k]["number"]<by_name[fail]["number"] for k in before)
-            and all(by_name[k]["conclusion"]=="skipped" and by_name[k]["number"]>by_name[fail]["number"] for k in after),
-            "Prior accepted recovery did not stop strictly before open, audit and publication")
-    artifacts=api.metadata(root+"/artifacts?per_page=100")
-    require(artifacts["total_count"]==len(artifacts["artifacts"])==1,"Earlier recovery produced unexpected additional artifacts")
-    row,=artifacts["artifacts"]
-    owner=row["workflow_run"]
-    require(row["id"]==ROTATED_CHALLENGE and row["name"]==f"r28-thaw-{ROTATED_RUN}-request" and
-            row["size_in_bytes"]==CHALLENGE_SIZE and row["digest"]=="sha256:"+CHALLENGE_SHA and
-            owner["id"]==ROTATED_RUN and owner["head_sha"]==ROTATED_HEAD and
-            owner["repository_id"]==owner["head_repository_id"]==a.REPO_ID and owner["head_branch"]==a.BRANCH,
-            "Historical challenge or transfer association changed")
-    print(f"prior_accepted_run={ROTATED_RUN} claim={ROTATED_CLAIM_ID} recovery_job={ROTATED_RECOVER} "
-          f"challenge_artifact={ROTATED_CHALLENGE} publication=skipped "
-          f"owner_observed_transcript_utf8_bytes=32333 sha256={ROTATED_TRANSCRIPT_SHA}",flush=True)
+    if stop.outcome=="owner-response-unopened":
+        failed=lookup
+        later={unlock:"skipped",opened:"skipped",reuse:"skipped",audit:"skipped",authorize:"skipped",publish:"skipped"}
+    elif stop.outcome=="opened-continuity-audit-rejected":
+        failed=audit
+        before=(*before,lookup,unlock,opened)
+        require(by_name[reuse]["conclusion"]=="skipped","Audit did not use the original reopened bytes")
+        later={"Preserve a bounded failed continuity report encrypted to the original disposable test recipient":"success",
+               "Deposit failed-audit for this exact recovery":"success",authorize:"skipped",publish:"skipped"}
+    else:
+        raise ValueError("Unreviewed historical recovery outcome")
+    require(len(by_name)==len(steps) and {k for k,s in by_name.items() if s["conclusion"]=="failure"}=={failed} and
+            all(by_name[k]["conclusion"]=="success" and by_name[k]["number"]<by_name[failed]["number"] for k in before)
+            and all(by_name[k]["conclusion"]==v and by_name[k]["number"]>by_name[failed]["number"] for k,v in later.items()),
+            "Historical job's observed failure boundary changed")
+    page=api.metadata(root+"/artifacts?per_page=100")
+    rows={r["id"]:r for r in page["artifacts"]}
+    require(page["total_count"]==len(page["artifacts"])==len(stop.artifacts)
+            and set(rows)=={r.ident for r in stop.artifacts},"Earlier recovery produced unexpected artifacts")
+    for artifact in stop.artifacts:
+        row=rows[artifact.ident]
+        owner=row["workflow_run"]
+        require(row["name"]==f"r28-thaw-{stop.run}-{artifact.stage}" and row["size_in_bytes"]==artifact.size and
+                row["digest"]=="sha256:"+artifact.digest and owner["id"]==stop.run and owner["head_sha"]==stop.head and
+                owner["repository_id"]==owner["head_repository_id"]==a.REPO_ID and owner["head_branch"]==a.BRANCH,
+                "Historical challenge or rejection evidence has a different generation or content")
+    print(f"prior_accepted_run={stop.run} claim={stop.claim_id} recovery_job={recover} outcome={stop.outcome} "
+          f"publication=skipped owner_observed_transcript_utf8_bytes={stop.transcript_size} sha256={stop.transcript_sha}",flush=True)
 
 
 def source_failed(api, read_log):
@@ -227,11 +310,11 @@ def check_original_draft(api):
     release=api.draft(a.RELEASE_ID)
     assets=release["assets"]
     require(a.claim_info(api,a.encode(v2_holder()),v2.CLAIM)==CLAIM_ID,"Wrong original v2 claim bytes or ID")
-    require(a.claim_info(api,a.encode(previous_holder()),PREVIOUS_CLAIM)==ROTATED_CLAIM_ID,
-            "Original accepted V3 reservation bytes or immutable ID changed")
+    held_history(api)
+    known_claims={CLAIM,*(stop.claim_name for stop in HISTORY)}
     rows=[r for r in assets if r["name"].startswith(STEM)]
     require(all(r["name"] in {STEM+x+y for x in ("p00","manifest.json") for y in ("","-retry1")} for r in rows) and
-            not any((r["name"].startswith(CAMPAIGN+"-") and r["name"] not in (PREVIOUS_CLAIM,CLAIM)) or
+            not any((r["name"].startswith(CAMPAIGN+"-") and r["name"] not in known_claims) or
                     (r["name"].startswith(v2.CAMPAIGN+"-") and r["name"]!=v2.CLAIM and not r["name"].startswith(STEM)) or
                     r["name"].startswith(f"r28-{SOURCE}-a1-s01-") for r in assets),
             "Unexpected alternate source or destination asset")
@@ -263,27 +346,89 @@ def check_original_draft(api):
     return manifest["id"]
 
 
+COMMITMENTS = {
+    "parent_content":{"files":252024,"sha256":"1fbed862f70b2ba2086642edd432e95497c4bf11fb67a91516d8c5cc92f9c7cb"},
+    "child_content":{"files":252027,"sha256":"402b1ba8cfef1a764b80105cb92393c9531991d409d5ccece052f7f19e765270"},
+}
+METRIC_PATHS = ("siso_metrics.json", *(f"siso_metrics.{i}.json" for i in range(10)))
+
+
+ADDED_OUTPUTS = {"apks/ChromeAndWebView32.ssargs":292,"apks/ChromeAndWebView64.ssargs":212,
+                 "obj/components/guest_view/common/common/guest_view_constants.o":7564}
+
+
+def regenerated(evidence, token):
+    return (evidence["path"]=="build.ninja.d" and evidence["target"]=="build.ninja.stamp" and
+            evidence["role"]=="regeneration-input" and evidence["references"]==1 and evidence["generator"]=="gn" and
+            evidence["token"]==token and evidence["gn_revision"]=="0035961837fbcfe875d855744b3eda4fd2eefb43" and
+            isinstance(evidence["sha256"],str) and re.fullmatch("[0-9a-f]{64}",evidence["sha256"]))
+
+
+def added_outputs(report, depfiles):
+    added=[row for row in report["differences"] if row["classification"]=="added"]
+    require(len(added)==3 and {row["path"] for row in added}==set(ADDED_OUTPUTS), "Wrong additions to this frozen archive")
+    for row in added:
+        name=row["path"]
+        require(row["parent"] is None and re.fullmatch(f"f:0:{ADDED_OUTPUTS[name]}:[0-9a-f]{{64}}",row["child"]),
+                "Added file is missing or has the wrong identity")
+        if name.endswith(".ssargs"):
+            dep=row["regeneration_dependency"]
+            require(row["role"]=="gn-generated-packaging-descriptor" and regenerated(dep,name) and
+                    depfiles=={dep["sha256"]},"GN descriptors do not share the original frozen regeneration input")
+
+
+def qualified_metrics(report):
+    rows={v["path"]:v for v in report["metrics"]}
+    require(len(report["metrics"])==len(rows)==11 and set(rows)==set(METRIC_PATHS) and
+            report["metric_rotation"]=={"steps":3,"matched":8,"bounded_files":11},
+            "Missing complete frozen Siso metric history")
+    for path in METRIC_PATHS:
+        rec=rows[path]
+        require(rec["parent"]!=rec["child"], "Identical metrics incorrectly classified as changed")
+        for side in ("parent","child"):
+            evidence=rec["evidence"][side]
+            mode,size,digest=evidence["mode"],evidence["size"],evidence["sha256"]
+            require(evidence["name"]==path and evidence["producer_revision"]=="b521b230cb7c56c821235e498285cf8e548a73ee" and
+                    evidence["version"]=="1.6.5" and evidence["schema"]=="siso.StepMetric.jsonl" and
+                    evidence["graph_references"]==0 and evidence["diagnostic_query"]=="unknown target" and
+                    type(mode) is int and 0<=mode<=0o777 and not mode & 0o111 and
+                    type(size) is int and 0<size<=128*1024**2 and re.fullmatch("[a-f0-9]{64}",digest) and
+                    rec[side]==f"f:0:{size}:{digest}", "Frozen Siso file lacks byte-bound typed diagnostic evidence")
+            n,summaries,errors=evidence["step_rows"],evidence["summary_rows"],evidence["error_steps"]
+            require(type(n) is int and type(summaries) is int and type(errors) is int and n>=0 and
+                    summaries in (0,1) and 0<=errors<=n and n+summaries>0,
+                    "Metric has no valid parsed data or build summary")
+    for old_path,new_path in zip(METRIC_PATHS,METRIC_PATHS[3:]):
+        require(rows[old_path]["parent"]==rows[new_path]["child"], "Siso history bytes do not survive ordered rotation")
+
+
 def passed_audit(path):
     st=path.lstat()
     require(stat.S_ISREG(st.st_mode) and 0<st.st_size<=128*1024**2,"Missing or oversized frozen-pair audit")
     raw=path.read_bytes()
     report=json.loads(raw)
-    require(report["schema"]=="bare-r28-archive-continuity-v3" and report["status"]=="passed" and
+    require(report["schema"]=="bare-r28-archive-continuity-v4" and report["status"]=="passed" and report["issues"]==[] and
             report["parent_sha"]==a.S2_SHA and report["child_sha"]==CHILD, "No successful archive audit for the exact frozen pair")
-    for name in ("parent_content","child_content"):
-        c=report[name]
-        require(type(c["files"]) is int and 0<c["files"]<=550000 and re.fullmatch("[0-9a-f]{64}",c["sha256"]),
-                "Invalid actual payload commitment")
+    require(all(report.get(k)==value for k,value in COMMITMENTS.items()),
+            "Full frozen archive commitments differ from the original authenticated report")
     counts=report["counts"]
     require(all(type(v) is int and v>=0 for v in counts.values()) and
-            counts["removed"]==counts["unclassified"]==0 and counts["added"]>0 and counts["gn_diagnostic"]==1,
+            counts["removed"]==counts["unclassified"]==counts["completed_replacement"]==0 and
+            counts["added"]==report["new_files"]==3 and counts["unchanged"]==252012 and
+            counts["gn_diagnostic"]==1 and counts["siso_metrics"]==11,
             "Unresolved retention loss or unverified diagnostics")
+    qualified_metrics(report)
     d,=report["diagnostics"]
     require(d["path"]=="gn_logs.txt" and d["producer"]=="//BUILD.gn:1662-1672" and d.get("parent") and
             d.get("child") and d["parent"]!=d["child"] and d.get("evidence") and isinstance(report["differences"],list),
             "Missing scoped GN diagnostic evidence")
+    depfiles=set()
     for side in ("parent","child"):
         e=d["evidence"][side]
+        regen=e["regeneration_dependency"]
+        depfiles.add(regen["sha256"])
+        require(regenerated(regen,"gn_logs.txt"),
+                "Original GN diagnostic reference was not proven to be the one regeneration input")
         require(e["chromium"]=="800628ad1ca1fd0c51e3b43b5b2bca081e81c3f6" and
                 e["build_gn_sha256"]=="31f8205fe64264c5b4f9638eb6552e558ccf78a4839413a7c1a194116f26e72e" and
                 e["target"]=="chrome_public_apk" and e["diagnostic_query"]=="unknown target" and
@@ -291,6 +436,7 @@ def passed_audit(path):
                 re.fullmatch("[0-9a-f]{64}",e["manifest_content"]["sha256"]) and e["sections"],
                 "Missing original graph or source-format proof for GN diagnostic")
     require(isinstance(d["evidence"]["changed_sections"],list), "Missing GN section comparison")
+    added_outputs(report,depfiles)
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -301,7 +447,8 @@ def run(mode, helper, env, event, checkout, *, audit=None, clock=None, read_log=
     manifest=check_original_draft(api)
     if mode=="reserve":
         previous_gate(api)
-        previous_accepted(api)
+        for stop in HISTORY:
+            previous_accepted(api,stop)
         source_failed(api,read_log)
         if not manifest:
             valid_artifacts(api,clock or datetime.now(timezone.utc))
