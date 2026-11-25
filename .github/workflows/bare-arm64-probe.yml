@@ -2,6 +2,9 @@ name: Bare Personal ARM64 checkpoint build
 'on':
   workflow_call:
     inputs:
+      checkpoint_compression:
+        type: string
+        default: auto
       probe:
         type: string
         default: smoke
@@ -328,11 +331,11 @@ jobs:
       timeout-minutes: 5
       run: |
         mkdir -p "$RUNNER_TEMP/bare-ci"
-        for file in checkpoint.py build_trial.py coexist_inputs.py guard.py check_archive.py graph.py retained.py metrics_evidence.py migration_graph.py segment_graph.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+        for file in checkpoint.py build_trial.py coexist_inputs.py guard.py check_archive.py graph.py retained.py metrics_evidence.py migration_graph.py segment_graph.py android_outputs.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
           source=$file
           [[ $file != guard.py ]] || source=preflight28/limits/guard.py
           [[ $file != check_archive.py ]] || source=preflight28/bridge/check_archive.py
-          [[ $file != graph.py && $file != retained.py && $file != metrics_evidence.py && $file != migration_graph.py && $file != segment_graph.py ]] || source=preflight28/graph/$file
+          [[ $file != graph.py && $file != retained.py && $file != metrics_evidence.py && $file != migration_graph.py && $file != segment_graph.py && $file != android_outputs.py ]] || source=preflight28/graph/$file
           [[ $file != *.yml ]] || source=".github/workflows/$file"
           curl --fail --location --retry 2 --max-time 60 \
             "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/$source" \
@@ -1642,6 +1645,8 @@ jobs:
       env:
         TRIAL_PHASE: ${{ steps.trial.outputs.phase }}
         CHECKPOINT_KEY: ${{ steps.identity.outputs.key }}
+        CHECKPOINT_COMPRESSION: ${{ inputs.checkpoint_compression }}
+        SENDER_OUTCOME_DEADLINE: ${{ steps.peer_acquire.outputs.sender_outcome_deadline }}
       run: |
         cd "$RUNNER_TEMP/bare-official"
         phase="$TRIAL_PHASE"
@@ -1650,8 +1655,25 @@ jobs:
         [[ $PROBE_MODE != checkpoint-scale ]] || pack_timeout=32m
         [[ $PROBE_MODE != checkpoint-large ]] || pack_timeout=42m
         [[ $PROBE_MODE != checkpoint-production ]] || pack_timeout=42m
-        [[ $CHECKPOINT_BACKEND != draft ]] || pack_timeout=30m
-        docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CI_REVISION=$GITHUB_SHA" -e "BASE_IMAGE=$BARE_BASE_IMAGE" \
+        if [[ $CHECKPOINT_BACKEND == draft ]]; then
+          pack_timeout=30m
+          # Use one budget from the beginning of preparation to the last archive check.
+          # Keep 2m for sealing and 13m for relay on BOTH active runner clocks.
+          [[ $SENDER_OUTCOME_DEADLINE =~ ^[1-9][0-9]{8,10}$ ]]
+          job_start=$(cat "$RUNNER_TEMP/bare-probe-start")
+          [[ $job_start =~ ^[1-9][0-9]{8,10}$ ]]
+          pack_deadline=$(( $(date +%s) + 30*60 ))
+          for limit in "$((10#$job_start + 335*60))" "$((10#$SENDER_OUTCOME_DEADLINE - 15*60))"; do
+            (( pack_deadline <= limit )) || pack_deadline=$limit
+          done
+        fi
+        within_pack_deadline() {
+          if [[ $CHECKPOINT_BACKEND != draft ]]; then "$@"; return; fi
+          local remaining=$(( pack_deadline - $(date +%s) - 3 ))
+          (( remaining > 0 )) || { echo 'Packing deadline reached; retain the verified parent.' >&2; return 124; }
+          timeout --kill-after=2s "${remaining}s" "$@"
+        }
+        within_pack_deadline docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CI_REVISION=$GITHUB_SHA" -e "BASE_IMAGE=$BARE_BASE_IMAGE" \
           -e "TRIAL_PHASE=$phase" -e "PROBE_MODE=$PROBE_MODE" -e "PRODUCTION_CAP_BYTES=$PRODUCTION_CAP_BYTES" \
           -e CHECKPOINT_BACKEND -e "RETAIN_EXISTING_CACHES=$RETAIN_EXISTING_CACHES" chromium-builder \
           timeout --kill-after=2m "$pack_timeout" bash -seu <<'CONTAINER'
@@ -1749,8 +1771,14 @@ jobs:
           python3 /exchange/checkpoint.py check-gn-packaging out/Bare
         fi
         time python3 /exchange/checkpoint.py record-inputs out/Bare/checkpoint-inputs.jsonl.gz
-        output_bytes=$(du -sx -B1 out/Bare | cut -f1)
-        printf 'Allocated build output before compression: %s bytes\n' "$output_bytes"
+        if [[ $CHECKPOINT_BACKEND == draft ]]; then
+          # One existing du scan of the quiescent tree; used only to select a level.
+          du -sbx out/Bare | cut -f1 > /exchange/checkpoint/apparent-bytes
+          chmod 0644 /exchange/checkpoint/apparent-bytes
+        else
+          output_bytes=$(du -sx -B1 out/Bare | cut -f1)
+          printf 'Allocated build output before compression: %s bytes\n' "$output_bytes"
+        fi
         exclusions=()
         if [[ $PROBE_MODE == checkpoint-production ]]; then
           df -B1 /work /exchange /tmp
@@ -1802,19 +1830,21 @@ jobs:
         CONTAINER
         if [[ $CHECKPOINT_BACKEND == draft ]]; then
           file="$RUNNER_TEMP/r28-normal/child.tar.zst"
-          python3 "$GITHUB_WORKSPACE/preflight28/limits/guard.py" space "$RUNNER_TEMP" --bytes $((2 * 3758096384 + 16 * 1024**2)) --inodes 5
-          docker compose exec -T chromium-builder bash -euc '
+          within_pack_deadline python3 "$GITHUB_WORKSPACE/preflight28/limits/guard.py" space "$RUNNER_TEMP" --bytes $((2 * 3758096384 + 16 * 1024**2)) --inodes 5
+          within_pack_deadline python3 "$GITHUB_WORKSPACE/preflight28/transport/pack_draft.py" --deadline "$pack_deadline" \
+            "$file" "$CHECKPOINT_COMPRESSION" "$(cat exchange/checkpoint/apparent-bytes)" -- \
+            docker compose exec -T chromium-builder bash -euc '
             cd /work/chromium/src
             # This archive travels only as CMS to the fixed private Draft. The completed
             # target is handled by the owner-signing path; all dependencies, including
             # generated GN descriptors and intermediate Android packages, must survive.
             [[ ! -e out/Bare/apks/ChromePublic.apk && ! -L out/Bare/apks/ChromePublic.apk ]]
-            tar --format=posix --pax-option=delete=atime,delete=ctime -cf - out/Bare' |
-            zstd -q -T2 -9 -c | python3 "$GITHUB_WORKSPACE/preflight28/transport/stream.py" "$file"
+            tar --format=posix --pax-option=delete=atime,delete=ctime -cf - out/Bare'
           # Credentials are scoped to individual Actions steps and no process in the
           # isolated build container survives into the Artifact handshake.
-          docker compose stop --timeout 20
-          [[ -z $(docker compose ps --status running -q) ]]
+          within_pack_deadline docker compose stop --timeout 20
+          running=$(within_pack_deadline docker compose ps --status running -q)
+          [[ -z $running ]]
           [[ $(jq -er .evidence_valid exchange/checkpoint/proof.json) == true ]]
           jq -e '.ready_for_restore_test == true and .forced_kill == false and .failed_step_count == 0' "exchange/checkpoint/trial-$phase.json" > /dev/null
           identity=$(jq -er .identity_sha256 exchange/checkpoint/provenance.json)
@@ -1822,7 +1852,7 @@ jobs:
           for operation in validate-archive verify-continuation inspect-input-paths; do
             args=(--production)
             if [[ $operation == verify-continuation ]]; then args+=(--ci-revision "$GITHUB_SHA" --expected-identity "$identity"); fi
-            python3 "$check" "$RUNNER_TEMP/bare-ci/checkpoint.py" "$operation" "$file" "${args[@]}"
+            within_pack_deadline python3 "$check" "$RUNNER_TEMP/bare-ci/checkpoint.py" "$operation" "$file" "${args[@]}"
           done
           proof=$(cat exchange/checkpoint/frontier-proof.sha)
           [[ $proof =~ ^[0-9a-f]{64}$ && $(tail -n 1 exchange/checkpoint/frontier-after.log | jq -r .candidate_progress) == true ]]
