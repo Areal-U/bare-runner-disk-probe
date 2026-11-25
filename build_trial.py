@@ -7,6 +7,7 @@ it does not claim that every possible writer has exited.
 """
 
 import argparse
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -45,12 +46,15 @@ LARGE_TIME_LIMIT = 5400
 LARGE_OUTPUT_LIMIT = 6 * 1024 ** 3
 LARGE_OUTPUT_ENTRY_LIMIT = 300_000
 LARGE_MIN_FREE_BYTES = 20 * 1024 ** 3
-PRODUCTION_TIME_LIMIT = 180 * 60
+PRODUCTION_TIME_LIMIT = 310 * 60  # absolute upper bound before the mandatory direct-route closure
 PRODUCTION_DEFAULT_OUTPUT_LIMIT = 11 * 1024 ** 3
 PRODUCTION_OUTPUT_LIMIT = 18 * 1024 ** 3
 PRODUCTION_OUTPUT_ENTRY_LIMIT = 525_000
 PRODUCTION_MIN_FREE_BYTES = 20 * 1024 ** 3
 PRODUCTION_MIN_FREE_INODES = 20_000
+# Prior terminal DEX took 26:05 and the native link took 22:40. Here the
+# minimum applies only to redoing a terminal action cut off by a prior clock.
+INTERRUPTED_TERMINAL_MIN_SECONDS = 30 * 60
 LARGE_SAMPLE_SECONDS = 5
 LARGE_CONSOLE_PREFIX_BYTES = 2 * 1024 ** 2
 LARGE_CONSOLE_TAIL_BYTES = 32 * 1024
@@ -136,6 +140,16 @@ def record_sample(measurements, sample, free_bytes):
         peak[name] = max(peak.get(name, 0), sample[name])
 
 
+def record_scan(measurements, phase, wall, cpu):
+    cost = measurements.setdefault("scan_cost", {}).setdefault(str(phase), {
+        "count": 0, "wall_seconds": 0.0, "cpu_seconds": 0.0, "max_wall_seconds": 0.0,
+    })
+    cost["count"] += 1
+    cost["wall_seconds"] += wall
+    cost["cpu_seconds"] += cpu
+    cost["max_wall_seconds"] = max(cost["max_wall_seconds"], wall)
+
+
 def resource_status(source_root):
     filesystem = os.statvfs(source_root)
     result = {"free_inodes": filesystem.f_favail}
@@ -163,12 +177,35 @@ def update_siso_status(progress, chunk):
         progress["step_counter"] = int(match[1])
         progress["graph_total"] = int(match[2])
         description = match[4].decode("utf-8", errors="replace")
+        if re.search(r"(?:^|[ /_.:-])(?:DEX|R8|D8|LINK|SOLINK)(?:[ /_.:-]|$)", description, re.I):
+            active = progress.setdefault("terminal_actions", set())
+            if match[3] == b"S":
+                active.add(description)
+            else:
+                active.discard(description)
         if match[3] == b"S" and description.startswith(("LINK ", "SOLINK ")):
             progress["link_action"] = description
             progress["link_started"] = time.monotonic()
         elif match[3] == b"F" and description == progress.get("link_action"):
             progress.pop("link_action", None)
             progress.pop("link_started", None)
+
+
+def interrupted_terminal_retry(output, available_seconds):
+    if available_seconds >= INTERRUPTED_TERMINAL_MIN_SECONDS:
+        return []
+    prior = output / "checkpoint-trial-restore.json"
+    if not prior.exists():
+        return []
+    if prior.is_symlink() or not prior.is_file() or prior.stat().st_size > 128 * 1024**2:
+        raise ValueError("Invalid prior continuation trial report")
+    report = json.loads(prior.read_text(encoding="utf-8"))
+    if report.get("format") != FORMAT or report.get("target") != TARGET or report.get("reason") != "time-limit":
+        return []
+    actions = report.get("interrupted_terminal_actions", [])
+    if not isinstance(actions, list) or any(not isinstance(s, str) or not s for s in actions):
+        raise ValueError("Invalid interrupted terminal action evidence")
+    return actions
 
 
 def bounded_output_evidence(outputs, max_bytes):
@@ -443,6 +480,7 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
         result["rebuilt_completed_output_count"] = 0
         result["resources_before"] = resource_status(source_root)
     process = None
+    scan_pool = None
     selector = selectors.DefaultSelector()
     old_handlers = {}
     received_signals = []
@@ -452,6 +490,16 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
     last_console_progress = started
     progress = {}
     try:
+        guard = None
+        deadline = None
+        if production:
+            import runpy
+            guard = runpy.run_path(str(Path(__file__).with_name("guard.py")))
+            if epoch := os.environ.get("COMPILE_STOP_EPOCH"):
+                remaining = int(epoch) - time.time()
+                if remaining > PRODUCTION_TIME_LIMIT:
+                    raise ValueError("Compile deadline exceeds one runner job")
+                deadline = time.monotonic() + remaining
         if phase not in {"seed", "restore"} or seconds <= 0 or sample_seconds <= 0:
             raise ValueError("Invalid trial phase or time budget")
         if sum((scale, large, production)) > 1:
@@ -473,7 +521,11 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
         if metrics_path.exists() or metrics_path.is_symlink():
             raise ValueError("Metrics path must be new for this trial")
         baseline = previous_paths(previous_result)
+        scan_wall, scan_cpu = time.monotonic(), time.thread_time()
         snapshot = tree_snapshot(output)
+        if production:
+            record_scan(result["measurements"], "initial", time.monotonic() - scan_wall,
+                        time.thread_time() - scan_cpu)
         # A restored tree contains outputs from earlier generations. Even
         # without a seed result, their paths cannot count as new work.
         baseline.update(snapshot.pop("paths"))
@@ -495,6 +547,19 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                 result["resources_before"]["free_inodes"] < PRODUCTION_MIN_FREE_INODES):
             result["reason"] = "preflight-disk-limit"
             return result
+        if production:
+            level, _ = guard['pressure']({'estimate': snapshot['archive_input_estimate_bytes'],
+                                          'entries': snapshot['entries']}, guard['disk'](source_root), False)
+            if level == 'stop' or (deadline is not None and time.monotonic() >= deadline):
+                result['reason'] = 'preflight-resource-or-time'
+                return result
+            now = time.monotonic()
+            available = min(started + seconds, deadline) - now if deadline is not None else started + seconds - now
+            if phase == "restore" and (actions := interrupted_terminal_retry(output, available)):
+                result["reason"] = "insufficient-terminal-retry-window"
+                result["interrupted_terminal_actions"] = actions
+                result["available_compile_seconds"] = max(0, int(available))
+                return result
         log_path.parent.mkdir(parents=True, exist_ok=True)
         arguments = command if command is not None else [
             "autoninja", "-C", str(BUILD_DIR), "-j", str(jobs),
@@ -511,6 +576,14 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             selector.register(process.stdout, selectors.EVENT_READ)
             interrupted_at = None
             last_sample = 0
+            last_guard_sample = snapshot
+            last_resource_poll = 0
+            settle = None
+            level = 'normal'
+            if production:
+                sample_seconds = 30
+                scan_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                active_scan = None
             leader_exited_at = None
             while True:
                 now = time.monotonic()
@@ -519,11 +592,41 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                     reason = None
                     if received_signals:
                         reason = "controller-interrupted"
-                    elif now - started >= seconds:
+                    elif now - started >= seconds or (deadline is not None and now >= deadline):
                         reason = "time-limit"
-                    elif now - last_sample >= sample_seconds:
-                        sample = tree_snapshot(output, include_paths=False)
-                        sample.pop("paths")
+                    if not reason and production and now - last_resource_poll >= 0.5:
+                        last_resource_poll = now
+                        fs = guard['disk'](source_root)
+                        stats = result["measurements"]
+                        stats["disk_polls"] = stats.get("disk_polls", 0) + 1
+                        stats["min_free_inodes"] = min(fs["free_inodes"], stats.get("min_free_inodes", fs["free_inodes"]))
+                        stats["min_free_bytes"] = min(fs["free_bytes"], stats["min_free_bytes"])
+                        level, sample_seconds = guard['pressure'](
+                            {'estimate': last_guard_sample['archive_input_estimate_bytes'],
+                             'entries': last_guard_sample['entries']}, fs, bool(progress.get('terminal_actions')))
+                        if level == 'stop':
+                            reason = 'disk-limit' if fs['free_bytes']-min_free_bytes <= guard['STOP_MARGIN'] or fs['free_inodes']-PRODUCTION_MIN_FREE_INODES <= guard['STOP_ENTRIES'] else 'output-limit'
+                    sample_due = now - last_sample >= sample_seconds
+                    if production:
+                        if not reason and sample_due and active_scan is None:
+                            active_scan = scan_pool.submit(guard["tree"], output)
+                            scan_interval = sample_seconds
+                            last_sample = now
+                        sample_due = active_scan is not None and active_scan.done()
+                    if not reason and sample_due:
+                        if production:
+                            observed = active_scan.result()
+                            active_scan = None
+                            sample = {name: observed[name] for name in ("entries", "logical_bytes", "allocated_bytes")}
+                            sample["archive_input_estimate_bytes"] = observed["estimate"]
+                            record_scan(result["measurements"], scan_interval, observed["scan_seconds"], observed["scan_cpu_seconds"])
+                        else:
+                            sample = tree_snapshot(output, include_paths=False)
+                            sample.pop("paths")
+                            last_sample = now
+                        last_guard_sample = sample
+                        if production:
+                            result['monitor_interval_seconds'] = sample_seconds
                         free = shutil.disk_usage(source_root).free
                         result["last_sample"] = {**sample, "free_bytes": free}
                         if production:
@@ -545,7 +648,6 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                                 sink.write((status + "\n").encode("ascii"))
                                 sink.flush()
                                 last_console_progress = now
-                        last_sample = now
                         if sample["archive_input_estimate_bytes"] >= max_output_bytes:
                             reason = "output-limit"
                         elif sample["entries"] >= max_output_entries:
@@ -555,14 +657,50 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                             reason = "disk-limit"
                     if reason:
                         result["reason"] = reason
+                        if production and progress.get("terminal_actions"):
+                            result["interrupted_terminal_actions"] = sorted(progress["terminal_actions"])
                         with contextlib.suppress(ProcessLookupError):
                             os.killpg(process.pid, signal.SIGINT)
                         result["interrupt_sent"] = True
                         interrupted_at = now
-                if running and interrupted_at is not None and now - interrupted_at >= stop_grace_seconds:
+                risk = None
+                if running and production and interrupted_at is not None:
+                    if settle is None:
+                        fs = guard['disk'](source_root)
+                        settle_sample = {'estimate': last_guard_sample['archive_input_estimate_bytes'],
+                                         'entries': last_guard_sample['entries']}
+                        settle = guard['QuiescenceBudget'](settle_sample, fs, max_output_bytes, max_output_entries, min_free_bytes)
+                        settle_scan = active_scan
+                        next_tree = next_poll = now
+                        watch = result['quiescence_monitor'] = {
+                            'disk_polls': 0, 'tree_scans': 0, 'min_free_bytes': fs['free_bytes'],
+                            'min_free_inodes': fs['free_inodes'], 'peak_estimate': settle_sample['estimate'],
+                        }
+                    if now >= next_poll:
+                        fs = guard['disk'](source_root)
+                        if settle_scan is not None and settle_scan.done():
+                            settle_sample = settle_scan.result()
+                            settle_scan = None
+                            watch['tree_scans'] += 1
+                            record_scan(result["measurements"], "stopping", settle_sample["scan_seconds"],
+                                        settle_sample["scan_cpu_seconds"])
+                        if settle_scan is None and now >= next_tree:
+                            settle_scan = scan_pool.submit(guard['tree'], output)
+                            next_tree = now + 5
+                        watch['disk_polls'] += 1
+                        watch['min_free_bytes'] = min(watch['min_free_bytes'], fs['free_bytes'])
+                        watch['min_free_inodes'] = min(watch['min_free_inodes'], fs['free_inodes'])
+                        watch['peak_estimate'] = max(watch['peak_estimate'], settle_sample['estimate'])
+                        risk = settle.risk(settle_sample, fs)
+                        next_poll = now + 0.5
+                if running and interrupted_at is not None and (risk or now - interrupted_at >= stop_grace_seconds):
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(process.pid, signal.SIGKILL)
                     result["forced_kill"] = True
+                    if production:
+                        result['stop_reason'] = result['reason']
+                        result['reason'] = 'quiescence-forced-kill'
+                        watch['kill_reason'] = risk or 'grace-timeout'
                     process.wait(timeout=10)
                 for key, _ in selector.select(timeout=0.2):
                     try:
@@ -593,12 +731,22 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                             sink.write(chunk)
                             sink.flush()
                 if process.poll() is not None:
+                    if production and not result['forced_kill']:
+                        try:
+                            os.killpg(process.pid, 0)
+                        except ProcessLookupError:
+                            pass
+                        else:
+                            with contextlib.suppress(ProcessLookupError):
+                                os.killpg(process.pid, signal.SIGKILL)
+                            result['forced_kill'] = True
+                            result['reason'] = 'unsettled-process-group'
                     leader_exited_at = leader_exited_at or time.monotonic()
                     if not selector.get_map() or time.monotonic() - leader_exited_at > 1:
                         break
             result["returncode"] = process.returncode
             result["stdout_drain_complete"] = not bool(selector.get_map())
-            if interrupted_at is None:
+            if interrupted_at is None and not result['forced_kill']:
                 result["reason"] = "completed" if process.returncode == 0 else "compile-error"
         result["close"] = close_evidence(info_path, close_before, output, journal_before)
         if production:
@@ -646,6 +794,8 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             result["forced_kill"] = True
             process.wait(timeout=10)
             result["returncode"] = process.returncode
+        if scan_pool is not None:
+            scan_pool.shutdown(wait=True, cancel_futures=True)
         selector.close()
         if process is not None and process.stdout is not None:
             process.stdout.close()
@@ -710,11 +860,13 @@ def main():
     if args.jobs == 1 and not args.production:
         parser.error("--jobs 1 requires --production")
     time_limit, output_limit, entry_limit, disk_floor = trial_limits(args.scale, args.large, args.production)
-    seconds = args.seconds if args.seconds is not None else (time_limit if expanded else 180)
+    seconds = args.seconds if args.seconds is not None else (180 * 60 if args.production else time_limit if expanded else 180)
     default_output = PRODUCTION_DEFAULT_OUTPUT_LIMIT if args.production else output_limit
     max_output_bytes = args.max_output_bytes if args.max_output_bytes is not None else default_output
     max_output_entries = args.max_output_entries if args.max_output_entries is not None else entry_limit
     min_free_bytes = args.min_free_bytes if args.min_free_bytes is not None else disk_floor
+    if args.production and seconds > 180 * 60 and not os.environ.get("COMPILE_STOP_EPOCH"):
+        parser.error("Extended compile time requires a verified absolute job deadline")
     if not 1 <= seconds <= time_limit:
         parser.error(f"--seconds must be between 1 and {time_limit}")
     if not 1 <= max_output_bytes <= output_limit or min_free_bytes < disk_floor:
@@ -730,7 +882,7 @@ def main():
     for key in ("scale_limits", "large_limits", "production_limits", "output_before", "last_sample",
                 "measurements", "completed_output_count", "new_completed_output_count",
                 "rebuilt_completed_output_count", "evidence_truncated", "console", "artifact_ready",
-                "resources_before", "resources_after", "oom_kill_count"):
+                "resources_before", "resources_after", "oom_kill_count", "quiescence_monitor"):
         if key in result:
             summary[key] = result[key]
     print(json.dumps(summary))
