@@ -1,0 +1,172 @@
+name: Compare Bare checkpoint receiver timing
+description: An ephemeral role in a bounded public-fixture diagnostic
+inputs:
+  mode:
+    description: baseline or delayed
+    required: true
+  role:
+    description: ticket, producer, or receiver
+    required: true
+outputs:
+  receipt-id:
+    description: ID of the published durable receipt
+    value: ${{ steps.receipt.outputs.artifact-id }}
+runs:
+  using: composite
+  steps:
+  - name: Bind peer names to the checkout and attempt
+    shell: bash
+    run: python3 "$GITHUB_ACTION_PATH/trial.py" init "$MODE"
+    id: begin
+    env:
+      MODE: ${{ inputs.mode }}
+  - name: Issue a public test parent by content digest
+    shell: bash
+    run: python3 "$GITHUB_ACTION_PATH/trial.py" ticket "$MODE"
+    if: ${{ inputs.role == 'ticket' || (inputs.role == 'receiver' && inputs.mode == 'baseline') }}
+    env:
+      MODE: ${{ inputs.mode }}
+  - name: Refresh storage admission for ticket
+    if: ${{ inputs.role == 'ticket' || (inputs.role == 'receiver' && inputs.mode == 'baseline') }}
+    shell: bash
+    env:
+      MODE: ${{ inputs.mode }}
+      GH_TOKEN: ${{ github.token }}
+    run: python3 "$GITHUB_ACTION_PATH/trial.py" admit "$MODE" ticket
+  - name: Publish immutable ticket
+    if: ${{ inputs.role == 'ticket' || (inputs.role == 'receiver' && inputs.mode == 'baseline') }}
+    uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+    with:
+      name: ${{ steps.begin.outputs.ticket }}
+      path: ${{ steps.begin.outputs.root }}/ticket/
+      retention-days: 1
+      compression-level: 0
+      overwrite: false
+      if-no-files-found: error
+  - name: Hold the issuer VM for the controlled 20-second scheduling difference
+    shell: bash
+    run: python3 "$GITHUB_ACTION_PATH/trial.py" pause "$MODE"
+    if: ${{ inputs.role == 'ticket' }}
+    env:
+      MODE: ${{ inputs.mode }}
+  - name: Generate an ephemeral receiver key on its VM
+    shell: bash
+    run: python3 "$GITHUB_ACTION_PATH/trial.py" key "$MODE"
+    if: ${{ inputs.role == 'receiver' }}
+    env:
+      MODE: ${{ inputs.mode }}
+  - name: Refresh storage admission for key
+    if: ${{ inputs.role == 'receiver' }}
+    shell: bash
+    env:
+      MODE: ${{ inputs.mode }}
+      GH_TOKEN: ${{ github.token }}
+    run: python3 "$GITHUB_ACTION_PATH/trial.py" admit "$MODE" key
+  - name: Publish immutable key
+    if: ${{ inputs.role == 'receiver' }}
+    uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+    with:
+      name: ${{ steps.begin.outputs.key }}
+      path: ${{ steps.begin.outputs.root }}/key/
+      retention-days: 1
+      compression-level: 0
+      overwrite: false
+      if-no-files-found: error
+  - name: Find exact ticket in this run's finite window
+    shell: bash
+    run: python3 "$GITHUB_ACTION_PATH/trial.py" lookup "$MODE" ticket
+    if: ${{ inputs.role == 'producer' }}
+    id: lookup_ticket
+    env:
+      MODE: ${{ inputs.mode }}
+      GH_TOKEN: ${{ github.token }}
+  - name: Download bound ticket
+    if: ${{ inputs.role == 'producer' }}
+    uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+    with:
+      artifact-ids: ${{ steps.lookup_ticket.outputs.id }}
+      merge-multiple: true
+      path: ${{ steps.begin.outputs.root }}/ticket
+  - name: Restore and verify the identical public Bare input
+    shell: bash
+    run: python3 "$GITHUB_ACTION_PATH/trial.py" claim-ticket "$MODE"
+    if: ${{ inputs.role == 'producer' }}
+    env:
+      MODE: ${{ inputs.mode }}
+  - name: Find exact key in this run's finite window
+    shell: bash
+    run: python3 "$GITHUB_ACTION_PATH/trial.py" lookup "$MODE" key
+    if: ${{ inputs.role == 'producer' }}
+    id: lookup_key
+    env:
+      MODE: ${{ inputs.mode }}
+      GH_TOKEN: ${{ github.token }}
+  - name: Download bound key
+    if: ${{ inputs.role == 'producer' }}
+    uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+    with:
+      artifact-ids: ${{ steps.lookup_key.outputs.id }}
+      merge-multiple: true
+      path: ${{ steps.begin.outputs.root }}/key
+  - name: Seal using the production frame implementation
+    shell: bash
+    run: python3 "$GITHUB_ACTION_PATH/trial.py" seal "$MODE"
+    if: ${{ inputs.role == 'producer' }}
+    env:
+      MODE: ${{ inputs.mode }}
+  - name: Refresh storage admission for envelope
+    if: ${{ inputs.role == 'producer' }}
+    shell: bash
+    env:
+      MODE: ${{ inputs.mode }}
+      GH_TOKEN: ${{ github.token }}
+    run: python3 "$GITHUB_ACTION_PATH/trial.py" admit "$MODE" envelope
+  - name: Publish immutable envelope
+    if: ${{ inputs.role == 'producer' }}
+    uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+    with:
+      name: ${{ steps.begin.outputs.envelope }}
+      path: ${{ steps.begin.outputs.root }}/envelope/
+      retention-days: 1
+      compression-level: 0
+      overwrite: false
+      if-no-files-found: error
+  - name: Find exact envelope in this run's finite window
+    shell: bash
+    run: python3 "$GITHUB_ACTION_PATH/trial.py" lookup "$MODE" envelope
+    if: ${{ inputs.role == 'receiver' }}
+    id: lookup_envelope
+    env:
+      MODE: ${{ inputs.mode }}
+      GH_TOKEN: ${{ github.token }}
+  - name: Download bound envelope
+    if: ${{ inputs.role == 'receiver' }}
+    uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+    with:
+      artifact-ids: ${{ steps.lookup_envelope.outputs.id }}
+      merge-multiple: true
+      path: ${{ steps.begin.outputs.root }}/envelope
+  - name: Independently reconstruct the input and verify receipt
+    shell: bash
+    run: python3 "$GITHUB_ACTION_PATH/trial.py" receive "$MODE"
+    if: ${{ inputs.role == 'receiver' }}
+    env:
+      MODE: ${{ inputs.mode }}
+  - name: Refresh storage admission for receipt
+    if: ${{ inputs.role == 'receiver' }}
+    shell: bash
+    env:
+      MODE: ${{ inputs.mode }}
+      GH_TOKEN: ${{ github.token }}
+    run: python3 "$GITHUB_ACTION_PATH/trial.py" admit "$MODE" receipt
+  - name: Publish immutable receipt
+    if: ${{ inputs.role == 'receiver' }}
+    uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+    with:
+      name: ${{ steps.begin.outputs.receipt }}
+      path: ${{ steps.begin.outputs.root }}/receipt/
+      retention-days: 1
+      compression-level: 0
+      overwrite: false
+      if-no-files-found: error
+    id: receipt
