@@ -303,11 +303,11 @@ jobs:
       timeout-minutes: 5
       run: |
         mkdir -p "$RUNNER_TEMP/bare-ci"
-        for file in checkpoint.py build_trial.py coexist_inputs.py guard.py check_archive.py graph.py retained.py segment_graph.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+        for file in checkpoint.py build_trial.py coexist_inputs.py guard.py check_archive.py graph.py retained.py metrics_evidence.py migration_graph.py segment_graph.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
           source=$file
           [[ $file != guard.py ]] || source=preflight28/limits/guard.py
           [[ $file != check_archive.py ]] || source=preflight28/bridge/check_archive.py
-          [[ $file != graph.py && $file != retained.py && $file != segment_graph.py ]] || source=preflight28/graph/$file
+          [[ $file != graph.py && $file != retained.py && $file != metrics_evidence.py && $file != migration_graph.py && $file != segment_graph.py ]] || source=preflight28/graph/$file
           [[ $file != *.yml ]] || source=".github/workflows/$file"
           curl --fail --location --retry 2 --max-time 60 \
             "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/$source" \
@@ -892,7 +892,7 @@ jobs:
           streamed=true
         fi
         docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CI_REVISION=$GITHUB_SHA" -e "BASE_IMAGE=$BARE_BASE_IMAGE" \
-          -e "EXPECTED_IDENTITY=$EXPECTED_IDENTITY" -e "STREAMED=$streamed" -e VERIFY_FRONTIER_ONLY -e "REPAIR_LEGACY_INPUT_PATHS=$REPAIR_LEGACY_INPUT_PATHS" \
+          -e "EXPECTED_IDENTITY=$EXPECTED_IDENTITY" -e COEXIST_27_S2_KEY -e "STREAMED=$streamed" -e VERIFY_FRONTIER_ONLY -e "REPAIR_LEGACY_INPUT_PATHS=$REPAIR_LEGACY_INPUT_PATHS" \
           -e "PROBE_MODE=$PROBE_MODE" -e "EXPECTED_KEY=$EXPECTED_KEY" -e "LEGACY_PRODUCTION_KEY=$LEGACY_PRODUCTION_KEY" \
           -e "EXPANDED_PRODUCTION_KEY=$EXPANDED_PRODUCTION_KEY" \
           -e "PRE_SNAPSHOT_KEY=$PRE_SNAPSHOT_KEY" -e "PRE_SNAPSHOT_BACKUP_KEY=$PRE_SNAPSHOT_BACKUP_KEY" \
@@ -1011,7 +1011,14 @@ jobs:
           # Generate them before Siso takes its snapshot of the restored inputs.
           if [[ $STREAMED != true ]]; then
             echo 'Regenerating the ARM64 manifest and its local packaging descriptors'
+            if [[ $EXPECTED_KEY == "$COEXIST_27_S2_KEY" ]]; then
+              if [[ -x third_party/ninja/ninja ]]; then export NINJA="$PWD/third_party/ninja/ninja"; fi
+              python3 /exchange/migration_graph.py before --state /exchange/checkpoint/gn-migration-before.json
+            fi
             gn gen out/Bare
+            if [[ $EXPECTED_KEY == "$COEXIST_27_S2_KEY" ]]; then
+              python3 /exchange/migration_graph.py after --state /exchange/checkpoint/gn-migration-before.json
+            fi
           fi
           cmp -- /exchange/args.gn out/Bare/args.gn
           python3 /exchange/checkpoint.py check-gn-packaging out/Bare
