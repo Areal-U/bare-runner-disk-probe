@@ -93,7 +93,9 @@ name: Bare Personal ARM64 checkpoint build
         value: ${{ (inputs.backend == 'draft' && jobs.draft-publisher.outputs.private_readback_verified) || (inputs.backend != 'draft' && jobs.compile-probe.outputs.checkpoint_saved)
           || '' }}
       checkpoint_advanced:
-        value: ${{ jobs.compile-probe.outputs.checkpoint_advanced }}
+        value: ${{ (inputs.backend == 'draft' && jobs.draft-publisher.outputs.checkpoint_advanced) || (inputs.backend != 'draft' && jobs.compile-probe.outputs.checkpoint_advanced) || 'false' }}
+      private_status:
+        value: ${{ jobs.draft-publisher.outputs.private_status }}
       apk_artifact_id:
         value: ${{ jobs.compile-probe.outputs.apk_artifact_id }}
       apk_cache_key:
@@ -335,8 +337,7 @@ jobs:
       run: |-
         set -euo pipefail
         if [[ ! ${MY_CHECK:-} =~ ^[1-9][0-9]*$ ]]; then
-          MY_CHECK=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" | jq -er --arg suffix "$CLOCK_SUFFIX" '
-            select(.total_count == (.jobs|length)) | [.jobs[]|select((.name|endswith($suffix)) and .status=="in_progress")|.check_run_url|split("/")|last] | select(length==1) | first')
+          MY_CHECK=$(python3 -I "$RUNNER_TEMP/bare-ci/guard.py" job-check --job-suffix "$CLOCK_SUFFIX")
         fi
         python3 -I "$RUNNER_TEMP/bare-ci/guard.py" job-clock --check-run "$MY_CHECK" > "$RUNNER_TEMP/bare-probe-start"
     - name: Read the pinned public transport helpers anonymously
@@ -382,8 +383,7 @@ jobs:
       run: |-
         set -euo pipefail
         if [[ ! ${CHECK_RUN:-} =~ ^[1-9][0-9]*$ ]]; then
-          CHECK_RUN=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" | jq -er --arg suffix "$CLOCK_SUFFIX" '
-            select(.total_count == (.jobs|length)) | [.jobs[]|select((.name|endswith($suffix)) and .status=="in_progress")|.check_run_url|split("/")|last] | select(length==1) | first')
+          CHECK_RUN=$(JOB_READ_TOKEN="$GH_TOKEN" python3 -I preflight28/limits/guard.py job-check --job-suffix "$CLOCK_SUFFIX")
         fi
         python3 preflight28/bridge/normal.py keygen ordinary --check-run "$CHECK_RUN"
       if: ${{ inputs.backend == 'draft' }}
@@ -2098,6 +2098,8 @@ jobs:
       R28_COLLECTION_CLAIM: ${{ inputs.owner_claim_id }}
     outputs:
       relay_no_receipt: ${{ steps.peer_wait_outcome.outputs.outcome_absent }}
+      checkpoint_advanced: ${{ steps.publish.outputs.checkpoint_advanced }}
+      private_status: ${{ steps.publish.outputs.recovery_status }}
       checkpoint_manifest_id: ${{ steps.publish.outputs.checkpoint_manifest_id }}
       checkpoint_manifest_sha: ${{ steps.publish.outputs.checkpoint_manifest_sha }}
       checkpoint_sha: ${{ steps.publish.outputs.checkpoint_sha }}
@@ -2133,8 +2135,7 @@ jobs:
       run: |-
         set -euo pipefail
         if [[ ! ${CHECK_RUN:-} =~ ^[1-9][0-9]*$ ]]; then
-          CHECK_RUN=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" | jq -er --arg suffix "$CLOCK_SUFFIX" '
-            select(.total_count == (.jobs|length)) | [.jobs[]|select((.name|endswith($suffix)) and .status=="in_progress")|.check_run_url|split("/")|last] | select(length==1) | first')
+          CHECK_RUN=$(JOB_READ_TOKEN="$GH_TOKEN" python3 -I preflight28/limits/guard.py job-check --job-suffix "$CLOCK_SUFFIX")
         fi
         sender_start=$(JOB_READ_TOKEN="$GH_TOKEN" python3 -I preflight28/limits/guard.py job-clock --check-run "$CHECK_RUN")
         python3 preflight28/bridge/normal.py keygen limited --check-run "$CHECK_RUN" --job-start "$sender_start"
@@ -2189,7 +2190,7 @@ jobs:
     - name: Receive bounded ciphertext and independently verify fixed private publication
       if: ${{ steps.peer_wait_outcome.outputs.id != '' }}
       id: publish
-      timeout-minutes: 34
+      timeout-minutes: 350
       env:
         GH_TOKEN: ${{ github.token }}
       run: python3 preflight28/bridge/normal.py publish

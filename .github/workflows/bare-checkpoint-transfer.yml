@@ -757,7 +757,7 @@ jobs:
                 child = o["sha"]
                 if child in seen or not re.fullmatch("[0-9a-f]{64}", child): raise SystemExit("Repeated or invalid child")
                 seen.add(child); parent=child
-            elif state in {"apk", "no-progress", "apk-size-exceeded", "cipher-size-exceeded", "limit-verified",
+            elif state in {"apk", "no-progress", "apk-size-exceeded", "cipher-size-exceeded", "limit-verified", "manifest_present_visibility_pending",
                            "relay-quota-denied","relay-capacity-exceeded","relay-deadline","relay-missing","relay-ambiguous"}:
                 if state == "limit-verified" and (n != 13 or o["sha"] != parent): raise SystemExit("Unverified terminal parent")
                 if state == "apk" and not (o.get("cipher_id") or o.get("cipher_cache")): raise SystemExit("No recoverable APK")
@@ -783,6 +783,8 @@ jobs:
       private_ordinal: ${{ steps.lookup.outputs.private_ordinal }}
       private_parent: ${{ steps.lookup.outputs.private_parent }}
       private_identity: ${{ steps.lookup.outputs.private_identity }}
+      expected_manifest: ${{ steps.lookup.outputs.manifest_id }}
+      expected_manifest_sha: ${{ steps.lookup.outputs.manifest_sha }}
     steps:
     - name: Load the exact read-only reconciliation code
       run: |-
@@ -857,7 +859,7 @@ jobs:
     needs: recover-first-attempt
     if: ${{ !cancelled() && github.run_attempt != '1' && inputs.checkpoint_backend == 'draft' && needs.recover-first-attempt.result == 'success' && needs.recover-first-attempt.outputs.private_ordinal != '' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 36
+    timeout-minutes: 85
     permissions:
       contents: write
       actions: read
@@ -866,6 +868,8 @@ jobs:
       R28_PARENT_SHA: ${{ needs.recover-first-attempt.outputs.private_parent }}
       R28_PARENT_IDENTITY: ${{ needs.recover-first-attempt.outputs.private_identity }}
       R28_HEAD_SHA: ${{ github.sha }}
+      R28_EXPECTED_RECOVERY_MANIFEST: ${{ needs.recover-first-attempt.outputs.expected_manifest }}
+      R28_EXPECTED_RECOVERY_MANIFEST_SHA: ${{ needs.recover-first-attempt.outputs.expected_manifest_sha }}
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       with:
@@ -878,19 +882,28 @@ jobs:
     - run: python3 preflight28/transport/prepare.py tools
     - name: Reacquire the canonical Draft assets with a GET-only client
       id: recovered
+      timeout-minutes: 80
       env:
         GH_TOKEN: ${{ github.token }}
-      run: python3 preflight28/control/recover_private.py
+        R28_CHECK_RUN: ${{ job.check_run_id }}
+      run: |
+        export R28_STEP_START="$(date +%s)"
+        python3 preflight28/control/recover_private.py
     - name: Record the recovered checkpoint receipt
       env:
         PRIVATE_VERIFIED: ${{ steps.recovered.outputs.private_readback_verified }}
         PARTIAL: ${{ steps.recovered.outputs.recovery_status }}
         OWNER_OUTCOME_ARTIFACT_ID: ${{ steps.recovered.outputs.owner_outcome_artifact_id }}
         MANIFEST_ID: ${{ steps.recovered.outputs.checkpoint_manifest_id }}
+        MANIFEST_SHA: ${{ steps.recovered.outputs.checkpoint_manifest_sha }}
         DIGEST: ${{ steps.recovered.outputs.checkpoint_sha }}
       run: |
         if [[ $PRIVATE_VERIFIED == false ]]; then
           case "$PARTIAL" in
+            manifest_present_visibility_pending)
+              [[ $MANIFEST_ID =~ ^[1-9][0-9]*$ && $MANIFEST_SHA =~ ^[0-9a-f]{64}$ && $DIGEST =~ ^[0-9a-f]{64}$ ]]
+              printf 'Original slot %s manifest %s SHA-256 %s. Authenticated bytes agree. Anonymous visibility confirmation is pending.\n' "$R28_SLOT" "$MANIFEST_ID" "$MANIFEST_SHA"
+              exit 1 ;;
             owner_outcome_artifact_available)
               printf 'Owner outcome Artifact %s. The preceding record contains its ZIP digest and expiry.\n' "$OWNER_OUTCOME_ARTIFACT_ID"
               exit 0 ;;

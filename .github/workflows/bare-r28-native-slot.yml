@@ -233,6 +233,52 @@ jobs:
           [[ $(head -n 1 -- "$file") == age-encryption.org/v1 ]]
           printf '%s  %s\n' "$EXPECTED_SHA" "$file" | sha256sum --check --strict
         done
+  confirm-private:
+    name: Confirm original private visibility for slot ${{ inputs.ordinal }}
+    needs: arm
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.backend == 'draft' && !inputs.verify_only && inputs.ordinal <= 12 && needs.arm.result == 'success' && needs.arm.outputs.private_status == 'manifest_present_visibility_pending' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    permissions:
+      actions: read
+      contents: write
+    env:
+      R28_SLOT: ${{ inputs.ordinal }}
+      R28_PARENT_SHA: ${{ inputs.parent_sha }}
+      R28_PARENT_IDENTITY: ${{ inputs.parent_identity }}
+      R28_HEAD_SHA: ${{ github.sha }}
+      R28_EXPECTED_RECOVERY_MANIFEST: ${{ needs.arm.outputs.checkpoint_manifest_id }}
+      R28_EXPECTED_RECOVERY_MANIFEST_SHA: ${{ needs.arm.outputs.checkpoint_manifest_sha }}
+    outputs:
+      private_readback_verified: ${{ steps.reread.outputs.private_readback_verified }}
+      recovery_status: ${{ steps.reread.outputs.recovery_status }}
+      checkpoint_manifest_id: ${{ steps.reread.outputs.checkpoint_manifest_id }}
+      checkpoint_manifest_sha: ${{ steps.reread.outputs.checkpoint_manifest_sha }}
+      checkpoint_sha: ${{ steps.reread.outputs.checkpoint_sha }}
+      checkpoint_identity: ${{ steps.reread.outputs.checkpoint_identity }}
+      checkpoint_bytes: ${{ steps.reread.outputs.checkpoint_bytes }}
+      checkpoint_key: ${{ steps.reread.outputs.checkpoint_key }}
+      checkpoint_ordinal: ${{ steps.reread.outputs.checkpoint_ordinal }}
+      producer_sha: ${{ steps.reread.outputs.producer_sha }}
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+        sparse-checkout: |
+          preflight28
+          .github/workflows/bare-round26-transport-check.yml
+        sparse-checkout-cone-mode: false
+    - run: python3 preflight28/transport/prepare.py tools
+    - name: Verify this exact manifest and all original parts using only reads
+      id: reread
+      timeout-minutes: 80
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R28_CHECK_RUN: ${{ job.check_run_id }}
+      run: |
+        export R28_STEP_START="$(date +%s)"
+        python3 preflight28/control/recover_private.py
   result:
     name: Record the independently verified segment outcome
     runs-on: ubuntu-24.04
@@ -241,6 +287,7 @@ jobs:
     - arm
     - read
     - apk
+    - confirm-private
     if: ${{ !cancelled() }}
     outputs:
       status: ${{ steps.record.outputs.status }}
@@ -285,12 +332,32 @@ jobs:
         if ordinal > 1:
             checked(o.get("parent_frontier_verified") == "true", "Unverified previous frontier")
         relay = o.get("relay_stop","")
+        visibility_pending = o.get("private_status") == "manifest_present_visibility_pending"
+        confirmation = n.get('confirm-private', {'result':'skipped','outputs':{}})
+        initially_pending = visibility_pending
+        if visibility_pending:
+            checked(os.environ['BACKEND'] == 'draft' and os.environ['VERIFY_ONLY'] == 'false' and ordinal <= 12
+                    and a['result'] == 'success' and read['result'] == apk['result'] == 'skipped'
+                    and o.get('frontier_status') == 'candidate' and status not in {'sealed','apk-size-exceeded','cipher-size-exceeded'}
+                    and o.get('private_readback_verified') == o.get('checkpoint_saved') == 'false',
+                    "Conflicting pending privacy receipt")
+            checked(confirmation['result'] == 'success', "The independent privacy recheck did not complete")
+            c = confirmation['outputs']
+            fields = ('checkpoint_manifest_id','checkpoint_manifest_sha','checkpoint_sha','checkpoint_identity',
+                      'checkpoint_bytes','checkpoint_key','checkpoint_ordinal','producer_sha')
+            checked(all(c.get(k) and c[k] == o.get(k) for k in fields), "The privacy recheck addresses a different manifest")
+            visibility_pending = c.get('recovery_status') == 'manifest_present_visibility_pending'
+            checked((visibility_pending and c.get('private_readback_verified') == 'false') or
+                    (c.get('recovery_status') == 'verified' and c.get('private_readback_verified') == 'true'),
+                    "The independent reader returned no decisive receipt")
+        else:
+            checked(confirmation['result'] == 'skipped',"Unexpected additional private receipt job")
         if relay:
             checked(relay in {"relay-quota-denied","relay-capacity-exceeded","relay-deadline","relay-missing","relay-ambiguous"}
                     and os.environ['BACKEND'] == 'draft' and a['result'] == 'success' and
-                    (o.get('relay_no_receipt') == 'true' or o.get('private_readback_verified') == 'true'),
+                    (o.get('relay_no_receipt') == 'true' or o.get('private_readback_verified') == 'true' or initially_pending),
                     "Unconfirmed transfer stop")
-        if relay and o.get('private_readback_verified') != 'true' and o.get('frontier_status') == 'candidate' and not status in {'sealed','apk-size-exceeded','cipher-size-exceeded'} and os.environ['VERIFY_ONLY'] != 'true':
+        if relay and not initially_pending and o.get('private_readback_verified') != 'true' and o.get('frontier_status') == 'candidate' and not status in {'sealed','apk-size-exceeded','cipher-size-exceeded'} and os.environ['VERIFY_ONLY'] != 'true':
             checked(read['result'] == apk['result'] == 'skipped', "A missing checkpoint cannot authorize another slot")
             result["status"] = relay
         elif status in {"apk-size-exceeded","cipher-size-exceeded"}:
@@ -316,14 +383,15 @@ jobs:
                 result["status"] = "no-progress"
             elif os.environ["BACKEND"] == "draft":
                 key = f'bare-coexist-204-{os.environ["GITHUB_RUN_ID"]}-1-checkpoint-production-s{ordinal}'
-                checked(read["result"] == apk["result"] == "skipped" and o.get("private_readback_verified") == "true" and
-                        o.get("checkpoint_saved") == "true" and o.get("frontier_status") == "candidate" and
+                checked(read["result"] == apk["result"] == "skipped" and (initially_pending or
+                        o.get("private_readback_verified") == o.get("checkpoint_saved") == "true") and o.get("frontier_status") == "candidate" and
                         o.get("checkpoint_key") == key, "Missing independent private receipt")
                 aid, manifest = o.get("checkpoint_manifest_id",""), o.get("checkpoint_manifest_sha","")
                 archive, identity, length = o.get("checkpoint_sha",""), o.get("checkpoint_identity",""), o.get("checkpoint_bytes","")
                 checked(re.fullmatch("[1-9][0-9]*",aid) and all(digest(x) for x in (manifest,archive,identity)) and
                         archive != parent and length.isdecimal() and 0 < int(length) <= 7*1024**3//2, "Invalid private successor receipt")
-                result.update(status="candidate", key=key, sha=archive, identity=identity, manifest_id=aid, manifest_sha=manifest, archive_bytes=length)
+                result.update(status="manifest_present_visibility_pending" if visibility_pending else "candidate",
+                              key=key, sha=archive, identity=identity, manifest_id=aid, manifest_sha=manifest, archive_bytes=length)
             elif read["result"] == "success":
                 saved = read["outputs"]
                 key = f'bare-coexist-204-{os.environ["GITHUB_RUN_ID"]}-1-checkpoint-production-s{ordinal}'
