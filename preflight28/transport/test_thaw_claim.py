@@ -39,6 +39,13 @@ class Service(GitHub):
         super().__init__()
         self.add(t.v2.CLAIM,t.a.encode(t.v2_holder()),t.CLAIM_ID)
         self.history=source_jobs()
+        outcomes={"Confirm failed prior acceptance, exact surviving artifacts and new single recovery claim":"failure",
+                  "Deposit request for this exact recovery":"skipped",
+                  "Open original authenticated frames and verify the original producer evidence":"skipped",
+                  "Reconcile original data and publish the original immutable generation":"skipped"}
+        self.previous=[dict(id=j,status="completed",run_id=t.FAILED_GATE,conclusion=concl,
+                            steps=[dict(name=k,conclusion=v) for k,v in outcomes.items()] if i==0 else [])
+                       for i,(j,concl) in enumerate(zip(t.FAILED_JOBS,["failure","skipped","skipped"]))]
         self.arts=[dict(id=aid,size_in_bytes=size,digest="sha256:"+digest,expires_at=expires,expired=False,
                     name=f"r28-fresh-{t.SOURCE}-{key}",workflow_run=dict(id=t.SOURCE,head_sha=t.HEAD,head_branch=t.a.BRANCH,
                     repository_id=t.a.REPO_ID,head_repository_id=t.a.REPO_ID)) for key,(aid,size,digest,expires) in t.ARTIFACTS.items()]
@@ -46,6 +53,10 @@ class Service(GitHub):
         route=urlsplit(url).path.removeprefix(self.BASE)
         if route.startswith("/actions/runs/"):
             rid=int(route.split("/")[3])
+            if rid==t.FAILED_GATE:
+                if route.endswith("/jobs"): return dict(total_count=3,jobs=self.previous)
+                if route.endswith("/artifacts"): return dict(total_count=0,artifacts=[])
+                return {**base_run(rid),"head_sha":t.FAILED_HEAD,"path":t.WORKFLOW,"status":"completed","conclusion":"failure"}
             if rid==t.SOURCE:
                 if route.endswith("/jobs"):return dict(total_count=len(self.history),jobs=self.history)
                 if route.endswith("/artifacts"):return dict(total_count=len(self.arts),artifacts=self.arts)
@@ -102,6 +113,14 @@ class Tests(unittest.TestCase):
             with self.assertRaises(ValueError):apply(h,"verify",role="receive")
             with self.assertRaises(ValueError):apply(h,"authorize",rid=RID+1,audit=audit)
             self.assertEqual(h.posts,1)
+
+    def test_old_logs_need_no_token_and_prior_gate_cannot_progress(self):
+        for job,(size,digest,line) in t.TRANSCRIPTS.items():
+            t.log_witness(job,line.split("Z ",1)[1])
+            with self.assertRaises(ValueError): t.log_witness(job,"different failure")
+        fake=Service();fake.previous[0]["steps"][-1]["conclusion"]="success"
+        with self.assertRaisesRegex(ValueError,"first admission"):apply(fake)
+        self.assertEqual(fake.posts,0)
 
     def test_wrong_service_evidence_never_reserves(self):
         for change in ("wrong-claim","expired","cipher-sha","wrong-size","handoff-name","original-writer-ran","other-transfer",

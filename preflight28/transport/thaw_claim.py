@@ -7,11 +7,9 @@ import json
 import os
 from pathlib import Path
 import re
-import resource
 import stat
 import subprocess
 import sys
-import tempfile
 
 import recovery_claim as v2
 
@@ -74,19 +72,49 @@ def check_event(api, env, event, checkout, mode):
             "artifacts":{k:dict(id=v[0],bytes=v[1],sha256=v[2],expires_at=v[3]) for k,v in ARTIFACTS.items()}}
 
 
+# Immutable provider transcripts read independently with the existing owner
+# connector. SHA is over the exact UTF-8 decoded transcript re-encoded as UTF-8.
+# The job-scoped workflow token can read job metadata but returned an error
+# fetching historical logs in run 45519361611; the live checks below remain.
+TRANSCRIPTS = {
+    PRODUCE: (440582, "725b17f56b83b4a46e5cb6efb1ee5a6e13893ee3a9361036795768962ae0679e",
+              "2026-11-25T00:28:39.2724305Z ValueError: Unaccounted retained output replacement: gn_logs.txt"),
+    SEND: (14139, "f9f2af3ac7a4cf7c01a6198d17157fd792a7c2c7f984274a3393192d552e6c7c",
+           "2026-11-25T00:28:41.7256633Z ValueError: Original peer ended without proof of success"),
+}
+FAILED_GATE = 45519361611
+FAILED_HEAD = "82d6fe3a24c4aa7a6d4280419d4121c95e884c0b"
+FAILED_JOBS = (138886992719, 138887106729, 138887107201)
+
+
 def log_witness(job, expected):
-    # GitHub CLI follows GitHub's short-lived job-log redirect. Keep its URL and
-    # all unrelated log contents out of job output. The observed logs are <500KB.
-    limit=2*1024**2
-    with tempfile.TemporaryFile() as f:
-        def bounded():
-            resource.setrlimit(resource.RLIMIT_FSIZE,(limit,limit))
-        subprocess.run(["gh","api","--method","GET",f"repos/{a.REPO}/actions/jobs/{job}/logs"],
-                       stdout=f,stderr=subprocess.DEVNULL,check=True,timeout=65,preexec_fn=bounded)
-        f.seek(0)
-        data=f.read(limit+1)
-    require(0<len(data)<limit and any(line.rstrip().endswith(expected.encode()) for line in data.splitlines()),
-            "Historical job log does not contain the approved failure reason")
+    size, digest, line = TRANSCRIPTS[job]
+    require(line.split("Z ",1)[1]==expected and size>0 and re.fullmatch("[0-9a-f]{64}",digest),
+            "Historical owner-verified witness does not match the selected failure")
+    print(f"transcript_source=prior_independent_owner_read job={job} utf8_bytes={size} sha256={digest}")
+
+
+def previous_gate(api):
+    root=f"{api.BASE}/actions/runs/{FAILED_GATE}"
+    run=api.metadata(root+"/attempts/1")
+    v2.pinned_run(run,FAILED_GATE,FAILED_HEAD,WORKFLOW)
+    require(run["status"]=="completed" and run["conclusion"]=="failure","Prior thaw could still be running")
+    page=api.metadata(root+"/attempts/1/jobs?per_page=100")
+    jobs={j["id"]:j for j in page["jobs"]}
+    require(page["total_count"]==3 and set(jobs)==set(FAILED_JOBS) and
+            [jobs[k]["conclusion"] for k in FAILED_JOBS]==["failure","skipped","skipped"] and
+            all(j["status"]=="completed" and j["run_id"]==FAILED_GATE for j in jobs.values()),
+            "Prior thaw might have accepted original bytes")
+    results={s["name"]:s["conclusion"] for s in jobs[FAILED_JOBS[0]]["steps"]}
+    failure="Confirm failed prior acceptance, exact surviving artifacts and new single recovery claim"
+    require({k for k,v in results.items() if v=="failure"}=={failure} and
+            all(results.get(k)=="skipped" for k in ("Deposit request for this exact recovery",
+                "Open original authenticated frames and verify the original producer evidence",
+                "Reconcile original data and publish the original immutable generation")),
+            "Prior thaw did not stop at its first admission check")
+    arts=api.metadata(root+"/artifacts?per_page=100")
+    require(arts["total_count"]==0 and not arts["artifacts"],"Prior thaw already created a transfer")
+    print(f"prior_unclaimed_gate={FAILED_GATE} prior_publication=skipped prior_artifacts=0")
 
 
 def source_failed(api, read_log):
@@ -202,6 +230,7 @@ def run(mode, helper, env, event, checkout, *, audit=None, clock=None, read_log=
     holder=check_event(api,env,event,checkout,mode)
     manifest=check_original_draft(api)
     if mode=="reserve":
+        previous_gate(api)
         source_failed(api,read_log)
         if not manifest:
             valid_artifacts(api,clock or datetime.now(timezone.utc))
