@@ -1,0 +1,27 @@
+{
+  "spec": {
+    "BARE_REV": "21cb542601950cbd5ee2eddcad6a9163bdf5ea99",
+    "CHROMIUM_REV": "800628ad1ca1fd0c51e3b43b5b2bca081e81c3f6",
+    "DEPOT_REV": "96a7c1418eedaa6bea333a8941e8a0078681b4d0",
+    "revision": "800628ad1ca1fd0c51e3b43b5b2bca081e81c3f6",
+    "scope": "chromium",
+    "url": "https://chromium.googlesource.com/chromium/src.git"
+  },
+  "tree": "a4ac23792423662a0e4db0781f747188bfcb9046",
+  "sha256": "fcb767e71051ae3326ab5c46fe2296f9bea596becaa1ff96ba865964a11fb972",
+  "bytes": 1445132120,
+  "files": 506967,
+  "checkout_bytes": 4332343336,
+  "artifact": {
+    "id": 15011371264,
+    "size_in_bytes": 1445132256,
+    "digest": "sha256:c24a41ffc22f4957c16e37b51c5da7edeafe7ef8da29f897b200e46c1e5d1e19",
+    "name": "bare-public-git-45590664108-1",
+    "workflow_run": 45590664108,
+    "attempt": 1,
+    "producer_sha": "ce90c02d107f13af39fbfb7b44cfe92e2102d6f3",
+    "producer_workflow_id": 411691930,
+    "expires_at": "2026-11-26T10:02:24Z",
+    "producer_job": 139123887632
+  }
+}
