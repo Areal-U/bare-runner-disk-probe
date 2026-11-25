@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 import thaw
 
@@ -73,18 +73,48 @@ def key():
         b.keygen()
     finally:
         b.ROOT=previous
-    (ROOT/"holder.json").write_text(json.dumps({**c,"fingerprint":b.fingerprint(ROOT/"public.pem")},sort_keys=True))
+    holder={**c,"fingerprint":b.fingerprint(ROOT/"public.pem")}
+    if resumed():
+        import anon_peer
+        holder["anonymous_api"]=anon_peer.sample(c)
+    (ROOT/"holder.json").write_text(json.dumps(holder,sort_keys=True))
 
 
 def label(c, kind):
     return f"r28-thaw-{c['run']}-a{c['attempt']}-" + {"key":"receiver-key","descriptor":"descriptor"}[kind]
 
 
+ISSUER = "Grant only a short-lived read of original private checkpoint parts"
+READER = "Ordinary runner reads and verifies the private generation from the original recipe"
+
+
+def resumed():
+    value=os.environ.get("R28_RESUME_PUBLISHED")
+    need(value in (None, "45522666298"), "Unknown published checkpoint")
+    return value is not None
+
+
+def check_peer(scope, job_name):
+    page=b.api_json(f"/repos/{b.REPO}/actions/runs/{scope['run']}/attempts/{scope['attempt']}/jobs?per_page=100")
+    need(page["total_count"]==len(page["jobs"])<=3, "Unbound peer inventory")
+    found=[j for j in page["jobs"] if j["name"]==job_name]
+    need(len(found)<=1,"Ambiguous physical peer")
+    if not found:
+        return
+    item,=found
+    need(item["run_id"]==scope["run"] and item.get("run_attempt",scope["attempt"])==scope["attempt"] and
+         item.get("head_sha",scope["head"])==scope["head"], "Wrong peer incarnation")
+    if item["status"]=="completed" and item["conclusion"]!="success":
+        raise Rejected("Original peer terminated without its specific read grant")
+
+
 def wait(kind):
     thaw.check_role("issue" if kind=="key" else "receive")
     c=service()
     name=label(c,kind)
-    end=time.monotonic()+15*60
+    extended=resumed()
+    end=time.monotonic()+(84 if extended and kind=="descriptor" else 15)*60
+    next_peer=0
     while time.monotonic()<end:
         page=b.api_json(f"/repos/{b.REPO}/actions/runs/{c['run']}/artifacts?name={quote(name)}&per_page=100")
         rows=[a for a in page["artifacts"] if a["name"]==name]
@@ -97,8 +127,11 @@ def wait(kind):
             b.output(id=a["id"])
             print(f"thaw_peer={kind} artifact_id={a['id']} expires_at={a['expires_at']}",flush=True)
             return
-        time.sleep(5)
-    raise ValueError("Peer grant was not received before its deadline")
+        if extended and time.monotonic()>=next_peer:
+            check_peer(c,ISSUER if kind=="descriptor" else READER)
+            next_peer=time.monotonic()+45
+        time.sleep(8)
+    raise Rejected("Peer grant was not received before its deadline")
 
 
 def expires(url):
@@ -125,13 +158,52 @@ def expires(url):
     return int(min(limits))
 
 
+def private_visibility(api, obj, deadline, scope, peer_evidence):
+    release=api.draft(b.RELEASE)
+    row=api.asset_info(release,obj["name"],obj["bytes"],obj["sha256"],obj["id"])
+    parsed=urlsplit(row["browser_download_url"])
+    need(parsed.scheme=="https" and parsed.netloc=="github.com" and not parsed.query and not parsed.fragment and
+         parsed.path.startswith("/"+b.REPO+"/releases/download/"),"Unexpected private direct link")
+    for host,path,label in (("github.com",parsed.path,"direct"),(api.API,f"{api.BASE}/releases/assets/{row['id']}","api")):
+        for attempt in range(4):
+            retry_at=api.anonymous_status(host,path,label)
+            if retry_at is None:
+                break
+            need(label=="api" and type(retry_at) is int, "Ambiguous private visibility")
+            if peer_evidence is not None:
+                import anon_peer
+                if anon_peer.valid(peer_evidence,row["id"],scope):
+                    print(f"anonymous_api=404 origin=bound-ordinary asset_id={row['id']}",flush=True)
+                    break
+            remaining=retry_at-int(time.time())
+            need(attempt<3 and remaining<=3900 and retry_at<=deadline,
+                 "Provider reset exceeds remaining private visibility window")
+            print(f"anonymous_reset_at={retry_at} wait_seconds={max(0,remaining)} asset_id={row['id']}",flush=True)
+            while time.time()<retry_at:
+                need(time.time()<deadline, "Private visibility deadline exhausted")
+                check_peer(scope,READER)
+                time.sleep(min(55,max(0,retry_at-time.time())))
+        else:
+            raise Rejected("No completed nonredirecting anonymous 404")
+
+
+def published_gate():
+    subprocess.run([sys.executable, str(Path(__file__).with_name("published_reader.py")), "verify"],check=True)
+
+
 def issue():
     thaw.check_role("issue")
     c=service()
-    thaw.gate("verify")
+    replay=resumed()
+    if replay:
+        published_gate()
+    else:
+        thaw.gate("verify")
     pub=ROOT/"incoming/public.pem"
     fingerprint=b.fingerprint(pub)
-    need(json.loads(thaw.small(ROOT/"incoming/holder.json",8192))=={**c,"fingerprint":fingerprint},
+    holder=json.loads(thaw.small(ROOT/"incoming/holder.json",8192))
+    peer_evidence=holder.pop("anonymous_api",None) if replay else None
+    need(holder=={**c,"fingerprint":fingerprint},
          "Receiver identity does not match the current run and attempt")
     api=thaw.private()
     part=thaw.saved(api,"p00",thaw.SIZE,thaw.SHA)
@@ -140,8 +212,12 @@ def issue():
     need(ref,"Original completed manifest missing")
     manifest_inputs(ref,c["attempt"])
     thaw.verify_manifest(api,part,ref)
+    deadline=int(time.time())+65*60
     for obj in (ref,part):
-        thaw.invisible(api,obj)
+        if replay:
+            private_visibility(api,obj,deadline,c,peer_evidence)
+        else:
+            thaw.invisible(api,obj)
     conn,res=api.request(api.API,"GET",f"{api.BASE}/releases/assets/{part['id']}",auth=True,accept="application/octet-stream")
     try:
         need(res.status==302,"No private part redirect")

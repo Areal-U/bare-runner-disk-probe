@@ -55,6 +55,12 @@ class Draft:
 
 class ThawReadTests(unittest.TestCase):
     def test_complete_other_host_download_and_rerun(self):
+        self.full_delivery(False)
+
+    def test_published_only_full_read(self):
+        self.full_delivery(True)
+
+    def full_delivery(self,replay):
         with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
             top=Path(td)
             data=random.Random(39).randbytes(3*r.CHUNK+44)
@@ -77,6 +83,11 @@ class ThawReadTests(unittest.TestCase):
             api=Draft(data,address)
             stack.enter_context(patch.object(r.thaw,"private",return_value=api))
             gates=[]
+            if replay:
+                import anon_peer
+                os.environ["R28_RESUME_PUBLISHED"]="45522666298"
+                stack.enter_context(patch.object(anon_peer,"sample",return_value={"ids":[]}))
+                stack.enter_context(patch.object(r,"published_gate",side_effect=lambda:gates.append("published-only")))
             stack.enter_context(patch.object(r.thaw,"gate",side_effect=gates.append))
             reverse=top/"ordinary";issuer=top/"issuer";reverse.mkdir();issuer.mkdir()
             def role(name):
@@ -103,7 +114,7 @@ class ThawReadTests(unittest.TestCase):
             (r.ROOT/"incoming").mkdir(parents=True,mode=0o700)
             for f in ("public.pem","holder.json"):shutil.copyfile(reverse/"r28-thaw"/f,r.ROOT/"incoming"/f)
             r.issue()
-            self.assertEqual(gates,["verify"]);self.assertEqual(len(api.deny),4)
+            self.assertEqual(gates,["published-only"] if replay else ["verify"]);self.assertEqual(len(api.deny),4)
             encrypted=(r.ROOT/"descriptor.cms").read_bytes()
             self.assertNotIn(b"release-assets.github",encrypted)
             self.assertNotIn(b"se=",encrypted)
