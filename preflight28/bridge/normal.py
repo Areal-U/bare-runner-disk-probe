@@ -76,8 +76,21 @@ def sender_deadline(record):
     return expected["sender_accept_until"]
 
 
+class RelayTimeExpired(ValueError):
+    pass
+
+
+class RelayCapacityExceeded(ValueError):
+    pass
+
+
+class RelayPriorExists(ValueError):
+    pass
+
+
 def time_left(deadline, required_seconds, stage):
-    b.require(time.time() + required_seconds <= deadline, "Sender time budget exhausted before " + stage)
+    if time.time() + required_seconds > deadline:
+        raise RelayTimeExpired("Sender time budget exhausted before " + stage)
 
 
 def keygen(role,check_run,job_start=None):
@@ -126,8 +139,16 @@ def wait(kind):
             b.require(len(mine)<=1,"Ambiguous ordinary job identity")
             if len(mine)==1 and mine[0]["status"]=="completed":
                 observed_done=observed_done or time.monotonic()
+                if time.monotonic()-observed_done>=75 and mine[0]["conclusion"]=="success":
+                    b.output(outcome_absent="true")
+                    return
                 b.require(time.monotonic()-observed_done<75,"Ordinary job terminated without a durable outcome")
         time.sleep(max(0,min(deadline-time.monotonic(),8 if kind!="outcome" else 30)))
+    if kind=="outcome":
+        # Only an explicit, matching ordinary stop is accepted by the caller.
+        # Absence here never creates a readable checkpoint or triggers another slot.
+        b.output(outcome_absent="true")
+        return
     raise ValueError("Peer receipt unavailable before bounded deadline")
 
 
@@ -296,7 +317,8 @@ def capacity():
         return
     rows=b.inventory()
     name=stem()+"-outcome"
-    b.require(not any(row["name"]==name for row in rows), "Existing exact outcome must be reconciled")
+    if any(row["name"] == name for row in rows):
+        raise RelayPriorExists("Existing exact outcome must be reconciled")
     active=sum(x["size_in_bytes"] for x in rows if not x["expired"])
     visible=sum(x["size_in_bytes"] for x in rows)
     sealed=(ROOT/"checkpoint.cms").stat().st_size
@@ -310,8 +332,8 @@ def capacity():
         "projected_with_remaining_slots_at_same_size":visible+(13-slot())*outer,"retention_days":1,
         "configured_ceiling_bytes":int(limit) if limit else None,
         "new_native_cache_bytes":0},sort_keys=True),flush=True)
-    if limit:
-        b.require(visible+outer<=int(limit), "Candidate exceeds configured repository Artifact storage ceiling")
+    if limit and visible+outer>int(limit):
+        raise RelayCapacityExceeded("Candidate exceeds configured repository Artifact storage ceiling")
     time_left(sender_deadline(info()), (UPLOAD_MINUTES + VISIBILITY_MINUTES)*60, "outcome upload")
 
 

@@ -10,6 +10,7 @@ import yaml
 
 os.environ.setdefault("RUNNER_TEMP","/tmp")
 import normal
+import outcome_relay
 
 WORKFLOW = Path(__file__).resolve().parents[2]/".github/workflows/bare-arm64-probe.yml"
 JOBS = yaml.safe_load(WORKFLOW.read_bytes())["jobs"]
@@ -27,7 +28,11 @@ class SenderClockTests(unittest.TestCase):
         self.assertIn('guard.py job-clock --check-run "$CHECK_RUN"',key)
         self.assertIn('keygen limited --check-run "$CHECK_RUN" --job-start "$sender_start"',key)
         ordinary={step.get("id"):step for step in JOBS["compile-probe"]["steps"]}
-        self.assertEqual(ordinary["peer_put_outcome"]["timeout-minutes"],normal.UPLOAD_MINUTES)
+        upload_limit = "${{ fromJSON(steps.peer_capacity.outputs.upload_minutes || '18') }}"
+        for name in ("peer_put_outcome", "retry_relay"):
+            self.assertEqual(ordinary[name]["timeout-minutes"],upload_limit)
+        self.assertEqual(outcome_relay.upload_minutes({"status":"candidate"}),normal.UPLOAD_MINUTES)
+        self.assertEqual(outcome_relay.upload_minutes({"status":"no-progress"}),2)
         step=ordinary["trial"]
         self.assertIn("steps.peer_acquire.outputs.sender_outcome_deadline",step["env"]["SENDER_OUTCOME_DEADLINE"])
         code=step["run"]
