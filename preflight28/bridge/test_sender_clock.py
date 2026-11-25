@@ -23,7 +23,7 @@ class SenderClockTests(unittest.TestCase):
         self.assertEqual(sender["timeout-minutes"],normal.JOB_MINUTES)
         fetch=next(step for step in sender["steps"] if step["name"].startswith("Fetch authenticated outcome"))
         self.assertEqual(fetch["timeout-minutes"],normal.DOWNLOAD_MINUTES)
-        self.assertEqual(steps["publish"]["timeout-minutes"],normal.PUBLISH_MINUTES)
+        self.assertEqual(steps["publish"]["timeout-minutes"],normal.JOB_MINUTES)
         key=steps["peer_key"]["run"]
         self.assertIn('guard.py job-clock --check-run "$CHECK_RUN"',key)
         self.assertIn('keygen limited --check-run "$CHECK_RUN" --job-start "$sender_start"',key)

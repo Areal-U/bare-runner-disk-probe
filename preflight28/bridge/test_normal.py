@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs,urlsplit
@@ -122,7 +123,30 @@ class TestTransport(unittest.TestCase):
                 n.recover()
                 self.assertIn("recovery_status=partial_private_parts",(work/"outputs").read_text())
                 api.assets.extend([second,manifest_row])
-                n.recover()
+                # A provider throttle never acknowledges private visibility. The
+                # part/manifest were committed only once; all reconciliation is GET.
+                deadline=time.time()+210
+                timeline=[]
+                def throttled(host,path,label):
+                    timeline.append((host,path,label))
+                    return int(deadline+3600) if label=="api" else None
+                with patch.object(api,"anonymous_status",side_effect=throttled):
+                    n.recover(deadline=deadline)
+                pending=dict(line.split("=",1) for line in (work/"outputs").read_text().splitlines())
+                self.assertEqual(pending["recovery_status"],"manifest_present_visibility_pending")
+                self.assertEqual(pending["private_readback_verified"],"false")
+                self.assertEqual(pending["checkpoint_advanced"],"false")
+                self.assertEqual(int(pending["checkpoint_manifest_id"]),manifest_row["id"])
+                self.assertEqual(pending["checkpoint_manifest_sha"],manifest_row["digest"].removeprefix("sha256:"))
+                self.assertEqual(pending["checkpoint_sha"],b.digest(candidate))
+                self.assertEqual([event[2] for event in timeline],["direct","direct","direct","api"])
+                explicit={"R28_EXPECTED_RECOVERY_MANIFEST":str(manifest_row["id"]),
+                          "R28_EXPECTED_RECOVERY_MANIFEST_SHA":pending["checkpoint_manifest_sha"]}
+                with patch.dict(os.environ,explicit):
+                    with patch.dict(os.environ,R28_EXPECTED_RECOVERY_MANIFEST="999999"):
+                        with self.assertRaisesRegex(ValueError,"observed private manifest changed"):
+                            n.recover(deadline=time.time()+900)
+                    n.recover(deadline=time.time()+900)
                 self.assertEqual(len(api.assets),4)
                 with self.assertRaisesRegex(ValueError,"Rerun"):n.publish()
                 rec=dict(line.split("=",1) for line in (work/"outputs").read_text().splitlines())

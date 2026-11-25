@@ -26,6 +26,8 @@ PUBLISH_MINUTES = 34
 SENDER_MARGIN_MINUTES = 5
 UPLOAD_MINUTES = 18
 VISIBILITY_MINUTES = 2
+# Pinned GitHub HTTP client uses a 150s socket timeout per anonymous GET.
+VISIBILITY_REQUEST_SECONDS = 150
 
 
 def slot():
@@ -379,35 +381,67 @@ def put(suffix,file,offset,length,digest):
     raise ValueError("Empty residue on both permitted write attempts")
 
 
-def verify_outputs(mid,sha_manifest):
+def visibility(api, rows, deadline):
+    """Probe all direct URLs first, then the per-asset API sharing one anonymous quota."""
+    b.require(isinstance(deadline,(int,float)) and deadline>0,
+              "Visibility needs the absolute current hosted-job deadline")
+    stop=time.monotonic()+max(0,deadline-time.time())
+    checks=[]
+    for row in rows:
+        url=urlsplit(row["browser_download_url"])
+        b.require(url.scheme=="https" and url.netloc=="github.com" and not url.query and not url.fragment and
+                  url.path.startswith("/"+b.REPO+"/releases/download/"),"Unexpected direct asset URI")
+        checks.append((row,"direct","github.com",url.path))
+    checks.extend((row,"api",api.API,f"{api.BASE}/releases/assets/{row['id']}") for row in rows)
+    state={row["id"]:{"id":row["id"],"bytes":row["size"],"sha256":row["digest"].removeprefix("sha256:"),
+                       "authenticated":"verified","direct":"not_probed","api":"not_probed"} for row in rows}
+    for row,label,host,path in checks:
+        while time.monotonic()+VISIBILITY_REQUEST_SECONDS<=stop:
+            # None means a genuine nonredirecting 404. Recognized API 403/429
+            # supply an absolute provider deadline. Public or ambiguous replies raise.
+            retry_at=api.anonymous_status(host,path,label)
+            if retry_at is None:
+                state[row["id"]][label]="404"
+                break
+            b.require(type(retry_at) is int and retry_at>0 and host==api.API,
+                      "Unrecognized anonymous-service retry response")
+            state[row["id"]][label]="rate_limited"
+            state[row["id"]]["retry_at"]=retry_at
+            delay=max(1,retry_at-time.time())
+            if time.monotonic()+delay+VISIBILITY_REQUEST_SECONDS>stop:
+                return False,state
+            print(f"private_checkpoint_rate_wait asset_id={row['id']} endpoint={label} "
+                  f"provider_retry_epoch={retry_at} remaining_seconds={max(0,int(stop-time.monotonic()))}",flush=True)
+            time.sleep(delay)
+        else:
+            return False,state
+    return True,state
+
+
+def verify_outputs(mid,sha_manifest,deadline):
     m=get_manifest(mid,sha_manifest,logical(slot()))
     b.require(same(m),"Accepted manifest no longer corresponds to selected parent")
     api=b.auth_api()
     full=hashlib.sha256()
     existing=list_private(api)
-    ids={mid,*[p["id"] for p in m["parts"]]}
-    rows=[r for r in existing["assets"] if r["id"] in ids]
-    b.require(len(rows)==len(ids),"Private generation lost assets before readback")
-    for row in rows:
-        url=urlsplit(row["browser_download_url"])
-        b.require(url.scheme=="https" and url.netloc=="github.com" and not url.query and not url.fragment and
-                  url.path.startswith("/"+b.REPO+"/releases/download/"),"Unexpected direct asset URI")
-        for host,path,label in (("github.com",url.path,"direct"),(api.API,f"{api.BASE}/releases/assets/{row['id']}","api")):
-            for attempt in range(2):
-                retry_at=api.anonymous_status(host,path,label)
-                if retry_at is None:break
-                delay=max(0,retry_at-int(time.time()))
-                b.require(attempt==0 and delay<=45,"Anonymous access not confirmed inside finite readback budget")
-                time.sleep(delay)
+    ids=[mid,*[p["id"] for p in m["parts"]]]
+    by_id={r["id"]:r for r in existing["assets"] if r["id"] in ids}
+    b.require(len(by_id)==len(ids),"Private generation lost assets before readback")
     class Sink:
         def write(self,block):full.update(block)
     for part in m["parts"]:
         api.download(part["id"],part["bytes"],part["sha256"],Sink())
     b.require(full.hexdigest()==m["sha256"],"Independent private GET mismatch")
+    verified,observations=visibility(api,[by_id[i] for i in ids],deadline)
+    status="verified" if verified else "manifest_present_visibility_pending"
+    print("private_checkpoint_readback="+json.dumps({"status":status,"manifest_id":mid,
+          "manifest_sha256":sha_manifest,"archive_bytes":m["bytes"],"archive_sha256":m["sha256"],
+          "deadline_epoch":int(deadline),"assets":list(observations.values())},sort_keys=True),flush=True)
+    flag=str(verified).lower()
     b.output(checkpoint_manifest_id=mid,checkpoint_manifest_sha=sha_manifest,checkpoint_sha=m["sha256"],
              checkpoint_bytes=m["bytes"],checkpoint_identity=m["identity"],checkpoint_key=m["key"],
-             checkpoint_ordinal=m["ordinal"],producer_sha=m["producer_sha"],private_readback_verified="true",
-             checkpoint_advanced="true")
+             checkpoint_ordinal=m["ordinal"],producer_sha=m["producer_sha"],private_readback_verified=flag,
+             checkpoint_advanced=flag,recovery_status=status)
 
 
 def put_json(suffix, record):
@@ -496,15 +530,24 @@ def publish():
         for i,part in enumerate(expected):
             m["parts"].append(put(f"p{i:02}",source,i*PART,part["bytes"],part["sha256"]))
     receipt=put_json("manifest.json",m)
-    verify_outputs(receipt["id"],receipt["sha256"])
+    # This bound is derived from the authenticated physical job start, shared
+    # by all assets; the 34m transfer reserve is not a visibility wall.
+    deadline=cutoff+(DOWNLOAD_MINUTES+PUBLISH_MINUTES)*60
+    verify_outputs(receipt["id"],receipt["sha256"],deadline)
 
 
-def recover():
+def recover(deadline=None):
     # Only an independently readable Draft manifest admits further compilation.
     # An uncommitted encrypted Artifact has a separate offline owner-recovery path.
     api=b.auth_api()
     release=list_private(api)
     row=existing(release,"manifest.json")
+    expected=os.environ.get("R28_EXPECTED_RECOVERY_MANIFEST","")
+    digest=os.environ.get("R28_EXPECTED_RECOVERY_MANIFEST_SHA","")
+    if expected or digest:
+        b.require(expected.isdecimal() and int(expected)>0 and sha_check(digest) and row is not None
+                  and row["id"]==int(expected) and row["digest"]=="sha256:"+digest,
+                  "Original independently observed private manifest changed")
     if not row:
         if recovered_intent(release):
             return
@@ -518,14 +561,16 @@ def recover():
                      checkpoint_advanced="false",owner_outcome_artifact_id=rec["artifact_id"])
             return
         raise ValueError("No unique committed generation; inspect exact ciphertext and owner-wrapped recovery receipt before any reissue; no automatic recomputation")
-    verify_outputs(row["id"],row["digest"].removeprefix("sha256:"))
+    b.require(deadline is not None and deadline>0,"Committed manifest needs the live recovery job deadline")
+    verify_outputs(row["id"],row["digest"].removeprefix("sha256:"),deadline)
 
 
 if __name__=="__main__":
     os.umask(0o077)
     parser=argparse.ArgumentParser(description=__doc__)
     sub=parser.add_subparsers(dest="mode",required=True)
-    for mode in ("names","issue","acquire","publish","recover","capacity"):sub.add_parser(mode)
+    for mode in ("names","issue","acquire","publish","capacity"):sub.add_parser(mode)
+    a=sub.add_parser("recover");a.add_argument("--deadline",type=int,required=True)
     a=sub.add_parser("keygen");a.add_argument("role",choices=["ordinary","limited"]);a.add_argument("--check-run",type=int,required=True);a.add_argument("--job-start",type=int)
     a=sub.add_parser("wait");a.add_argument("kind",choices=["key","descriptor","outcome"])
     a=sub.add_parser("seal");a.add_argument("file",type=Path);a.add_argument("--identity",required=True);a.add_argument("--proof-sha",required=True)
