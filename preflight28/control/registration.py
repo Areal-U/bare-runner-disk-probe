@@ -70,6 +70,7 @@ def checked_build_route(inputs):
                 "apk_recipient": RECIPIENT, "jobs": "2", "output_gib": "18"}
     require(all(inputs.get(k, v) == v for k, v in required.items()) and
             inputs.get("compile_minutes", "0") in ("0", "180") and
+            inputs.get("checkpoint_compression", "auto") in ("auto", "compact") and
             inputs.get("retain_existing_caches", "false") in ("false", False) and
             not inputs.get("loss_origin_run") and not inputs.get("encrypted_apk_bytes"),
             "Dispatch differs from the R28 numbered Draft build")

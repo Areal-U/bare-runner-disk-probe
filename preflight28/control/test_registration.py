@@ -123,7 +123,7 @@ class TicketTests(unittest.TestCase):
     def test_nominal_ticket_cannot_reserve_a_legacy_or_alternate_build(self, claim):
         fixed = dict(checkpoint_key="bare-coexist-204-45285202990-1-checkpoint-production-s2",
                      checkpoint_sha=S2_SHA, checkpoint_identity="a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc")
-        for override in ({"checkpoint_backend":"cache"}, dict(fixed,build_segments="1"), dict(fixed,build_segments="2"),
+        for override in ({"checkpoint_backend":"cache"}, {"checkpoint_compression":"unknown"}, dict(fixed,build_segments="1"), dict(fixed,build_segments="2"),
                          dict(fixed,checkpoint_key="foreign"), {"checkpoint_sha":S2_SHA}, {"compile_minutes":"25"},
                          {"loss_origin_run":"42"}, {"retain_existing_caches":"true"}, {"jobs":"1"}, {"output_gib":"19"},
                          {"encrypted_apk_bytes":"859"}, {"apk_recipient":"other"}):
