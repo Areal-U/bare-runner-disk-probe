@@ -63,8 +63,12 @@ def api_json(path, expected=200, *, timeout=30):
     require(path == "/repos/" + REPO or path.startswith("/repos/" + REPO + "/"), "Unscoped API access")
     conn = http.client.HTTPSConnection("api.github.com", timeout=timeout)
     try:
-        conn.request("GET", path, headers={"User-Agent":"r28-split-reader/1", "Accept":"application/vnd.github+json",
-                     "Authorization":"Bearer " + os.environ["GH_TOKEN"], "X-GitHub-Api-Version":"2022-11-28"})
+        headers = {"User-Agent":"r28-split-reader/1", "Accept":"application/vnd.github+json",
+                   "Authorization":"Bearer " + os.environ["GH_TOKEN"], "X-GitHub-Api-Version":"2022-11-28"}
+        if os.environ.get("BARE_NEXT_FRESH_RUN_GATE") == "1" and "/actions/runs?status=" in path:
+            headers["Cache-Control"] = "no-cache, max-age=0"
+            conn.timeout = min(conn.timeout, 6)
+        conn.request("GET", path, headers=headers)
         response = conn.getresponse()
         limited = response.status == 403 and (
             response.getheader("X-RateLimit-Remaining") == "0" or bool(response.getheader("Retry-After")))

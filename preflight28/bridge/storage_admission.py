@@ -135,7 +135,73 @@ def receipt_rows(get):
     return first
 
 
+RUN_STATES = ("in_progress", "queued", "waiting", "pending", "requested")
+DIAGNOSTIC_FLAG = "BARE_NEXT_FRESH_RUN_GATE"
+
+
+def diagnostic_active_runs(get, env, *, delays=(0, 2, 5, 9), seconds=65):
+    """A suspect diagnostic view needs two fresh, complete clean sweeps before admission."""
+    run = int(env["GITHUB_RUN_ID"])  # 0 for the pre-dispatch check
+    deadline = time.monotonic() + seconds
+    clean_sweeps = 0
+    required = 1
+    for index, delay in enumerate(delays):
+        if time.monotonic() + delay >= deadline:
+            break
+        if delay:
+            time.sleep(delay)
+        problems, seen = {}, set()
+        for state in RUN_STATES:
+            if time.monotonic() >= deadline:
+                break
+            # Change page size between sweeps to avoid reusing the same cached URL.
+            path = f"{BASE}/actions/runs?status={state}&per_page={2+index}"
+            try:
+                response = get(path)
+            except (OSError, ValueError) as exc:
+                code = getattr(exc, "code", getattr(exc, "status", None))
+                # Do not write arbitrary remote text, titles, URLs or credentials into logs.
+                problems[state] = {"error": type(exc).__name__, "http":code if type(code) is int else None}
+                continue
+            if not isinstance(response, dict):
+                problems[state] = {"error":"invalid response"}
+                continue
+            rows, total = response.get("workflow_runs"), response.get("total_count")
+            sample = []
+            valid = isinstance(rows, list) and type(total) is int and total == len(rows) <= 1
+            if isinstance(rows, list):
+                for row in rows[:5]:
+                    row = row if isinstance(row, dict) else {}
+                    ident, observed = row.get("id"), row.get("status")
+                    sample.append({"id": ident if type(ident) is int else None,
+                                   "status": observed if observed in (*RUN_STATES,"completed") else "missing/unknown"})
+                    if type(ident) is not int or ident <= 0 or ident != run or observed != state or ident in seen:
+                        valid = False
+                    elif valid:
+                        seen.add(ident)
+            if not valid:
+                problems[state] = {"total": total if type(total) is int else None,
+                                   "count":len(rows) if isinstance(rows,list) else None, "rows":sample}
+        if time.monotonic() >= deadline:
+            print("BARE_NEXT_GATE deadline before verified full inventory", file=sys.stderr, flush=True)
+            break
+        if problems:
+            clean_sweeps = 0
+            required = 2
+            print("BARE_NEXT_GATE "+json.dumps({"run":run,"sweep":index+1,"filtered":problems},sort_keys=True),
+                  file=sys.stderr, flush=True)
+        else:
+            clean_sweeps += 1
+            if clean_sweeps >= required:
+                if required == 2:
+                    print(f"BARE_NEXT_GATE run={run} settled after {index+1} sweeps",file=sys.stderr,flush=True)
+                return
+    raise StorageUnconfirmed("Another or unknown run: diagnostic inventory did not settle in time")
+
+
 def check_active_runs(get, env):
+    if env.get(DIAGNOSTIC_FLAG) == "1":
+        return diagnostic_active_runs(get, env)
     run = int(env["GITHUB_RUN_ID"])
     for status in ("in_progress","queued","waiting","pending","requested"):
         active = get(f"{BASE}/actions/runs?status={status}&per_page=2")
