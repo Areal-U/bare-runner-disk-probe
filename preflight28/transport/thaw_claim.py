@@ -22,7 +22,19 @@ CLAIM_ID = 789343072
 RESERVE, PRODUCE, SEND, RECEIVE = 138867879857, 138867986638, 138867986660, 138883657205
 CAMPAIGN = "r28-preflight-s2-20261125-v3"
 WORKFLOW = ".github/workflows/bare-r28-s2-thaw.yml"
-CLAIM = CAMPAIGN + "-frozen-s2-claim.json"
+PREVIOUS_CLAIM = CAMPAIGN + "-frozen-s2-claim.json"
+ROTATED_RUN = 45519704241
+ROTATED_RECOVER = 138888166632
+ROTATED_RECEIVE = 138889312318
+ROTATED_ISSUE = 138889312694
+ROTATED_HEAD = "46ddb76ee4d7084269d0807b0711e1f171069a3c"
+ROTATED_BEFORE = "7e6599d7c58e5597036fcc66432435e768fce762"
+ROTATED_CLAIM_ID = 789455791
+ROTATED_CHALLENGE = 14979437645
+CHALLENGE_SHA = "32aa86fcdc869288aeccc651e420393b8d12fb65ed73d737de6af1dce1f34687"
+CHALLENGE_SIZE = 2906
+ROTATED_TRANSCRIPT_SHA = "e4713d82f521e4b30fa8eedc873a458adef3a328ca1129ce564aaf751ba0a9ce"
+CLAIM = CAMPAIGN + "-frozen-s2-after-45519704241.json"
 STEM = f"{v2.CAMPAIGN}-run{SOURCE}-a1-seg01-"
 CHILD = "532ca75915583a89e2830d062076e3d7130f1edabbe5c03159ce6b1e3c76c1ba"
 SIZE = 1745316602
@@ -49,7 +61,7 @@ def v2_holder():
 def check_event(api, env, event, checkout, mode):
     attempt, rid = int(env["GITHUB_RUN_ATTEMPT"]), int(env["GITHUB_RUN_ID"])
     head, before, pr = env["TRIAL_SHA"], env["PRIOR_SHA"], event["pull_request"]
-    require(rid>SOURCE and attempt>=1 and env["GITHUB_JOB"] == ("issue" if mode=="verify" else "recover") and
+    require(rid>ROTATED_RUN and attempt>=1 and env["GITHUB_JOB"] == ("issue" if mode=="verify" else "recover") and
             (mode=="verify" or attempt==1) and env["GITHUB_ACTOR"]==env["GITHUB_TRIGGERING_ACTOR"]==v2.OWNER and
             env["GITHUB_REPOSITORY"]==a.REPO and env["GITHUB_EVENT_NAME"]=="pull_request" and
             env["GITHUB_REF"]=="refs/pull/9/merge", "Forbidden transfer attempt, role, or actor")
@@ -64,12 +76,24 @@ def check_event(api, env, event, checkout, mode):
     current=original if attempt==1 else api.metadata(f"{api.BASE}/actions/runs/{rid}/attempts/{attempt}")
     v2.pinned_run(current,rid,head,WORKFLOW,attempt)
     require(current["status"]=="in_progress" and current["conclusion"] is None,"Inactive transfer attempt")
+    prior = previous_holder()
+    return {**base_holder(rid,head,before),"schema":4,"supersedes_run":ROTATED_RUN,
+            "supersedes_claim_id":ROTATED_CLAIM_ID,"supersedes_claim_sha256":hashlib.sha256(a.encode(prior)).hexdigest(),
+            "supersedes_recover_job":ROTATED_RECOVER,"supersedes_challenge_id":ROTATED_CHALLENGE,
+            "supersedes_challenge_sha256":CHALLENGE_SHA,"supersedes_transcript_sha256":ROTATED_TRANSCRIPT_SHA}
+
+
+def base_holder(rid, head, before):
     return {"schema":3,"campaign":CAMPAIGN,"workflow":WORKFLOW,"repository_id":a.REPO_ID,"pr":9,
             "run_id":rid,"initial_attempt":1,"head":head,"before":before,"source_run":SOURCE,"source_head":HEAD,
             "source_attempt":1,"source_claim":CLAIM_ID,"source_claim_sha256":hashlib.sha256(a.encode(v2_holder())).hexdigest(),
             "source_job":PRODUCE,"source_parent_sha":a.S2_SHA,"original_draft_stem":STEM,
             "source_sha256":CHILD,"source_bytes":SIZE,
             "artifacts":{k:dict(id=v[0],bytes=v[1],sha256=v[2],expires_at=v[3]) for k,v in ARTIFACTS.items()}}
+
+def previous_holder():
+    return base_holder(ROTATED_RUN,ROTATED_HEAD,ROTATED_BEFORE)
+
 
 
 # Immutable provider transcripts read independently with the existing owner
@@ -96,7 +120,7 @@ def log_witness(job, expected):
 
 def previous_gate(api):
     root=f"{api.BASE}/actions/runs/{FAILED_GATE}"
-    run=api.metadata(root+"/attempts/1")
+    run=api.metadata(root)
     v2.pinned_run(run,FAILED_GATE,FAILED_HEAD,WORKFLOW)
     require(run["status"]=="completed" and run["conclusion"]=="failure","Prior thaw could still be running")
     page=api.metadata(root+"/attempts/1/jobs?per_page=100")
@@ -115,6 +139,50 @@ def previous_gate(api):
     arts=api.metadata(root+"/artifacts?per_page=100")
     require(arts["total_count"]==0 and not arts["artifacts"],"Prior thaw already created a transfer")
     print(f"prior_unclaimed_gate={FAILED_GATE} prior_publication=skipped prior_artifacts=0")
+
+
+def previous_accepted(api):
+    root=f"{api.BASE}/actions/runs/{ROTATED_RUN}"
+    run=api.metadata(root)
+    v2.pinned_run(run,ROTATED_RUN,ROTATED_HEAD,WORKFLOW)
+    require(run["status"]=="completed" and run["conclusion"]=="failure","Prior accepted recovery is still active or changed")
+    page=api.metadata(root+"/attempts/1/jobs?per_page=100")
+    jobs={j["id"]:j for j in page["jobs"]}
+    expected={ROTATED_RECOVER:("Recover original sealed candidate and audit before immutable private publication","failure"),
+              ROTATED_RECEIVE:("Ordinary runner reads and verifies the private generation from the original recipe","skipped"),
+              ROTATED_ISSUE:("Grant only a short-lived read of original private checkpoint parts","skipped")}
+    require(set(jobs)==set(expected) and page["total_count"]==len(page["jobs"])==3 and
+            all(j["status"]=="completed" and j["run_id"]==ROTATED_RUN and
+                (j["name"],j["conclusion"])==expected[jid] for jid,j in jobs.items()),"Prior downstream recovery changed")
+    steps=jobs[ROTATED_RECOVER]["steps"]
+    by_name={s["name"]:s for s in steps if s["status"]=="completed"}
+    fail="Locate the owner-encrypted response in the existing private Draft"
+    before=("Confirm failed prior acceptance, exact surviving artifacts and new single recovery claim",
+            "Create recipient for the existing test owner and bind the current recovery job","Deposit request for this exact recovery",
+            "Read verified original original-key Artifact by immutable ID","Read verified original original-cipher Artifact by immutable ID",
+            "Read original S2 for exact archive comparison")
+    after=("Open disposable owner authorisation on this one recovery host",
+           "Open original authenticated frames and verify the original producer evidence",
+           "Recover already committed identical private bytes without any new key exchange",
+           "Compare every original S2 payload and audit the GN diagnostic in the actual graphs",
+           "Authorize only the fixed original archive using the complete accepted audit",
+           "Reconcile original data and publish the original immutable generation")
+    require(len(by_name)==len(steps) and {k for k,s in by_name.items() if s["conclusion"]=="failure"}=={fail} and
+            all(by_name[k]["conclusion"]=="success" and by_name[k]["number"]<by_name[fail]["number"] for k in before)
+            and all(by_name[k]["conclusion"]=="skipped" and by_name[k]["number"]>by_name[fail]["number"] for k in after),
+            "Prior accepted recovery did not stop strictly before open, audit and publication")
+    artifacts=api.metadata(root+"/artifacts?per_page=100")
+    require(artifacts["total_count"]==len(artifacts["artifacts"])==1,"Earlier recovery produced unexpected additional artifacts")
+    row,=artifacts["artifacts"]
+    owner=row["workflow_run"]
+    require(row["id"]==ROTATED_CHALLENGE and row["name"]==f"r28-thaw-{ROTATED_RUN}-request" and
+            row["size_in_bytes"]==CHALLENGE_SIZE and row["digest"]=="sha256:"+CHALLENGE_SHA and
+            owner["id"]==ROTATED_RUN and owner["head_sha"]==ROTATED_HEAD and
+            owner["repository_id"]==owner["head_repository_id"]==a.REPO_ID and owner["head_branch"]==a.BRANCH,
+            "Historical challenge or transfer association changed")
+    print(f"prior_accepted_run={ROTATED_RUN} claim={ROTATED_CLAIM_ID} recovery_job={ROTATED_RECOVER} "
+          f"challenge_artifact={ROTATED_CHALLENGE} publication=skipped "
+          f"owner_observed_transcript_utf8_bytes=32333 sha256={ROTATED_TRANSCRIPT_SHA}",flush=True)
 
 
 def source_failed(api, read_log):
@@ -159,9 +227,11 @@ def check_original_draft(api):
     release=api.draft(a.RELEASE_ID)
     assets=release["assets"]
     require(a.claim_info(api,a.encode(v2_holder()),v2.CLAIM)==CLAIM_ID,"Wrong original v2 claim bytes or ID")
+    require(a.claim_info(api,a.encode(previous_holder()),PREVIOUS_CLAIM)==ROTATED_CLAIM_ID,
+            "Original accepted V3 reservation bytes or immutable ID changed")
     rows=[r for r in assets if r["name"].startswith(STEM)]
     require(all(r["name"] in {STEM+x+y for x in ("p00","manifest.json") for y in ("","-retry1")} for r in rows) and
-            not any((r["name"].startswith(CAMPAIGN+"-") and r["name"]!=CLAIM) or
+            not any((r["name"].startswith(CAMPAIGN+"-") and r["name"] not in (PREVIOUS_CLAIM,CLAIM)) or
                     (r["name"].startswith(v2.CAMPAIGN+"-") and r["name"]!=v2.CLAIM and not r["name"].startswith(STEM)) or
                     r["name"].startswith(f"r28-{SOURCE}-a1-s01-") for r in assets),
             "Unexpected alternate source or destination asset")
@@ -231,6 +301,7 @@ def run(mode, helper, env, event, checkout, *, audit=None, clock=None, read_log=
     manifest=check_original_draft(api)
     if mode=="reserve":
         previous_gate(api)
+        previous_accepted(api)
         source_failed(api,read_log)
         if not manifest:
             valid_artifacts(api,clock or datetime.now(timezone.utc))

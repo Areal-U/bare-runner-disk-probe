@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 import thaw_claim as t
 from test_recovery_claim import GitHub, OWNER, REPO, context, run as base_run
 
-RID=t.SOURCE+100
+RID=t.ROTATED_RUN+100
 WHEAD="6"*40
 WHEN=datetime(2026,11,25,0,35,tzinfo=timezone.utc)
 
@@ -34,10 +34,40 @@ def source_jobs():
                               t.PRIVATE_SEND:"skipped"}),job(t.RECEIVE,"skipped",{})]
 
 
+def accepted_history():
+    labels=[
+        ("Confirm failed prior acceptance, exact surviving artifacts and new single recovery claim","success"),
+        ("Create recipient for the existing test owner and bind the current recovery job","success"),
+        ("Deposit request for this exact recovery","success"),
+        ("Read verified original original-key Artifact by immutable ID","success"),
+        ("Read verified original original-cipher Artifact by immutable ID","success"),
+        ("Read original S2 for exact archive comparison","success"),
+        ("Locate the owner-encrypted response in the existing private Draft","failure"),
+        ("Open disposable owner authorisation on this one recovery host","skipped"),
+        ("Open original authenticated frames and verify the original producer evidence","skipped"),
+        ("Recover already committed identical private bytes without any new key exchange","skipped"),
+        ("Compare every original S2 payload and audit the GN diagnostic in the actual graphs","skipped"),
+        ("Authorize only the fixed original archive using the complete accepted audit","skipped"),
+        ("Reconcile original data and publish the original immutable generation","skipped")]
+    names={t.ROTATED_RECOVER:"Recover original sealed candidate and audit before immutable private publication",
+           t.ROTATED_RECEIVE:"Ordinary runner reads and verifies the private generation from the original recipe",
+           t.ROTATED_ISSUE:"Grant only a short-lived read of original private checkpoint parts"}
+    return [dict(id=key,name=name,status="completed",run_id=t.ROTATED_RUN,
+            conclusion="failure" if key==t.ROTATED_RECOVER else "skipped",
+            steps=[dict(number=i+1,name=n,status="completed",conclusion=v) for i,(n,v) in enumerate(labels)]
+                  if key==t.ROTATED_RECOVER else []) for key,name in names.items()]
+
+
 class Service(GitHub):
     def __init__(self):
         super().__init__()
         self.add(t.v2.CLAIM,t.a.encode(t.v2_holder()),t.CLAIM_ID)
+        self.add(t.PREVIOUS_CLAIM,t.a.encode(t.previous_holder()),t.ROTATED_CLAIM_ID)
+        self.rotated=accepted_history()
+        self.challenges=[dict(id=t.ROTATED_CHALLENGE,name=f"r28-thaw-{t.ROTATED_RUN}-request",size_in_bytes=t.CHALLENGE_SIZE,
+             digest="sha256:"+t.CHALLENGE_SHA,workflow_run=dict(id=t.ROTATED_RUN,head_sha=t.ROTATED_HEAD,head_branch=t.a.BRANCH,
+             repository_id=t.a.REPO_ID,head_repository_id=t.a.REPO_ID))]
+        self.rotated_attempt=1
         self.history=source_jobs()
         outcomes={"Confirm failed prior acceptance, exact surviving artifacts and new single recovery claim":"failure",
                   "Deposit request for this exact recovery":"skipped",
@@ -53,6 +83,11 @@ class Service(GitHub):
         route=urlsplit(url).path.removeprefix(self.BASE)
         if route.startswith("/actions/runs/"):
             rid=int(route.split("/")[3])
+            if rid==t.ROTATED_RUN:
+                if route.endswith("/jobs"): return dict(total_count=len(self.rotated),jobs=self.rotated)
+                if route.endswith("/artifacts"): return dict(total_count=len(self.challenges),artifacts=self.challenges)
+                return {**base_run(rid),"run_attempt":self.rotated_attempt,"head_sha":t.ROTATED_HEAD,"path":t.WORKFLOW,
+                        "status":"completed","conclusion":"failure"}
             if rid==t.FAILED_GATE:
                 if route.endswith("/jobs"): return dict(total_count=3,jobs=self.previous)
                 if route.endswith("/artifacts"): return dict(total_count=0,artifacts=[])
@@ -140,6 +175,29 @@ class Tests(unittest.TestCase):
                 if change=="near-expiry":now=datetime(2026,11,25,23,57,24,tzinfo=timezone.utc)
                 with self.assertRaises(ValueError):apply(h,now=now)
                 self.assertEqual(h.posts,0)
+
+    def test_accepted_previous_stopped_and_immutable(self):
+        frozen=t.a.encode(t.previous_holder())
+        self.assertEqual(len(frozen),1125)
+        self.assertEqual(hashlib.sha256(frozen).hexdigest(),"fc68bc4b80b30dfe115e6bbe2dc205c177416bb5188e5cb44e0056aa88a83eb9")
+        for flaw in ("restarted","scope","unsealed","published","challenge","more","foreign-data","old-name","substituted-authority"):
+            h=Service()
+            if flaw=="restarted":h.rotated_attempt=2
+            if flaw=="scope":h.rotated[1]["name"],h.rotated[2]["name"]=h.rotated[2]["name"],h.rotated[1]["name"]
+            if flaw=="unsealed":h.rotated[0]["steps"][8]["conclusion"]="success"
+            if flaw=="published":h.rotated[0]["steps"][-1]["conclusion"]="success"
+            if flaw=="challenge":h.challenges[0]["digest"]="sha256:"+"0"*64
+            if flaw=="more":h.challenges.append(dict(h.challenges[0],id=11))
+            if flaw=="foreign-data":h.files[t.ROTATED_CLAIM_ID]=b"not original"
+            if flaw=="old-name":h.rows.pop(t.PREVIOUS_CLAIM)
+            if flaw=="substituted-authority":h.rows[t.PREVIOUS_CLAIM]["id"]=32;h.files[32]=frozen
+            with self.subTest(flaw=flaw),self.assertRaises((ValueError,KeyError)):apply(h)
+            self.assertEqual(h.posts,0)
+        h=Service();cid,_=apply(h)
+        self.assertEqual(h.files[t.ROTATED_CLAIM_ID],frozen)
+        self.assertEqual(h.rows[t.PREVIOUS_CLAIM]["id"],t.ROTATED_CLAIM_ID)
+        self.assertNotEqual(cid,t.ROTATED_CLAIM_ID)
+        self.assertEqual(h.posts,1)
 
     def test_bad_audit_cannot_authorize(self):
         h=Service();apply(h)

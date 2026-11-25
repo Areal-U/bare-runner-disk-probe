@@ -55,6 +55,16 @@ def stage_tools():
     archive = commands(ARCHIVE)
     for name in ["Prepare checkpoint_parts.py", "Prepare transfer.py"]:
         shell(archive[name])
+    # The owner saved the same untagged Draft and GitHub assigned a new permalink.
+    # Retain every historical check and require the previously read claim bytes for that exact alias.
+    transfer_source = TEMP / "transfer.py"
+    old_gate = '''    require(pinned_tag(tag) or (tag in (None, "") and pinned_tag(permalink_tag)),
+            "Draft tag or permalink differs from the independently verified owner draft")'''
+    alias_gate = '''    if not (pinned_tag(tag) or (tag in (None, "") and pinned_tag(permalink_tag))):
+        from r28_verified_draft import validate
+        validate(record, release_id, tag, permalink_tag, BASE, metadata, asset_info, download)'''
+    transfer_source.write_text(once(transfer_source.read_text(), old_gate, alias_gate))
+    (TEMP / "r28_verified_draft.py").write_bytes(Path(__file__).with_name("draft_anchor.py").read_bytes())
     import importlib
     import inspect
     sys.path.insert(0, str(TEMP))
