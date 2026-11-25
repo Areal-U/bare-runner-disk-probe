@@ -24,6 +24,26 @@ class ResumeRateTest(unittest.TestCase):
         self.assertEqual(actual,[("direct",1000),("api",1000),("api",1600)])
         self.assertGreater(jobs.call_count,1)
 
+    def test_reader_84_minute_absence_limits_provider_load(self):
+        now=[0];calls=[];pauses=[]
+        c={"run":45599999999,"attempt":1,"head":"a"*40}
+        j={"name":r.ISSUER,"run_id":c["run"],"run_attempt":1,"head_sha":c["head"],"status":"in_progress"}
+        def service(url):
+            calls.append(url)
+            if "/jobs?" in url:
+                return {"total_count":1,"jobs":[j]}
+            return {"total_count":0,"artifacts":[]}
+        def sleep(delay):
+            pauses.append(delay)
+            now[0]+=delay
+        with patch.object(r.thaw,"check_role"),patch.object(r,"service",return_value=c),patch.object(r,"resumed",return_value=True), \
+             patch.object(r.b,"api_json",side_effect=service),patch.object(r.time,"monotonic",side_effect=lambda:now[0]), \
+             patch.object(r.time,"sleep",side_effect=sleep), self.assertRaisesRegex(r.Rejected,"deadline"):
+            r.wait("descriptor")
+        self.assertEqual(now[0],84*60)
+        self.assertEqual(pauses[:4],[8,15,30,60])
+        self.assertLessEqual(len(calls),265)
+
     def test_deadline_and_dead_peer(self):
         api=Draft(b"current test","unused")
         obj=api.receipt(api.rows[11])

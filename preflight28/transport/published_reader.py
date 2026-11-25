@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import thaw_claim as thaw
 
@@ -65,6 +66,28 @@ STEPS = {
 }
 
 
+# The prior ticket could only read this same publication. The immutable ZIP
+# was independently downloaded. It contained public.pem and holder.json only.
+# Holder SHA binds the original source run, head, Draft, part and manifest.
+KEY_RUN = 45526428252
+KEY_HEAD = "6ac68b6c46dc7e9b60fe243a0f00e2d112ff2025"
+KEY_ISSUE, KEY_RECEIVE = 138910829897, 138910830294
+KEY_ARTIFACT = 14982970974
+KEY_ZIP_SHA = "5742c44a43fd4d55bb9cc2e43d26cf56533ad917c471816b0bb199e74b1b5acd"
+KEY_HOLDER_SHA = "03dd25103f1cb59315be7540df7086ce2f78ddf3b19faac169c5df3697e3eda8"
+KEY_JOBS = {KEY_ISSUE:JOBS[ISSUE], KEY_RECEIVE:JOBS[RECEIVE]}
+KEY_STEPS = {
+    KEY_ISSUE: (
+        ("Confirm the immutable private generation and original completed audit", "success"),
+        ("Locate authenticated key Artifact", "failure"),
+        ("Read exact peer Artifact", "skipped"),
+        ("Issue fresh part-scoped GET redirects encrypted to the separate runner", "skipped"),
+        ("Deposit descriptor for this exact recovery", "skipped"),
+    ),
+    KEY_RECEIVE: STEPS[RECEIVE],
+}
+
+
 @contextmanager
 def read_only(transfer):
     original = transfer.request
@@ -81,34 +104,68 @@ def read_only(transfer):
         transfer.request = original
 
 
-def historical_run(api):
-    root = f"{api.BASE}/actions/runs/{RUN}"
+def historical_run(api, rid, head, expected_jobs, expected_steps):
+    root = f"{api.BASE}/actions/runs/{rid}"
     # Latest run_attempt must still be 1. A later attempt could have delivered
     # a grant after the frozen transcript was captured.
     for path in (root, root + "/attempts/1"):
         row = api.metadata(path)
-        thaw.v2.pinned_run(row, RUN, HEAD, thaw.WORKFLOW)
+        thaw.v2.pinned_run(row, rid, head, thaw.WORKFLOW)
         require(row["status"] == "completed" and row["conclusion"] == "failure",
                 "Original reader is still active or has a different terminal outcome")
     page = api.metadata(root + "/attempts/1/jobs?per_page=100")
     jobs = {row["id"]: row for row in page["jobs"]}
-    require(set(jobs) == set(JOBS) and len(page["jobs"]) == page["total_count"] == 3,
+    require(set(jobs) == set(expected_jobs) and len(page["jobs"]) == page["total_count"] == len(expected_jobs),
             "Original publication attempt is ambiguous")
-    for jid, (name, conclusion) in JOBS.items():
+    for jid, (name, conclusion) in expected_jobs.items():
         job = jobs[jid]
         require(job["name"] == name and job["status"] == "completed" and job["conclusion"] == conclusion and
-                job["run_id"] == RUN and job.get("run_attempt", 1) == 1 and job.get("head_sha", HEAD) == HEAD,
+                job["run_id"] == rid and job.get("run_attempt", 1) == 1 and job.get("head_sha", head) == head,
                 "Original publication job or terminal outcome differs")
         stages = {s["name"]: s for s in job["steps"]}
         require(len(stages) == len(job["steps"]) and all(s["status"] == "completed" for s in stages.values()),
                 "Incomplete or ambiguous original job steps")
-        expected = STEPS[jid]
+        expected = expected_steps[jid]
         require(all(stages.get(label, {}).get("conclusion") == result for label, result in expected) and
                 {label for label, s in stages.items() if s["conclusion"] == "failure"} ==
                 {label for label, result in expected if result == "failure"},
                 "Original read stopped at a different boundary")
         numbers = [stages[label]["number"] for label, _ in expected]
         require(numbers == sorted(set(numbers)), "Original publication step order differs")
+
+
+def prior_key_ticket(api):
+    historical_run(api, KEY_RUN, KEY_HEAD, KEY_JOBS, KEY_STEPS)
+    page = api.metadata(f"{api.BASE}/actions/runs/{KEY_RUN}/artifacts?per_page=100")
+    require(len(page["artifacts"]) == page["total_count"] == 1,
+            "Prior read ticket did not retain exactly its single public key receipt")
+    item = page["artifacts"][0]
+    scope = item["workflow_run"]
+    require(item["id"] == KEY_ARTIFACT and item["name"] == f"r28-thaw-{KEY_RUN}-a1-receiver-key" and
+            item["size_in_bytes"] == 2446 and item["digest"] == "sha256:" + KEY_ZIP_SHA and
+            scope["id"] == KEY_RUN and scope["head_sha"] == KEY_HEAD and scope["head_branch"] == thaw.a.BRANCH and
+            scope["repository_id"] == scope["head_repository_id"] == thaw.a.REPO_ID,
+            "Previous public key receipt differs from the independently read holder")
+
+
+def unique_current_ticket(api, env):
+    rid, head = int(env["GITHUB_RUN_ID"]), env["TRIAL_SHA"]
+    row = api.metadata(f"{api.BASE}/actions/runs/{rid}/attempts/1")
+    workflow_id = row["workflow_id"]
+    require(type(workflow_id) is int and workflow_id > 0, "Invalid service workflow identity")
+    path = (f"{api.BASE}/actions/workflows/{workflow_id}/runs?head_sha={head}&branch={thaw.a.BRANCH}"
+            "&event=pull_request&per_page=100")
+    for delay in (0, 2, 4):
+        if delay:
+            time.sleep(delay)
+        data = api.metadata(path)
+        rows = data["workflow_runs"]
+        require(data["total_count"] == len(rows) <= 1, "Another ticket exists for this read revision")
+        if rows:
+            match = rows[0]
+            thaw.v2.pinned_run(match, rid, head, thaw.WORKFLOW, int(env["GITHUB_RUN_ATTEMPT"]))
+            return
+    raise ValueError("Current read ticket is not visible in the exact revision inventory")
 
 
 def previous_reads(api, env):
@@ -147,13 +204,15 @@ def previous_reads(api, env):
 
 
 def verify(transfer, env, event, checkout):
-    require(env["R28_RESUME_PUBLISHED"] == str(RUN) and int(env["GITHUB_RUN_ID"]) > RUN and
+    require(env["R28_RESUME_PUBLISHED"] == str(RUN) and int(env["GITHUB_RUN_ID"]) > KEY_RUN and
             env["MANIFEST_ID"] == str(MANIFEST_ID) and env["MANIFEST_SHA"] == MANIFEST_SHA,
             "Wrong read-only publication binding")
     with read_only(transfer) as api:
         thaw.check_event(api, env, event, checkout, "verify")
         previous_reads(api, env)
-        historical_run(api)
+        unique_current_ticket(api, env)
+        historical_run(api, RUN, HEAD, JOBS, STEPS)
+        prior_key_ticket(api)
         holder = thaw.a.encode(thaw.next_holder(RUN, HEAD, BEFORE, thaw.HISTORY[-1], 5))
         require(len(holder) == CLAIM_BYTES and hashlib.sha256(holder).hexdigest() == CLAIM_SHA and
                 thaw.a.claim_info(api, holder, thaw.CLAIM) == CLAIM_ID, "Accepted publication claim differs")
@@ -166,6 +225,7 @@ def verify(transfer, env, event, checkout):
         require(thaw.check_original_draft(api) == MANIFEST_ID, "Original manifest failed authenticated readback")
     return {"source_run": thaw.SOURCE, "source_head": thaw.HEAD, "claim_id": CLAIM_ID, "part_id": PART_ID,
             "original_manifest_id": MANIFEST_ID, "manifest_id": MANIFEST_ID, "manifest_sha": MANIFEST_SHA,
+            "prior_key_ticket": KEY_RUN, "prior_key_artifact": KEY_ARTIFACT, "prior_key_holder_sha": KEY_HOLDER_SHA,
             "source_sha": thaw.CHILD, "source_bytes": thaw.SIZE, "original_audit_sha": AUDIT_SHA}
 
 

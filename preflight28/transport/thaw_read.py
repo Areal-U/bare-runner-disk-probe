@@ -13,6 +13,7 @@ import time
 from urllib.parse import parse_qs, quote, urlsplit
 
 import thaw
+import artifact_poll
 
 b, frames = thaw.b, thaw.frames
 ROOT = thaw.TEMP / "r28-thaw"
@@ -94,9 +95,11 @@ def resumed():
     return value is not None
 
 
-def check_peer(scope, job_name):
+def check_peer(scope, job_name, delivered=None):
     page=b.api_json(f"/repos/{b.REPO}/actions/runs/{scope['run']}/attempts/{scope['attempt']}/jobs?per_page=100")
-    need(page["total_count"]==len(page["jobs"])<=3, "Unbound peer inventory")
+    need(type(page["total_count"]) is int and 0<=page["total_count"]<=3 and len(page["jobs"])<=3, "Unbound peer inventory")
+    if page["total_count"]!=len(page["jobs"]):
+        return False
     found=[j for j in page["jobs"] if j["name"]==job_name]
     need(len(found)<=1,"Ambiguous physical peer")
     if not found:
@@ -106,6 +109,14 @@ def check_peer(scope, job_name):
          item.get("head_sha",scope["head"])==scope["head"], "Wrong peer incarnation")
     if item["status"]=="completed" and item["conclusion"]!="success":
         raise Rejected("Original peer terminated without its specific read grant")
+    if delivered:
+        rows=[s for s in (item.get("steps") or []) if s["name"]==delivered]
+        need(len(rows)<=1, "Ambiguous peer upload step")
+        if rows and rows[0]["status"]=="completed":
+            need(rows[0]["conclusion"]=="success","Bound peer upload failed")
+            return True
+        return False
+    return True
 
 
 def wait(kind):
@@ -115,22 +126,26 @@ def wait(kind):
     extended=resumed()
     end=time.monotonic()+(84 if extended and kind=="descriptor" else 15)*60
     next_peer=0
+    polls=0
     while time.monotonic()<end:
-        page=b.api_json(f"/repos/{b.REPO}/actions/runs/{c['run']}/artifacts?name={quote(name)}&per_page=100")
-        rows=[a for a in page["artifacts"] if a["name"]==name]
-        need(page["total_count"]==len(page["artifacts"]) and len(rows)<=1,"Ambiguous grant Artifact")
-        if rows:
-            a,=rows
-            need(a["workflow_run"]["id"]==c["run"] and a["workflow_run"]["head_sha"]==c["head"] and
-                 not a["expired"] and type(a["id"]) is int and a["id"]>0 and 0<a["size_in_bytes"]<=131072 and
-                 b.sha(a["digest"].removeprefix("sha256:")),"Invalid grant Artifact")
+        try:
+            a=artifact_poll.lookup(c["run"],name,b.api_json,repo=b.REPO,head=c["head"])
+        except artifact_poll.UnstableInventory as exc:
+            print("pending_stable_artifact="+str(exc),flush=True)
+            a=None
+        peer = ISSUER if kind=="descriptor" else READER
+        label_step = "Deposit "+("descriptor" if kind=="descriptor" else "receiver-key")+" for this exact recovery"
+        if a and (not extended or check_peer(c,peer,label_step)):
+            need(a["size_in_bytes"]<=131072,"Oversized grant Artifact")
             b.output(id=a["id"])
             print(f"thaw_peer={kind} artifact_id={a['id']} expires_at={a['expires_at']}",flush=True)
             return
         if extended and time.monotonic()>=next_peer:
             check_peer(c,ISSUER if kind=="descriptor" else READER)
             next_peer=time.monotonic()+45
-        time.sleep(8)
+        pause=artifact_poll.backoff(polls) if extended else 8
+        polls+=1
+        time.sleep(max(0,min(pause,end-time.monotonic())))
     raise Rejected("Peer grant was not received before its deadline")
 
 

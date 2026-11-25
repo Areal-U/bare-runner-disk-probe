@@ -23,6 +23,19 @@ class Published(Service):
                       for i, (label, result) in enumerate(reader.STEPS[jid], 1)]
             self.jobs.append(dict(id=jid, run_id=reader.RUN, run_attempt=1, head_sha=reader.HEAD,
                                   name=name, status="completed", conclusion=outcome, steps=stages))
+        self.key_info = {**self.info, "id":reader.KEY_RUN, "head_sha":reader.KEY_HEAD}
+        self.key_jobs = []
+        for jid, (name, outcome) in reader.KEY_JOBS.items():
+            stages = [dict(number=i, name=label, status="completed", conclusion=result)
+                      for i, (label, result) in enumerate(reader.KEY_STEPS[jid], 1)]
+            self.key_jobs.append(dict(id=jid, run_id=reader.KEY_RUN, name=name, status="completed",
+                                      conclusion=outcome, steps=stages))
+        self.key_items = [dict(id=reader.KEY_ARTIFACT, name=f"r28-thaw-{reader.KEY_RUN}-a1-receiver-key",
+                               digest="sha256:" + reader.KEY_ZIP_SHA, size_in_bytes=2446,
+                               workflow_run=dict(id=reader.KEY_RUN, repository_id=thaw.a.REPO_ID,
+                                                 head_repository_id=thaw.a.REPO_ID, head_sha=reader.KEY_HEAD,
+                                                 head_branch=thaw.a.BRANCH))]
+        self.extra_tickets = []
         self.add(thaw.CLAIM, thaw.a.encode(thaw.next_holder(
             reader.RUN, reader.HEAD, reader.BEFORE, thaw.HISTORY[-1], 5)), reader.CLAIM_ID)
         self.part()
@@ -34,11 +47,22 @@ class Published(Service):
 
     def metadata(self, url, **kwargs):
         route = urlsplit(url).path
+        if route.startswith(f"{self.BASE}/actions/workflows/"):
+            live = {**base_run(reader.KEY_RUN+101), "path":thaw.WORKFLOW, "head_sha":WHEAD,
+                    "run_attempt":max(self.prior_jobs,default=0)+1}
+            rows = [live,*self.extra_tickets]
+            return {"total_count":len(rows), "workflow_runs":rows}
+        if route.startswith(f"{self.BASE}/actions/runs/{reader.KEY_RUN}"):
+            if route.endswith("/jobs"):
+                return {"total_count":len(self.key_jobs), "jobs":self.key_jobs}
+            if route.endswith("/artifacts"):
+                return {"total_count":len(self.key_items), "artifacts":self.key_items}
+            return self.key_info
         if route.startswith(f"{self.BASE}/actions/runs/{reader.RUN}"):
             if route.endswith("/jobs"):
                 return {"total_count": len(self.jobs), "jobs": self.jobs}
             return self.info
-        prefix = f"{self.BASE}/actions/runs/{reader.RUN + 101}/attempts/"
+        prefix = f"{self.BASE}/actions/runs/{reader.KEY_RUN + 101}/attempts/"
         if route.startswith(prefix):
             index, *suffix = route[len(prefix):].split("/")
             index = int(index)
@@ -46,7 +70,7 @@ class Published(Service):
                 jobs = self.prior_jobs[index]
                 return {"jobs":jobs, "total_count":len(jobs)}
             if index in self.prior_jobs:
-                return {**base_run(reader.RUN + 101), "head_sha":WHEAD, "path":thaw.WORKFLOW,
+                return {**base_run(reader.KEY_RUN + 101), "head_sha":WHEAD, "path":thaw.WORKFLOW,
                         "run_attempt":index, "status":"completed", "conclusion":self.prior_status.get(index,"failure")}
         return super().metadata(url, **kwargs)
 
@@ -56,7 +80,7 @@ class Published(Service):
 
 
 def bound():
-    env, event = context(reader.RUN + 101)
+    env, event = context(reader.KEY_RUN + 101)
     env.update(GITHUB_JOB="issue", TRIAL_SHA=WHEAD, PRIOR_SHA=reader.HEAD,
                R28_RESUME_PUBLISHED=str(reader.RUN), MANIFEST_ID=str(reader.MANIFEST_ID),
                MANIFEST_SHA=reader.MANIFEST_SHA)
@@ -100,6 +124,27 @@ class TestReadOnly(unittest.TestCase):
             reader.verify(h, env, event, WHEAD)
         with patch.dict(h.prior_status, {2:"success"}), self.assertRaisesRegex(ValueError, "no ordinary"):
             reader.verify(h, env, event, WHEAD)
+        self.assertEqual(h.posts, 0)
+
+    def test_completed_or_replaced_prior_key_ticket_is_never_retried(self):
+        h = Published()
+        for step in (*h.key_jobs[0]["steps"], *h.key_jobs[1]["steps"]):
+            result = "success" if step["conclusion"] != "success" else "skipped"
+            with self.subTest(boundary=step["name"]), patch.dict(step, conclusion=result), self.assertRaises(ValueError):
+                reader.verify(h, *bound(), WHEAD)
+        item = h.key_items[0]
+        for target, props in ((item, {"digest":"sha256:"+"1"*64}), (item, {"id":1}),
+                              (item, {"size_in_bytes":99}), (item["workflow_run"], {"head_sha":reader.HEAD}),
+                              (h.key_info, {"run_attempt":2})):
+            with self.subTest(change=props), patch.dict(target, props), self.assertRaises(ValueError):
+                reader.verify(h, *bound(), WHEAD)
+        h.extra_tickets.append({})
+        with self.assertRaisesRegex(ValueError, "Another ticket"):
+            reader.verify(h, *bound(), WHEAD)
+        h.extra_tickets.clear()
+        h.key_items.append({**item, "name":"unexpected-descriptor"})
+        with self.assertRaisesRegex(ValueError, "single public key"):
+            reader.verify(h, *bound(), WHEAD)
         self.assertEqual(h.posts, 0)
 
     def test_read_client_blocks_mutation_and_get_with_body(self):

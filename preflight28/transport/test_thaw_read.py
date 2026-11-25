@@ -101,10 +101,17 @@ class ThawReadTests(unittest.TestCase):
                     self.assertEqual(os.environ["GITHUB_JOB"],"receive")
                     self.assertTrue(path.endswith(f"/releases/{r.b.RELEASE}"))
                     return {}
+                c=r.scope()
+                if "/jobs?" in path:
+                    return {"total_count":1,"jobs":[{"name":r.READER,"status":"in_progress","conclusion":None,
+                        "run_id":run,"run_attempt":c["attempt"],"head_sha":head,
+                        "steps":[{"name":"Deposit receiver-key for this exact recovery","status":"completed","conclusion":"success"}]}]}
+                row={"name":r.label(c,"key"),"id":33,"size_in_bytes":1800,
+                     "workflow_run":{"id":run,"head_sha":head},"expired":False,"expires_at":"test","digest":"sha256:"+"f"*64}
                 if "/artifacts?" in path:
-                    c=r.scope()
-                    return {"total_count":1,"artifacts":[{"name":r.label(c,"key"),"id":33,"size_in_bytes":1800,
-                        "workflow_run":{"id":run,"head_sha":head},"expired":False,"expires_at":"test","digest":"sha256:"+"f"*64}]}
+                    return {"total_count":1,"artifacts":[row]}
+                if path.endswith("/artifacts/33"):
+                    return row
                 return {"id":run,"run_attempt":int(os.environ["GITHUB_RUN_ATTEMPT"]),"head_sha":head,"path":r.WORKFLOW,
                         "status":"in_progress","repository":{"id":1450926240},"actor":{"id":292261483}}
             stack.enter_context(patch.object(r.b,"api_json",side_effect=service))
