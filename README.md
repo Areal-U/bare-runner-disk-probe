@@ -6,15 +6,16 @@ Bare成果担当はこの枝で入力と受領を点検し、後日の本番反�
 
 1. 同じ版を続ける場合は、元の本人向け成果、登録、初回runと現在のattempt、受領済みの最新の親を照合する。完成品があれば再利用し、転送失敗なら既存回収を使う。成果担当が参照する実コマンド・有限な復旧分岐は [入力と親の判定](next_build/INPUTS.md) にある。
 2. 上流更新を選んだ場合は、指定したBareコミットが要求するChromiumを固定する。`next_build/render_input_assertions.py` で版名・版コード・パッチ数・同居GN・APK検査に対応する差分を隔離ディレクトリへ出す。更新判断は版ごとに行う。新しい生成グラフで終盤ラベル、変更したOS依存とパッチを確認する。旧版の生成物は無条件には読み込まない。
-3. 現版で共通に採るファイルは [本番反映候補の一覧](next_build/product-paths.txt) に固定した。通常入口は `.github/workflows/bare-checkpoint-transfer.yml`。12区間・消失復旧の呼出しから `bare-r28-native-slot.yml`、`bare-arm64-probe.yml` を経て計算と圧縮へ至る。旧キャンペーンは旧HEAD・親・本人宛先に拘束される。新しい本番では成果担当と既存回収担当が実際の対象HEAD、親、本人宛先、期限、空き容量の登録と応答を用意する。再開にあたってR28の古い受付を新規起動に転用しない。同版・同じS2・同じ本人宛先なら、成果担当が `next_build/render_campaign.py` で新しい名前に固定した登録と復旧の差分と未発行フォームを生成できる。
-4. 次のGitHub実地比較は下表の条件で選ぶ。ホスト測定が未完でも、標準方式のまま次回用候補を準備できる。実運用への反映・起動は別途決定する。
+3. 共通の20ファイルは [通常の候補一覧](https://github.com/Areal-U/bare-runner-disk-probe/blob/ce90c02d107f13af39fbfb7b44cfe92e2102d6f3/next_build/product-paths.txt) に固定した。この作業枝の [24ファイルの一覧](next_build/product-paths.txt) は条件付きのソース事前投入を含む。通常入口は `.github/workflows/bare-checkpoint-transfer.yml`。12区間・消失復旧の呼出しから `bare-r28-native-slot.yml`、`bare-arm64-probe.yml` を経て計算と圧縮へ至る。旧キャンペーンは旧HEAD・親・本人宛先に拘束される。新しい本番では成果担当と既存回収担当が実際の対象HEAD、親、本人宛先、期限、空き容量の登録と応答を用意する。再開にあたってR28の古い受付を新規起動に転用しない。同版・同じS2・同じ本人宛先なら、成果担当が `next_build/render_campaign.py` で新しい名前に固定した登録と復旧の差分と未発行フォームを生成できる。
+4. 下表と「実施済みの比較」から、対象版・工程群・予定回数が同じ結果を先に使う。条件が変わり、採否を左右する場合だけ既存の比較入口へ進む。実運用への反映・起動は別途決定する。
 
-この枝の先頭をチェックアウトした状態で、一覧にある共通差分だけを再生成できる。実際の本番枝に別変更があれば適用先を保護して再照合する。
+通常は下記の固定済み20ファイルを使う。Chromiumソースの事前投入だけは、Linux・Androidの通常同期で利用資格を満たした世代に対し、[受入条件と入力の作り方](next_build/SOURCE_INPUT.md)に従う。実際の本番枝に別変更があれば適用先を保護して再照合する。
 
 ```bash
 base=f3ed4479912a30959859d81328af3fd4dc6d8d00
-mapfile -t paths < next_build/product-paths.txt
-git diff --binary "$base" HEAD -- "${paths[@]}" > ../bare-next-common.patch
+standard=ce90c02d107f13af39fbfb7b44cfe92e2102d6f3
+mapfile -t paths < <(git show "$standard:next_build/product-paths.txt")
+git diff --binary "$base" "$standard" -- "${paths[@]}" > ../bare-next-common.patch
 ```
 
 ## 標準として選んだ設定
@@ -43,3 +44,21 @@ python3 next_build/trials.py split --recovery-clear --dispatch
 ```
 
 無料標準の公開Bareリポジトリ・通常のUbuntuホストに限定する。試験ごとの保持は1日。容量は下見時の実占有＋当該試験分、試験用総上限6 GiB、既存リポジトリ設定があればその値のうち最も小さいものを使う。6 GiBは診断の技術上限で、試験時の無料条件とサービス側の空きは当日に別々に判定する。送信前にも容量・期限・他runを再確認する。実地試験は優先順に一件ずつ行い、他の試験のために本番保存を止めない。[GitHubの無料条件](https://docs.github.com/en/actions/concepts/billing-and-usage)
+
+
+## 実施済みの比較と次回への適用
+
+実装を検査した版は [ce90c02d](https://github.com/Areal-U/bare-runner-disk-probe/tree/ce90c02d107f13af39fbfb7b44cfe92e2102d6f3)。受取時差とV8の試験は、その対象コードが同じ c653e91c で行った。以下は同じ入力と目的で再利用できる。
+
+| 対象 | 観測 | 次回 |
+|---|---|---|
+| [Android 147工程の2台分担](https://github.com/Areal-U/bare-runner-disk-probe/actions/runs/45590329396) | 2台36.875秒、1台29.975秒。別VMの成果の再コンパイル0件、後続アーカイブSHA一致。1台対照は合流後の同一VMで行った。 | 標準は1台、2並列。別の重い工程群を提案する際は追加入力の配送・合流を含めて比較する。 |
+| [受取VMの時差](https://github.com/Areal-U/bare-runner-disk-probe/actions/runs/45588439525) | 公開試験データ378,880 Bの両条件で別jobが再取得。時差案は鍵待ちが32.526秒長く、VM占有合計が65秒増えた。計算締切が延びる推計は44秒。 | 同時起動。早期完成や転送回復を含む本番相当の時間が改善した場合に限り変更する。 |
+| [V8のソース事前配布](https://github.com/Areal-U/bare-runner-disk-probe/actions/runs/45588925367) | 検証した同一treeの2回利用では初回待ち込みで7.832秒遅い。同条件が続いた場合に4回から黒字。 | V8単独の常設配布は採らない。 |
+| [Chromium本体のGit pack](https://github.com/Areal-U/bare-runner-disk-probe/actions/runs/45590664108) | 506,967ファイルでcommit/tree一致、追加pack 0。直接230.802秒、受取23.852秒、復元・照合70.901秒。作成・送信・初回待ち156.950秒を加味して、1回は20.90秒遅く、2回は115.15秒短い。 | 同じ固定版をArtifactの有効期間内に2回以上使う場合の候補。Android依存・hooksや実際の計算締切を別に照合する。 |
+
+固定Ubuntu 22.04でのソース事前投入は、［署名済み索引→同じパッケージ→Chromium の固定ソース一式］の経路で資格を確認する。`source-android` の[初回](https://github.com/Areal-U/bare-runner-disk-probe/actions/runs/45594688917)はAPTの準備枠、[2回目](https://github.com/Areal-U/bare-runner-disk-probe/actions/runs/45598926830)は同日時のUbuntu索引2件のHTTP 503でソース取得前に停止した。両方から通常用manifestを発行することはできなかった。Ubuntuの公式署名が指定する同じ2索引は、固定名とby-hashの別経路から回収し、APT 2.4.14で破損拒否を検査済み。自動配備は未検証。ビルダーが同じsnapshotを読めることは直接同期でも必要になる。
+
+`source-android-host` はUbuntu 24.04の標準ホストで同一のLinux/Android用gclientを使う互換性試験。同じ入力と目的で結果がある場合はこれを参照する。固定Ubuntuの資格判定とは異なる実行名・結果名を使う。[ホスト上の互換性試験](https://github.com/Areal-U/bare-runner-disk-probe/actions/runs/45601195010)
+
+ホスト試験では正規のpackを1回取得し、304依存を同期して、固定V8、Android SDK 37のaapt2とNDK sysrootを確認した。rootの追加Git packは0 B。受信と復元・依存同期は計444.554秒、最低空き40.72 GBだった。第28回の直接同期508秒と比較すると、作成・転送・検証の費用を含めて2回利用で約40.06秒遅い。3回なら約18.39秒短いという計算は異なるOS間の参考値。次回は直接同期を使用する。固定Ubuntu上の正の便益、同一ソース、期限内の利用、無料の空きがすべて確認済みの案件だけに事前投入の選択を残す。
