@@ -13,6 +13,7 @@ permissions:
   actions: read
 env:
   NEXT_SPLIT_GROUP: field
+  BARE_NEXT_FRESH_RUN_GATE: '1'
   R28_STORAGE_CEILING: ${{ inputs.storage_ceiling }}
   R28_STORAGE_UNTIL: ${{ inputs.storage_until }}
   R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}

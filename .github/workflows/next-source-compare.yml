@@ -17,6 +17,7 @@ on:
 permissions: {}
 env:
   GIT_TERMINAL_PROMPT: '0'
+  BARE_NEXT_FRESH_RUN_GATE: '1'
   R28_STORAGE_CEILING: ${{ inputs.storage_ceiling }}
   R28_STORAGE_UNTIL: ${{ inputs.storage_until }}
   R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}

@@ -107,22 +107,21 @@ jobs:
       with:
         persist-credentials: false
     - name: Read back baseline receipt after receiver exit
-      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
-      with:
-        artifact-ids: ${{ needs.baseline-receiver.outputs.receipt_id }}
-        merge-multiple: true
-        path: ${{ runner.temp }}/bare-next-receiver/baseline
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RECEIPT_ID: ${{ needs.baseline-receiver.outputs.receipt_id }}
+      run: python3 preflight28/next_receiver/trial.py lookup baseline receipt
     - name: Read back delayed receipt after receiver exit
-      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
-      with:
-        artifact-ids: ${{ needs.delayed-receiver.outputs.receipt_id }}
-        merge-multiple: true
-        path: ${{ runner.temp }}/bare-next-receiver/delayed
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RECEIPT_ID: ${{ needs.delayed-receiver.outputs.receipt_id }}
+      run: python3 preflight28/next_receiver/trial.py lookup delayed receipt
     - name: Compare the two admitted roles and the extra issuer
       env:
         GH_TOKEN: ${{ github.token }}
       run: python3 preflight28/next_receiver/trial.py collect baseline
 env:
+  BARE_NEXT_FRESH_RUN_GATE: '1'
   R28_STORAGE_CEILING: ${{ inputs.storage_ceiling }}
   R28_STORAGE_UNTIL: ${{ inputs.storage_until }}
   R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
