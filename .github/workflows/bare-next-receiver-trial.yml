@@ -1,0 +1,128 @@
+name: Bare receiver timing diagnostic
+'on':
+  workflow_call:
+    inputs:
+      storage_ceiling:
+        type: string
+        required: true
+      storage_until:
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  baseline-producer:
+    name: RX baseline producer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        persist-credentials: false
+    - name: Run the bounded producer
+      uses: ./preflight28/next_receiver
+      id: trial
+      with:
+        mode: baseline
+        role: producer
+  baseline-receiver:
+    name: RX baseline receiver
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        persist-credentials: false
+    - name: Run the bounded receiver
+      uses: ./preflight28/next_receiver
+      id: trial
+      with:
+        mode: baseline
+        role: receiver
+    outputs:
+      receipt_id: ${{ steps.trial.outputs.receipt-id }}
+  delayed-producer:
+    name: RX delayed producer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    needs:
+    - baseline-producer
+    - baseline-receiver
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        persist-credentials: false
+    - name: Run the bounded producer
+      uses: ./preflight28/next_receiver
+      id: trial
+      with:
+        mode: delayed
+        role: producer
+  delayed-ticket:
+    name: RX delayed ticket
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    needs:
+    - baseline-producer
+    - baseline-receiver
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        persist-credentials: false
+    - name: Run the bounded ticket
+      uses: ./preflight28/next_receiver
+      id: trial
+      with:
+        mode: delayed
+        role: ticket
+  delayed-receiver:
+    name: RX delayed receiver
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    needs:
+    - delayed-ticket
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        persist-credentials: false
+    - name: Run the bounded receiver
+      uses: ./preflight28/next_receiver
+      id: trial
+      with:
+        mode: delayed
+        role: receiver
+    outputs:
+      receipt_id: ${{ steps.trial.outputs.receipt-id }}
+  compare:
+    name: RX verify receipts and compare occupied VM time
+    needs:
+    - baseline-receiver
+    - delayed-receiver
+    - delayed-producer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        persist-credentials: false
+    - name: Read back baseline receipt after receiver exit
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      with:
+        artifact-ids: ${{ needs.baseline-receiver.outputs.receipt_id }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/bare-next-receiver/baseline
+    - name: Read back delayed receipt after receiver exit
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      with:
+        artifact-ids: ${{ needs.delayed-receiver.outputs.receipt_id }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/bare-next-receiver/delayed
+    - name: Compare the two admitted roles and the extra issuer
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 preflight28/next_receiver/trial.py collect baseline
+env:
+  R28_STORAGE_CEILING: ${{ inputs.storage_ceiling }}
+  R28_STORAGE_UNTIL: ${{ inputs.storage_until }}
+  R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}

@@ -1,8 +1,27 @@
 name: Bare runner disk probe
+run-name: ${{ inputs.trial && inputs.trial != 'disk' && format('Bare next-build trial {0} {1}', inputs.trial, github.sha) || 'Bare runner disk probe' }}
 
 on:
   workflow_dispatch:
     inputs:
+      trial:
+        description: Optional bounded next-build comparison on the dedicated test branch
+        type: choice
+        default: disk
+        options: [disk, source-v8, source-chromium, split, receiver]
+      expected_sha:
+        description: Reviewed test branch SHA from next_build/trials.py
+        type: string
+      recovery_clear:
+        description: Prior independent collection has no pending GitHub work
+        type: boolean
+        default: false
+      storage_ceiling:
+        description: Pre-dispatch total from next_build/trials.py
+        type: string
+      storage_until:
+        description: Pre-dispatch expiration epoch
+        type: string
       reclaim:
         description: Measure again after removing listed unused tools from the temporary runner
         type: boolean
@@ -12,7 +31,7 @@ permissions: {}
 
 jobs:
   measure:
-    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' }}
+    if: ${{ (inputs.trial == 'disk' || inputs.trial == '') && toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -80,3 +99,64 @@ jobs:
             echo 'After reclaim'
             report_disk
           fi
+
+  trial-admission:
+    if: ${{ inputs.trial != 'disk' && inputs.trial != '' && github.actor == 'Areal-U' && github.event.sender.id == 292261483 && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-next-build-prep-20261125' }}
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      ceiling: ${{ steps.admit.outputs.ceiling }}
+      until: ${{ steps.admit.outputs.until }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: admit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT_TRIAL: ${{ inputs.trial }}
+          NEXT_EXPECTED_SHA: ${{ inputs.expected_sha }}
+          NEXT_RECOVERY_CLEAR: ${{ inputs.recovery_clear }}
+          NEXT_CEILING: ${{ inputs.storage_ceiling }}
+          NEXT_UNTIL: ${{ inputs.storage_until }}
+          R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
+        run: python3 next_build/trials.py "$NEXT_TRIAL" --inside-run
+
+  source-comparison:
+    needs: trial-admission
+    if: ${{ inputs.trial == 'source-v8' || inputs.trial == 'source-chromium' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/next-source-compare.yml
+    with:
+      scope: ${{ inputs.trial == 'source-v8' && 'v8' || 'chromium' }}
+      reuses: 2
+      storage_ceiling: ${{ needs.trial-admission.outputs.ceiling }}
+      storage_until: ${{ needs.trial-admission.outputs.until }}
+
+  split-comparison:
+    needs: trial-admission
+    if: ${{ inputs.trial == 'split' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/bare-next-split.yml
+    with:
+      storage_ceiling: ${{ needs.trial-admission.outputs.ceiling }}
+      storage_until: ${{ needs.trial-admission.outputs.until }}
+
+  receiver-comparison:
+    needs: trial-admission
+    if: ${{ inputs.trial == 'receiver' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/bare-next-receiver-trial.yml
+    with:
+      storage_ceiling: ${{ needs.trial-admission.outputs.ceiling }}
+      storage_until: ${{ needs.trial-admission.outputs.until }}

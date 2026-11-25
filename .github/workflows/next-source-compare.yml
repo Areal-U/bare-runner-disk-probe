@@ -1,0 +1,98 @@
+name: Compare a pinned Bare source input on fresh runners
+on:
+  workflow_call:
+    inputs:
+      scope:
+        type: string
+        default: v8
+      reuses:
+        type: number
+        default: 2
+      storage_ceiling:
+        type: string
+        required: true
+      storage_until:
+        type: string
+        required: true
+permissions: {}
+env:
+  GIT_TERMINAL_PROMPT: '0'
+  R28_STORAGE_CEILING: ${{ inputs.storage_ceiling }}
+  R28_STORAGE_UNTIL: ${{ inputs.storage_until }}
+  R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
+  SOURCE_SCOPE: ${{ inputs.scope }}
+jobs:
+  prepare:
+    if: ${{ github.repository == 'Areal-U/bare-runner-disk-probe' && !github.event.repository.private && !github.event.repository.fork && github.run_attempt == '1' && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/bare-coexist-v2.0.4' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      receipt: ${{ steps.make.outputs.receipt }}
+      object: ${{ steps.put.outputs.artifact-id }}
+      upload_s: ${{ steps.clock.outputs.upload_s }}
+      published: ${{ steps.clock.outputs.published }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Read the selected official shallow Git input
+        id: make
+        run: python3 next_build/trials/source_reuse.py produce "$SOURCE_SCOPE" "$RUNNER_TEMP/input-trial"
+      - name: Admit the exact one-day public source upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 next_build/trials/source_reuse.py admit "$SOURCE_SCOPE" "$RUNNER_TEMP/input-trial"
+          echo "UPLOAD_START=$(date +%s%N)" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        id: put
+        timeout-minutes: 9
+        with:
+          name: bare-public-git-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/input-trial/source.pack
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: false
+      - id: clock
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, time
+          ns = time.time_ns()
+          print('upload_s=' + str((ns - int(os.environ['UPLOAD_START']))/1e9))
+          print('published=' + str(ns))
+          PY
+  compare:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    permissions:
+      contents: read
+      actions: read
+    env:
+      SOURCE_RECEIPT: ${{ needs.prepare.outputs.receipt }}
+      UPLOAD_S: ${{ needs.prepare.outputs.upload_s }}
+      PUBLISHED: ${{ needs.prepare.outputs.published }}
+      REUSES: ${{ inputs.reuses }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Check disk and record the receiver handoff time
+        run: |
+          python3 next_build/trials/source_reuse.py room "$SOURCE_SCOPE" "$RUNNER_TEMP/input-trial"
+          echo "DOWNLOAD_START=$(date +%s%N)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        timeout-minutes: 12
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.object }}
+          path: ${{ runner.temp }}/input-trial
+          merge-multiple: true
+      - name: Time direct and preseeded gclient sync on the same independent runner
+        run: |
+          DOWNLOAD_S=$(python3 -c 'import os,time; print((time.time_ns()-int(os.environ["DOWNLOAD_START"]))/1e9)')
+          export DOWNLOAD_S
+          python3 next_build/trials/source_reuse.py receive "$SOURCE_SCOPE" "$RUNNER_TEMP/input-trial"
