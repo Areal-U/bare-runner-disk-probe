@@ -85,43 +85,90 @@ def compile_seconds(job_start, now, job_minutes=350):
     return max(0, int(job_start + (job_minutes - 40) * 60 - now))
 
 
-def job_clock(check_run):
-    repo = 'Areal-U/bare-runner-disk-probe'
-    if os.environ['GITHUB_REPOSITORY'] != repo or not os.environ.get('JOB_READ_TOKEN'):
+REPO = 'Areal-U/bare-runner-disk-probe'
+MAX_JOB_PAGES = 10
+
+
+def get_job_page(path, headers):
+    conn = http.client.HTTPSConnection('api.github.com', timeout=10)
+    try:
+        conn.request('GET', path, headers=headers)
+        response = conn.getresponse()
+        if response.status != 200:
+            raise ValueError(f'Job start lookup HTTP {response.status}')
+        return json.load(response)
+    finally:
+        conn.close()
+
+
+def attempt_jobs(run, attempt, headers):
+    jobs = []
+    seen = set()
+    total = None
+    for page in range(1, MAX_JOB_PAGES + 1):
+        path = f'/repos/{REPO}/actions/runs/{run}/attempts/{attempt}/jobs?per_page=100&page={page}'
+        listing = get_job_page(path, headers)
+        count = listing['total_count']
+        batch = listing['jobs']
+        if (type(count) is not int or not 0 < count <= 100 * MAX_JOB_PAGES or
+                (total is not None and count != total) or not isinstance(batch, list) or
+                len(batch) != min(100, count-len(jobs))):
+            raise ValueError('Incomplete or changing workflow job inventory')
+        total = count
+        for job in batch:
+            identifier = job['id']
+            if type(identifier) is not int or identifier <= 0 or identifier in seen:
+                raise ValueError('Duplicate or invalid workflow job ID')
+            seen.add(identifier)
+        jobs.extend(batch)
+        if len(jobs) == total:
+            return jobs
+    raise ValueError('Workflow job inventory exceeds its bound')
+
+
+def active_job(check_run=None, suffix=None):
+    if os.environ['GITHUB_REPOSITORY'] != REPO or not os.environ.get('JOB_READ_TOKEN'):
         raise ValueError('Job clock requires the authorized repository and read credential')
     run = int(os.environ['GITHUB_RUN_ID'])
     attempt = int(os.environ['GITHUB_RUN_ATTEMPT'])
+    if min(run,attempt) <= 0 or (check_run is not None and check_run <= 0) or not (check_run or suffix):
+        raise ValueError('Missing active job identity')
     allowed_sha = {os.environ['GITHUB_SHA']}
     if os.environ.get('GITHUB_EVENT_NAME') == 'pull_request':
         event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
         allowed_sha.add(event['pull_request']['head']['sha'])
-    path = f'/repos/{repo}/actions/runs/{run}/attempts/{attempt}/jobs?per_page=100'
-    headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'bare-trial-clock',
-               'Authorization': 'Bearer ' + os.environ['JOB_READ_TOKEN']}
+    prefix = f'https://api.github.com/repos/{REPO}/check-runs/'
+    headers = {'Accept':'application/vnd.github+json', 'User-Agent':'bare-trial-clock',
+               'Authorization':'Bearer ' + os.environ['JOB_READ_TOKEN']}
     for retry in range(3):
-        conn = http.client.HTTPSConnection('api.github.com', timeout=10)
         try:
-            conn.request('GET', path, headers=headers)
-            response = conn.getresponse()
-            if response.status != 200:
-                raise ValueError(f'Job start lookup HTTP {response.status}')
-            listing = json.load(response)
-            jobs = listing['jobs']
-            matches = [j for j in jobs if j['run_id'] == run and j['run_attempt'] == attempt
-                       and j['head_sha'] in allowed_sha and j['status'] == 'in_progress'
-                       and j['check_run_url'] == f'https://api.github.com/repos/{repo}/check-runs/{check_run}']
-            if len(jobs) != listing['total_count'] or len(matches) != 1:
-                raise ValueError('No unambiguous active check run clock')
-            start = datetime.fromisoformat(matches[0]['started_at'].replace('Z', '+00:00'))
+            jobs = attempt_jobs(run,attempt,headers)
+            candidates = [j for j in jobs if j['run_id'] == run and j['run_attempt'] == attempt
+                          and j['head_sha'] in allowed_sha and j['status'] == 'in_progress']
+            if suffix:
+                candidates = [j for j in candidates if j['name'] == suffix or j['name'].endswith(' / '+suffix)]
+            else:
+                candidates = [j for j in candidates if j['check_run_url'] == prefix+str(check_run)]
+            if len(candidates)!=1:
+                raise ValueError('No unambiguous active workflow job')
+            job = candidates[0]
+            url = job['check_run_url']
+            last = url.removeprefix(prefix)
+            if (not last.isascii() or not last.isdigit() or last.startswith('0') or
+                    url != prefix + last or (check_run is not None and int(last) != check_run)):
+                raise ValueError('The check-run identity does not match the exact active job')
+            start = datetime.fromisoformat(job['started_at'].replace('Z', '+00:00'))
             if not start.tzinfo or start.timestamp() > time.time():
                 raise ValueError('Invalid job start')
-            return int(start.timestamp())
+            return int(last), int(start.timestamp())
         except (OSError, ValueError, http.client.HTTPException):
             if retry == 2:
                 raise
             time.sleep(2)
-        finally:
-            conn.close()
+
+
+def job_clock(check_run):
+    return active_job(check_run,os.environ.get('CLOCK_SUFFIX'))[1]
 
 
 def tree(path):
@@ -312,6 +359,8 @@ def main():
     p = parser.add_subparsers(dest='action', required=True)
     cache = p.add_parser('cache')
     cache.add_argument('inventory', type=Path)
+    check = p.add_parser('job-check')
+    check.add_argument('--job-suffix', required=True)
     clock = p.add_parser('job-clock')
     clock.add_argument('--check-run', type=int, required=True)
     size = p.add_parser('size')
@@ -334,6 +383,9 @@ def main():
             a.add_argument('cmd', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     try:
+        if args.action == 'job-check':
+            print(active_job(suffix=args.job_suffix)[0])
+            return 0
         if args.action == 'job-clock':
             print(job_clock(args.check_run))
             return 0
