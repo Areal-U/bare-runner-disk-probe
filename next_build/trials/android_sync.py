@@ -47,6 +47,14 @@ def shell_material(normal):
     return builder, pre, sync
 
 
+def use_signed_pool(dockerfile):
+    mount = 'RUN --mount=type=bind,source=bare-ci-apt-ca.pem,target=/tmp/bare-ci-apt-ca.pem '
+    install = 'apt-get -o Acquire::Retries=3 -o Acquire::https::CAInfo=/tmp/bare-ci-apt-ca.pem install -y --no-install-recommends'
+    require(dockerfile.count(mount) == dockerfile.count(install) == 1, 'Unexpected pinned Bare bootstrap recipe')
+    return dockerfile.replace(mount, mount+'--mount=type=bind,source=bare-bootstrap-pool.sh,target=/tmp/bare-bootstrap-pool.sh ').replace(
+        install, 'bash /tmp/bare-bootstrap-pool.sh -y --no-install-recommends')
+
+
 def setup():
     from source_reuse import pins, PIN_FILE
     trial_dir = Path(__file__).resolve().parent
@@ -98,6 +106,12 @@ def setup():
     snapshot = re.findall(r'^      UBUNTU_SNAPSHOT_URL: (https://snapshot\.ubuntu\.com/ubuntu/[0-9TZ]+)$', workflow, re.M)
     base = re.findall(r'\[\[ \$EXPECTED_BASE == (ubuntu@sha256:[0-9a-f]{64}) \]\]', workflow)
     require(len(snapshot) == len(base) == 1, 'Normal immutable Ubuntu image or APT snapshot changed')
+    # Keep the original signed snapshot and its apt install plan. Change only the
+    # source of verified .deb bytes to avoid slow per-package snapshot requests.
+    require(snapshot == ['https://snapshot.ubuntu.com/ubuntu/20261112T093000Z'], 'Bootstrap mirror is bound to the reviewed snapshot')
+    shutil.copy(trial_dir/'bootstrap_pool.sh', official/'docker'/'bare-bootstrap-pool.sh')
+    require(builder.count('bash builder.sh build\n') == 1, 'Ambiguous builder start')
+    builder = builder.replace('bash builder.sh build\n', 'python3 "$GITHUB_WORKSPACE/next_build/trials/android_sync.py" pool-dockerfile\nbash builder.sh build\n')
     (root/'builder.sh').write_text('set -euo pipefail\n' + builder)
     with open(os.environ['GITHUB_ENV'],'a') as out:
         for k,v in {**lock, 'UBUNTU_SNAPSHOT_URL':snapshot[0], 'REQUESTED_BASE':base[0], 'ANDROID_TRIAL':str(root)}.items():
@@ -161,7 +175,10 @@ def watch(args):
 
 if __name__=='__main__':
     import argparse
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('op',choices=('setup','watch','boot','pre','before','after'));p.add_argument('args',nargs=argparse.REMAINDER);ns=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('op',choices=('setup','pool-dockerfile','watch','boot','pre','before','after'));p.add_argument('args',nargs=argparse.REMAINDER);ns=p.parse_args()
     if ns.op=='setup': setup()
+    elif ns.op=='pool-dockerfile':
+        dockerfile=Path('docker/Dockerfile')
+        dockerfile.write_text(use_signed_pool(dockerfile.read_text()))
     elif ns.op=='watch': watch(ns.args)
     else: stage(ns.op)
