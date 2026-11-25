@@ -29,6 +29,13 @@ FORMAT = "bare-apk-trial"
 VERSION = 1
 BUILD_DIR = PurePosixPath("out/Bare")
 TARGET = "chrome_public_apk"
+FINAL_DEX_LABEL = f"ACTION //chrome/android:{TARGET}__final_dex"
+# These APK operations require a long contiguous retry window on the fixed
+# ARM64 graph. Words such as "link" and "dex" also occur in ordinary C++ paths.
+TERMINAL_APK_ACTIONS = frozenset({
+    FINAL_DEX_LABEL, f"{FINAL_DEX_LABEL}(//build/toolchain/android:android_clang_arm64)",
+    "LINK libchrome.so", "LINK ./libchrome.so", "SOLINK libchrome.so", "SOLINK ./libchrome.so",
+})
 SUCCESS_SOURCE = "siso_metrics+ninja_log-v5"
 # GN's initial output already occupies about 1.3 GB on this pinned build.
 # This is an uncompressed working-set guard, not the 1 GiB upload limit.
@@ -177,7 +184,7 @@ def update_siso_status(progress, chunk):
         progress["step_counter"] = int(match[1])
         progress["graph_total"] = int(match[2])
         description = match[4].decode("utf-8", errors="replace")
-        if re.search(r"(?:^|[ /_.:-])(?:DEX|R8|D8|LINK|SOLINK)(?:[ /_.:-]|$)", description, re.I):
+        if description in TERMINAL_APK_ACTIONS:
             active = progress.setdefault("terminal_actions", set())
             if match[3] == b"S":
                 active.add(description)
@@ -189,6 +196,19 @@ def update_siso_status(progress, chunk):
         elif match[3] == b"F" and description == progress.get("link_action"):
             progress.pop("link_action", None)
             progress.pop("link_started", None)
+
+
+def legacy_nonterminal_action(action):
+    # Older reports matched "dex" and "link" anywhere in a Siso path. Only
+    # discard recognizable nonterminal actions; keep unfamiliar legacy labels.
+    if action.startswith(("CC ", "CXX ", "LINK clang_x64/", "LINK clang_x64_v8_arm64/")):
+        return True
+    if action in ("SOLINK ./libchrome_inputs.so", "SOLINK libchrome_inputs.so"):
+        return True
+    if action.startswith("ACTION //"):
+        label = action.partition("(")[0]
+        return label.endswith((":lint_css", "__dex", "__build_config"))
+    return False
 
 
 def interrupted_terminal_retry(output, available_seconds):
@@ -205,7 +225,7 @@ def interrupted_terminal_retry(output, available_seconds):
     actions = report.get("interrupted_terminal_actions", [])
     if not isinstance(actions, list) or any(not isinstance(s, str) or not s for s in actions):
         raise ValueError("Invalid interrupted terminal action evidence")
-    return actions
+    return [action for action in actions if not legacy_nonterminal_action(action)]
 
 
 def bounded_output_evidence(outputs, max_bytes):
@@ -582,6 +602,13 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             level = 'normal'
             if production:
                 sample_seconds = 30
+                # Only this worker updates scan_cost after the initial scan. It also
+                # accounts for the last in-flight scan when the child has exited.
+                def scan_output(phase):
+                    observed = guard["tree"](output)
+                    record_scan(result["measurements"], phase, observed["scan_seconds"], observed["scan_cpu_seconds"])
+                    return observed
+
                 scan_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 active_scan = None
             leader_exited_at = None
@@ -609,8 +636,7 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                     sample_due = now - last_sample >= sample_seconds
                     if production:
                         if not reason and sample_due and active_scan is None:
-                            active_scan = scan_pool.submit(guard["tree"], output)
-                            scan_interval = sample_seconds
+                            active_scan = scan_pool.submit(scan_output, sample_seconds)
                             last_sample = now
                         sample_due = active_scan is not None and active_scan.done()
                     if not reason and sample_due:
@@ -619,7 +645,6 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                             active_scan = None
                             sample = {name: observed[name] for name in ("entries", "logical_bytes", "allocated_bytes")}
                             sample["archive_input_estimate_bytes"] = observed["estimate"]
-                            record_scan(result["measurements"], scan_interval, observed["scan_seconds"], observed["scan_cpu_seconds"])
                         else:
                             sample = tree_snapshot(output, include_paths=False)
                             sample.pop("paths")
@@ -682,10 +707,8 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                             settle_sample = settle_scan.result()
                             settle_scan = None
                             watch['tree_scans'] += 1
-                            record_scan(result["measurements"], "stopping", settle_sample["scan_seconds"],
-                                        settle_sample["scan_cpu_seconds"])
                         if settle_scan is None and now >= next_tree:
-                            settle_scan = scan_pool.submit(guard['tree'], output)
+                            settle_scan = scan_pool.submit(scan_output, "stopping")
                             next_tree = now + 5
                         watch['disk_polls'] += 1
                         watch['min_free_bytes'] = min(watch['min_free_bytes'], fs['free_bytes'])

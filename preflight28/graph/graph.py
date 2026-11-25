@@ -55,7 +55,7 @@ def output_name(value, out):
     return p.as_posix()
 
 
-def parse_metrics(metrics, count, out, *, actual):
+def parse_metrics(metrics, count, out, *, actual, plan_rules=None):
     edges = {}
     seen_step = set()
     summary = False
@@ -80,6 +80,8 @@ def parse_metrics(metrics, count, out, *, actual):
             if actual and not step.get("is_local", False):
                 raise ValueError("small preflight edge did not execute locally")
             edges[names] = step.get("action", "")
+            if plan_rules is not None and step.get('rule') in plan_rules[0]:
+                plan_rules[1][canonical(names)] = [step['rule'], output_name(raw[0], out), step['action']]
     if count != len(edges) or (count and not summary):
         raise ValueError(f"incomplete Siso metrics: {len(edges)} of {count} steps")
     return edges
@@ -107,7 +109,7 @@ def preserve_ninja_log(out):
                 src.unlink(missing_ok=True)
 
 
-def run(out, command, targets, *, dry, noop=False):
+def run(out, command, targets, *, dry, noop=False, plan_rules=None):
     start = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="bare28-plan-") as name:
         tmp = Path(name)
@@ -134,7 +136,7 @@ def run(out, command, targets, *, dry, noop=False):
             if process.returncode or len(counts) != 1 or b"Build Failed" in tail:
                 raise ValueError("Siso completion/step count unavailable: "
                                  + tail[-1000:].decode(errors="replace"))
-        edges = parse_metrics(metrics, int(counts[0]), out, actual=not dry)
+        edges = parse_metrics(metrics, int(counts[0]), out, actual=not dry, plan_rules=plan_rules)
     print(json.dumps({"operation": "plan" if dry else "execute",
                       "target": targets[0], "steps": len(edges),
                       "seconds": round(time.monotonic() - start, 2)}), flush=True)

@@ -497,6 +497,52 @@ def archives(parent_path, child_path, parent_sha, child_sha, *, report_path=None
         return report
 
 
+# Only deterministic extra outputs of this exact Chromium Android handler revision.
+FILEARG_RULES = {'android/trace_event_bytecode_rewriter': 'trace_event_bytecode_rewriter.py', 'android/proguard': 'proguard.py'}
+STAMP_RULES = {'android/compile_java', 'android/compile_kt', 'android/errorprone', 'android/dex'} | FILEARG_RULES.keys()
+ANDROID_RULES_SHA256 = 'ebfbb8b3524aff976c0f9336d53f2efe4eb45ca2874ecf06226a75b0c225b18c'
+
+
+def stamp_metadata(proof, canonical):
+    """Map each evidenced auxiliary output to its ordinary-file size and digest."""
+    records = proof.get('runtime_stamps', {})
+    if not isinstance(records, dict):
+        raise ValueError('Invalid runtime output records')
+    closed = {canonical(g): g for g in proof['closed_groups']}
+    declared = {name for group in closed.values() for name in group}
+    result = {}
+    for edge, row in records.items():
+        if not isinstance(row, dict) or set(row) != {'rule', 'primary', 'action', 'files', 'fileargs'}:
+            raise ValueError('Incomplete runtime output record')
+        primary = row['primary']
+        if not isinstance(row['action'], str) or not 0 < len(row['action']) <= 512 or row['rule'] not in STAMP_RULES or edge not in closed or primary not in closed[edge]:
+            raise ValueError('Unbound runtime output record')
+        fileargs = row['fileargs']
+        if not isinstance(fileargs, dict) or (fileargs and row['rule'] not in FILEARG_RULES) or len(fileargs) > 64:
+            raise ValueError('Unexpected runtime output bindings')
+        for loc, digest in fileargs.items():
+            name, sep, selector = loc.partition(':')
+            if (not sep or not selector or not name.endswith('.json') or not name.startswith(('gen/', 'obj/')) or
+                    not isinstance(digest, str) or not re.fullmatch('[0-9a-f]{64}',digest)):
+                raise ValueError('Unbound FileArg selector')
+        files = row['files']
+        if not isinstance(files, dict) or not (1 <= len(files) <= (1024 if row['rule'] in FILEARG_RULES else 2)):
+            raise ValueError('Missing or invalid runtime outputs')
+        for name, rec in files.items():
+            if row['rule'] in FILEARG_RULES:
+                safe = (name.startswith(('gen/', 'obj/')) and name.endswith(('.jar','.dex','.zip')) and
+                        PurePosixPath(name).as_posix() == name and '..' not in PurePosixPath(name).parts)
+            else:
+                safe = name == primary + '.md5.stamp' or (row['rule'] == 'android/dex' and name.endswith('.desugardeps'))
+            if not safe:
+                raise ValueError('Unexpected runtime output')
+            if (name in result or name in declared or not isinstance(rec, list) or len(rec) != 2 or
+                    type(rec[0]) is not int or rec[0] < 0 or not re.fullmatch('[0-9a-f]{64}', rec[1])):
+                raise ValueError('Ambiguous or invalid runtime output')
+            result[name] = rec
+    return result
+
+
 if __name__ == "__main__":
     parser=argparse.ArgumentParser(description=__doc__)
     p=parser.add_subparsers(dest="mode",required=True).add_parser("archives")
