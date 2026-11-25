@@ -6,7 +6,7 @@ jobs:
   full-android-checkout:
     if: ${{ github.repository == 'Areal-U/bare-runner-disk-probe' && !github.event.repository.private && !github.event.repository.fork && github.event_name == 'workflow_dispatch' && github.run_attempt == '1' && github.ref == 'refs/heads/bare-next-build-prep-20261125' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 65
+    timeout-minutes: 85
     permissions:
       contents: read
       actions: read
@@ -24,7 +24,7 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       run: python3 next_build/trials/android_sync.py setup
     - name: Start the same pinned Ubuntu Bare builder
-      timeout-minutes: 15
+      timeout-minutes: 25
       env:
         PROBE_MODE: checkpoint-production
         CHECKPOINT_BACKEND: draft

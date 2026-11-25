@@ -386,7 +386,7 @@ jobs:
         set -euo pipefail
         [[ $GITHUB_SHA =~ ^[a-f0-9]{40}$ && $GITHUB_REPOSITORY == Areal-U/bare-runner-disk-probe ]]
         git init --quiet .
-        git sparse-checkout set --no-cone '/preflight28/' '/checkpoint.py'
+        git sparse-checkout set --no-cone '/preflight28/' '/checkpoint.py' '/next_build/'
         GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.extraHeader= fetch --no-tags --depth=1 \
           "https://github.com/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
         git checkout --quiet --detach FETCH_HEAD
@@ -832,11 +832,35 @@ jobs:
           echo 'Production archive validation and readback preserve literal POSIX filenames.'
         fi
         echo 'Distinct runner and builder users successfully handed off a verified archive.'
+    - name: Stage an explicitly selected public Chromium source seed
+      id: source_seed
+      if: ${{ inputs.backend == 'draft' && !inputs.verify_frontier_only && inputs.parent_run == '' }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        manifest=next_build/reviewed-source-plan.json
+        [[ -f $manifest ]] || exit 0
+        exchange="$RUNNER_TEMP/bare-official/exchange"
+        [[ -d $exchange && ! -e $exchange/public-source-seed && ! -L $exchange/public-source-seed ]] || exit 0
+        trial=$(mktemp -d "$exchange/.optional-source.XXXXXXXX") || exit 0
+        trap 'rm -rf --one-file-system -- "$trial"' EXIT
+        if timeout --kill-after=10s 3m python3 -I next_build/source_artifact.py stage "$manifest" "$trial" &&
+          install -D -m 0644 next_build/source_seed.py "$exchange/next_build/source_seed.py" &&
+          install -D -m 0644 next_build/trials/source_reuse.py "$exchange/next_build/trials/source_reuse.py" &&
+          mv -T -- "$trial/public-source-seed" "$exchange/public-source-seed"; then
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+          echo 'Verified immutable public source pack for the selected interval'
+        else
+          echo 'Optional source seed unavailable. Using normal direct synchronization.'
+        fi
     - name: Fetch only the pinned Chromium revision and Android dependencies
       timeout-minutes: 45
+      env:
+        SOURCE_READY: ${{ steps.source_seed.outputs.ready == 'true' }}
       run: |
         cd "$RUNNER_TEMP/bare-official"
-        docker compose exec -T -e "DEPOT_REV=$DEPOT_REV" -e "CHROMIUM_REV=$CHROMIUM_REV" -e GIT_TERMINAL_PROMPT=0 chromium-builder \
+        docker compose exec -T -e SOURCE_READY -e "DEPOT_REV=$DEPOT_REV" -e "CHROMIUM_REV=$CHROMIUM_REV" -e GIT_TERMINAL_PROMPT=0 chromium-builder \
           timeout --kill-after=2m 40m bash -seu <<'CONTAINER'
         set -o pipefail
         export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0
@@ -859,10 +883,42 @@ jobs:
         target_os = ['linux', 'android']
         cache_dir = None
         GCLIENT
+        # Both paths keep the fixed Linux+Android solution, depot tools and subsequent hooks.
+        sync_script=$(mktemp)
+        trap 'rm -f -- "$sync_script"' EXIT
+        cat > "$sync_script" <<'PINNED_SYNC'
         gclient sync --no-history --nohooks --revision "src@$CHROMIUM_REV" --jobs 4
         [[ $(git -C src rev-parse HEAD) == "$CHROMIUM_REV" ]]
+        PINNED_SYNC
+        seeded=false
+        seed_root=/exchange/public-source-seed
+        [[ ! -e src && ! -L src ]]
+        if [[ $SOURCE_READY == true && -f $seed_root/receipt.json && -f /exchange/next_build/source_seed.py ]]; then
+          seed_work=$(mktemp -d .bare-stage.XXXXXXXX)
+          if timeout --kill-after=10s 4m python3 -I /exchange/next_build/source_seed.py restore \
+                "$seed_root/receipt.json" "$seed_root/source.pack" "$PWD/$seed_work/src" "$CHROMIUM_REV"; then
+            mv -T -- "$seed_work/src" src
+            if timeout --kill-after=20s 17m bash -eu -o pipefail "$sync_script"; then
+              seeded=true
+            else
+              # This job created /work/chromium empty above. Remove only files of its
+              # failed optional synchronization and keep the original .gclient.
+              [[ $PWD == /work/chromium && -f .gclient && -d src && ! -L src ]]
+              find . -mindepth 1 -maxdepth 1 ! -name .gclient -exec rm -rf --one-file-system -- {} +
+              echo 'Seeded synchronization failed. Retrying the original empty solution.'
+            fi
+          fi
+          rm -rf --one-file-system -- "$seed_work"
+        fi
+        if [[ $seeded == false ]]; then
+          [[ ! -e src && ! -L src ]]
+          bash -eu -o pipefail "$sync_script"
+        fi
         df -B1 /work
         CONTAINER
+        if [[ $SOURCE_READY == true && -f exchange/public-source-seed/source.pack ]]; then
+          rm -f -- exchange/public-source-seed/source.pack
+        fi
     - name: Install build tools and apply the pinned Bare patches
       timeout-minutes: 35
       env:
