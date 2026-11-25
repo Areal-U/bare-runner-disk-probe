@@ -1,6 +1,5 @@
 """Per-slot checkpoint transport for the bounded Bare Personal Actions chain."""
 import argparse
-import base64
 import hashlib
 import http.client
 import io
@@ -8,11 +7,11 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import time
 from urllib.parse import quote, urlsplit
 import bridge as b
 import frames
+import owner_recovery
 from verify_payload import check as verify_payload
 
 ROOT = Path(os.environ["RUNNER_TEMP"]) / "r28-normal"
@@ -21,8 +20,12 @@ PARENT = {"sha": b.PARENT_SHA, "identity": b.PARENT_IDENTITY}
 PART = 2_000_000_000
 SCHEMA = "bare-r28-checkpoint-private-v1"
 STOPS = {"apk", "no-progress", "verify-only", "size-exceeded", "failed", "cancelled"}
-# Public only, approved in the R27 procedure. The trial has no access to its private key.
-OWNER_PUBLIC_AGE = "age1t69raxytlqula36e8w0tm6p3ezt49ztwnrtz8k57h6mvpwfguy7sjmr4yx"
+JOB_MINUTES = 350
+DOWNLOAD_MINUTES = 18
+PUBLISH_MINUTES = 34
+SENDER_MARGIN_MINUTES = 5
+UPLOAD_MINUTES = 18
+VISIBILITY_MINUTES = 2
 
 
 def slot():
@@ -59,12 +62,31 @@ def names():
     b.output(key_name=stem()+"-key",descriptor_name=stem()+"-descriptor",outcome_name=stem()+"-outcome")
 
 
-def keygen(role,check_run):
+def sender_times(job_start, check_run):
+    b.require(type(job_start) is int and 0 < job_start <= time.time() and
+              type(check_run) is int and check_run > 0, "Invalid hosted sender job clock")
+    tail = DOWNLOAD_MINUTES + PUBLISH_MINUTES + SENDER_MARGIN_MINUTES
+    return {"sender_job_start":job_start, "sender_check_run":check_run,
+            "sender_accept_until":job_start+(JOB_MINUTES-tail)*60}
+
+
+def sender_deadline(record):
+    expected = sender_times(record["sender_job_start"], record["sender_check_run"])
+    b.require(all(record.get(k) == v for k,v in expected.items()), "Changed hosted sender cutoff")
+    return expected["sender_accept_until"]
+
+
+def time_left(deadline, required_seconds, stage):
+    b.require(time.time() + required_seconds <= deadline, "Sender time budget exhausted before " + stage)
+
+
+def keygen(role,check_run,job_start=None):
     b.require(b.env_int("GITHUB_RUN_ATTEMPT")==1,"Retry is read-only; ephemeral work is initial-attempt only")
     b.require(role in ("ordinary","limited") and check_run > 0,"Invalid slot key owner")
+    clock = sender_times(job_start, check_run) if role == "limited" else {}
     ROOT.mkdir(mode=0o700)
     b.keygen()
-    (ROOT/"holder.json").write_text(json.dumps({**context(),"role":role,"check_run":check_run,
+    (ROOT/"holder.json").write_text(json.dumps({**context(),**clock,"role":role,"check_run":check_run,
        "fingerprint":b.fingerprint(ROOT/"public.pem")},sort_keys=True))
 
 
@@ -74,7 +96,8 @@ def wait(kind):
     tag = stem()+require_kind[kind]
     run=b.env_int("GITHUB_RUN_ID")
     start=time.monotonic()
-    deadline=start+(349*60 if kind=="outcome" else 20*60)
+    cutoff = sender_deadline(info()) if kind == "outcome" else None
+    deadline=start+(cutoff-time.time() if cutoff is not None else 20*60)
     observed_done=None
     while time.monotonic()<deadline:
         q=b.api_json(f"/repos/{b.REPO}/actions/runs/{run}/artifacts?name={quote(tag)}&per_page=100")
@@ -82,6 +105,8 @@ def wait(kind):
         b.require(len(found)<=1,"Duplicate peer artifact")
         if found:
             a,=found
+            if cutoff is not None:
+                time_left(cutoff, 0, "outcome download")
             bound=b.CAP+32*1024**2 if kind=="outcome" else 256*1024
             b.require(a["workflow_run"]["id"]==run and not a["expired"] and 0<a["size_in_bytes"]<=bound,
                       "Mismatched or expired peer artifact")
@@ -102,7 +127,7 @@ def wait(kind):
             if len(mine)==1 and mine[0]["status"]=="completed":
                 observed_done=observed_done or time.monotonic()
                 b.require(time.monotonic()-observed_done<75,"Ordinary job terminated without a durable outcome")
-        time.sleep(8 if kind!="outcome" else 30)
+        time.sleep(max(0,min(deadline-time.monotonic(),8 if kind!="outcome" else 30)))
     raise ValueError("Peer receipt unavailable before bounded deadline")
 
 
@@ -170,14 +195,17 @@ def issue():
               and peer["check_run"]>0 and peer["fingerprint"]==b.fingerprint(ROOT/"incoming/public.pem"),
               "Invalid ordinary job certificate")
     (ROOT/"peer.json").write_text(json.dumps(peer))
-    record={**context(),"worker_fpr":peer["fingerprint"],"writer_pem":(ROOT/"public.pem").read_text(),
+    holder = json.loads((ROOT/"holder.json").read_text())
+    b.require(same(holder) and holder["role"] == "limited" and holder["check_run"] == holder["sender_check_run"],
+              "Unbound private writer clock")
+    clock = sender_times(holder["sender_job_start"], holder["check_run"])
+    time_left(sender_deadline(holder), (UPLOAD_MINUTES + VISIBILITY_MINUTES)*60, "descriptor")
+    record={**context(),**clock,"worker_fpr":peer["fingerprint"],"writer_pem":(ROOT/"public.pem").read_text(),
             "lease_ends":int(time.time())+20*60,"source":None,"endpoints":[]}
-    if os.environ.get("R28_WRAP_PUBLIC") == "1":
-        wrapped = subprocess.run(["age","-r",OWNER_PUBLIC_AGE,str(ROOT/"key.pem")],check=True,
-                                 stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=15).stdout
-        b.require(wrapped.startswith(b"age-encryption.org/v1\n") and 0<len(wrapped)<8192,
-                  "Failed to preserve owner-wrapped transport-key backup")
-        record["owner_wrapped_writer_key_age"] = base64.b64encode(wrapped).decode("ascii")
+    # Registration checked this recipient and its claim against the owner ticket
+    # and the independent collector ACK before starting this physical slot.
+    record["owner_recovery"] = owner_recovery.wrap(ROOT,context(),os.environ["R28_OWNER_RECIPIENT"],
+                                                   b.env_int("R28_COLLECTION_CLAIM"))
     if slot()>1:
         mid=b.env_int("R28_PARENT_MANIFEST")
         digest=os.environ["R28_PARENT_MANIFEST_SHA"]
@@ -204,6 +232,9 @@ def acquire():
     rec=info()
     b.require(rec["worker_fpr"]==b.fingerprint(ROOT/"public.pem") and time.time()<rec["lease_ends"],
               "Input read lease invalid")
+    cutoff = sender_deadline(rec)
+    time_left(cutoff, (UPLOAD_MINUTES + VISIBILITY_MINUTES)*60, "peer acquisition")
+    b.output(sender_outcome_deadline=cutoff)
     pub=ROOT/"writer.pem";pub.write_text(rec["writer_pem"]);b.fingerprint(pub)
     m=rec["source"]
     if slot()==1:
@@ -249,10 +280,12 @@ def seal(file,identity,proof_sha):
     evidence={**context(),"status":"candidate","bytes":file.stat().st_size,"sha256":plain_hash,"identity":identity,
               "proof_sha":proof_sha,"sealed_bytes":sealed.stat().st_size,"sealed_sha":b.digest(sealed),
               "recipient_fpr":b.fingerprint(ROOT/"writer.pem")}
-    if "owner_wrapped_writer_key_age" in rec:
-        evidence["owner_wrapped_writer_key_age"] = rec["owner_wrapped_writer_key_age"]
+    wrapper = rec["owner_recovery"]
+    owner_recovery.checked(wrapper,context(),os.environ["R28_OWNER_RECIPIENT"],b.env_int("R28_COLLECTION_CLAIM"),
+                           evidence["recipient_fpr"])
+    evidence["owner_recovery"] = wrapper
     (ROOT/"outcome.json").write_text(json.dumps(evidence,sort_keys=True))
-    logged={k:v for k,v in evidence.items() if k!="owner_wrapped_writer_key_age"}
+    logged={k:v for k,v in evidence.items() if k!="owner_recovery"}
     print("sealed_checkpoint="+json.dumps(logged,sort_keys=True))
 
 
@@ -279,6 +312,7 @@ def capacity():
         "new_native_cache_bytes":0},sort_keys=True),flush=True)
     if limit:
         b.require(visible+outer<=int(limit), "Candidate exceeds configured repository Artifact storage ceiling")
+    time_left(sender_deadline(info()), (UPLOAD_MINUTES + VISIBILITY_MINUTES)*60, "outcome upload")
 
 
 def stop(reason):
@@ -405,6 +439,8 @@ def recovered_intent(rel):
 
 def publish():
     b.require(b.env_int("GITHUB_RUN_ATTEMPT")==1,"Rerun may only reconcile existing receipts")
+    cutoff = sender_deadline(info())
+    time_left(cutoff+(DOWNLOAD_MINUTES+PUBLISH_MINUTES)*60, PUBLISH_MINUTES*60, "Draft publication")
     r=json.loads((ROOT/"incoming/outcome.json").read_text())
     b.require(same(r),"Stale user, version, segment or candidate")
     if r["status"]!="candidate":
@@ -416,6 +452,8 @@ def publish():
               and sha_check(r["sha256"]) and sha_check(r["identity"]) and sha_check(r["proof_sha"])
               and slot()<=12 and file.stat().st_size==r["sealed_bytes"] and b.digest(file)==r["sealed_sha"]
               and b.fingerprint(ROOT/"public.pem")==r["recipient_fpr"],"Sealed checkpoint mismatch")
+    owner_recovery.checked(r["owner_recovery"],context(),os.environ["R28_OWNER_RECIPIENT"],
+                           b.env_int("R28_COLLECTION_CLAIM"),r["recipient_fpr"])
     plain=ROOT/"candidate.tar.zst"
     b.disk("before-private-writer-decryption",r["bytes"]+144*1024**2)
     frames.receive(file,plain,r["bytes"],r["sha256"])
@@ -440,13 +478,22 @@ def publish():
 
 
 def recover():
-    # After VM loss only an actually readable committed generation is a recovery
-    # source. A surviving CMS archive alone cannot recover its vanished private key.
+    # Only an independently readable Draft manifest admits further compilation.
+    # An uncommitted encrypted Artifact has a separate offline owner-recovery path.
     api=b.auth_api()
     release=list_private(api)
     row=existing(release,"manifest.json")
     if not row:
         if recovered_intent(release):
+            return
+        ctx=context()
+        claim=owner_recovery.collection_claim(api,release,ctx)
+        if claim:
+            # Service metadata is observable without giving CI access to the
+            # owner's identity. Only the offline owner opens and verifies bytes.
+            rec=owner_recovery.locate(ctx["run"],ctx["ordinal"],ctx["producer_sha"],ctx["parent_sha"],claim)
+            b.output(recovery_status="owner_outcome_artifact_available",private_readback_verified="false",
+                     checkpoint_advanced="false",owner_outcome_artifact_id=rec["artifact_id"])
             return
         raise ValueError("No unique committed generation; inspect exact ciphertext and owner-wrapped recovery receipt before any reissue; no automatic recomputation")
     verify_outputs(row["id"],row["digest"].removeprefix("sha256:"))
@@ -457,7 +504,7 @@ if __name__=="__main__":
     parser=argparse.ArgumentParser(description=__doc__)
     sub=parser.add_subparsers(dest="mode",required=True)
     for mode in ("names","issue","acquire","publish","recover","capacity"):sub.add_parser(mode)
-    a=sub.add_parser("keygen");a.add_argument("role",choices=["ordinary","limited"]);a.add_argument("--check-run",type=int,required=True)
+    a=sub.add_parser("keygen");a.add_argument("role",choices=["ordinary","limited"]);a.add_argument("--check-run",type=int,required=True);a.add_argument("--job-start",type=int)
     a=sub.add_parser("wait");a.add_argument("kind",choices=["key","descriptor","outcome"])
     a=sub.add_parser("seal");a.add_argument("file",type=Path);a.add_argument("--identity",required=True);a.add_argument("--proof-sha",required=True)
     sub.add_parser("stop").add_argument("--reason",required=True)

@@ -59,6 +59,13 @@ class TestTransport(unittest.TestCase):
              R28_PARENT_SHA=n.PARENT["sha"],R28_PARENT_IDENTITY=n.PARENT["identity"],R28_HEAD_SHA="5"*40,
              GITHUB_OUTPUT=str(Path(tmp)/"outputs")),patch.object(b,"disk"):
             work=Path(tmp)
+            owner_key=work/"test-owner.agekey"
+            subprocess.run(["age-keygen","-o",str(owner_key)],check=True,stderr=subprocess.DEVNULL)
+            recipient=subprocess.check_output(["age-keygen","-y",str(owner_key)],text=True).strip()
+            os.environ.update(R28_OWNER_RECIPIENT=recipient,R28_COLLECTION_CLAIM="123")
+            accepted_owner=patch.object(n.owner_recovery,"RECIPIENT",recipient)
+            accepted_owner.start()
+            self.addCleanup(accepted_owner.stop)
             api=LocalDraft()
             with patch.object(b,"auth_api",return_value=api),patch.object(n,"PART",1_000_000):
                 def role(name,num):
@@ -66,7 +73,8 @@ class TestTransport(unittest.TestCase):
                     n.ROOT=b.ROOT=work/(name+str(num))
                 def newkeys(num):
                     for i,key in enumerate(("ordinary","limited")):
-                        role(key,num);n.keygen(key,11+i)
+                        role(key,num)
+                        n.keygen(key,11+i,int(n.time.time()) if key=="limited" else None)
                         (n.ROOT/"incoming").mkdir()
                 def copy_peer(num,key,to,files):
                     for file in files:
@@ -77,6 +85,7 @@ class TestTransport(unittest.TestCase):
                     copy_peer(num,"limited","ordinary",["input.cms"])
                 issue_slot(1)
                 role("ordinary",1);n.acquire()
+                self.assertIn("sender_outcome_deadline="+str(n.sender_deadline(n.info())),(work/"outputs").read_text())
                 sys.path.insert(0,str(Path(n.__file__).resolve().parents[2]))
                 import checkpoint
                 src=work/"fixture";out=src/"out/Bare";out.mkdir(parents=True)
@@ -142,5 +151,26 @@ class TestTransport(unittest.TestCase):
                 role("limited",2);n.publish();self.assertEqual(len(api.assets),4)
                 # Ciphertext-only or missing generation never publishes/restarts other work.
                 with self.assertRaisesRegex(ValueError,"No unique committed"):n.recover()
+                # The limited VM was lost before an intent or manifest. On a read-only
+                # retry the signed-in service can identify the original owner artifact.
+                c=n.context()
+                claim={"schema":1,"campaign":"bare-personal-204-r28","repository_id":1450926240,
+                       "workflow":".github/workflows/bare-checkpoint-transfer.yml","branch":"bare-coexist-v2.0.4",
+                       "head":c["producer_sha"],"initial_parent":b.PARENT_SHA,"release_id":b.RELEASE,
+                       "recipient":recipient,"run_id":c["run"],"producer_attempt":1}
+                raw=json.dumps(claim).encode()
+                row={"id":123,"name":"bare-personal-204-r28-production-run-claim.json","size":len(raw),
+                     "digest":"sha256:"+hashlib.sha256(raw).hexdigest(),"state":"uploaded"}
+                api.assets.append(row);api.data[123]=raw
+                artifact={"id":321,"name":"r28-1234-a1-s02-outcome","digest":"sha256:"+"7"*64,
+                          "size_in_bytes":2048,"expired":False,"expires_at":"2099-12-01T00:00:00Z",
+                          "workflow_run":{"id":1234,"head_sha":c["producer_sha"]}}
+                with patch.object(b,"api_json",return_value={"artifacts":[artifact],"total_count":1}):
+                    n.recover()
+                    self.assertIn("recovery_status=owner_outcome_artifact_available",(work/"outputs").read_text())
+                    self.assertIn("owner_outcome_artifact_id=321",(work/"outputs").read_text())
+                    artifact["workflow_run"]["head_sha"]="8"*40
+                    with self.assertRaisesRegex(ValueError,"Unconfirmed immutable"):n.recover()
+
 
 if __name__=="__main__":unittest.main()
