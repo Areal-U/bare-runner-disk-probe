@@ -1,5 +1,5 @@
 name: Bare Personal v2.0.4 build and recovery
-run-name: ${{ inputs.mode == 'build-apk' && (inputs.build_segments == '2' && 'Bare ARM64 build (up to two segments)' || 'Bare ARM64 build (one segment)') || 'Recover encrypted Bare APK' }}
+run-name: ${{ inputs.mode == 'build-apk' && format('Bare ARM64 build (up to {0} segments)', inputs.build_segments) || (inputs.mode == 'recover-lost-slot' && 'Recover one confirmed lost Bare interval' || 'Recover encrypted Bare APK') }}
 'on':
   workflow_dispatch:
     inputs:
@@ -10,11 +10,27 @@ run-name: ${{ inputs.mode == 'build-apk' && (inputs.build_segments == '2' && 'Ba
         options:
         - build-apk
         - recover-encrypted-apk
-      apk_recipient:
-        description: age public recipient for the encrypted APK
+        - recover-lost-slot
+      loss_origin_run:
+        description: Registered source run for verified ciphertext recovery or certified loss replacement
         type: string
+      registration_asset_id:
+        description: Optional exact ticket ID (leave both fields empty to discover the one prior collection registration)
+        type: string
+      registration_sha:
+        description: Optional exact SHA-256 of that private collection registration
+        type: string
+      checkpoint_backend:
+        description: Storage for numbered successors (draft is the private zstd route)
+        type: choice
+        default: draft
+        options: [draft]
+      apk_recipient:
+        description: Pinned owner age public recipient for the encrypted APK
+        type: string
+        default: age1t69raxytlqula36e8w0tm6p3ezt49ztwnrtz8k57h6mvpwfguy7sjmr4yx
       checkpoint_key:
-        description: Leave empty for a cold build. For resume, use the verified v2.0.4 branch checkpoint key.
+        description: Leave empty to build from R27 S2. Ciphertext recovery uses the exact original cache key.
         type: string
       checkpoint_sha:
         description: SHA-256 from the selected readback
@@ -23,29 +39,25 @@ run-name: ${{ inputs.mode == 'build-apk' && (inputs.build_segments == '2' && 'Ba
         description: Input identity from the selected production readback
         type: string
       output_gib:
-        description: Output estimate limit for this segment
+        description: Estimated output ceiling in GiB for one segment
         type: choice
         default: '18'
         options: ['18']
       compile_minutes:
-        description: Maximum compilation minutes for this segment
+        description: Compile to the remaining job deadline (0), or apply an explicit earlier cutoff
         type: choice
-        default: '180'
-        options: ['180', '25']
+        default: '0'
+        options: ['0', '180']
       build_segments:
-        description: Maximum sequential build segments (2 requires a verified parent, 180 minutes and two jobs)
+        description: Maximum sequential build segments (12 uses the fixed R27 S2 parent)
         type: choice
-        default: '1'
-        options: ['1', '2']
-      retain_existing_caches:
-        description: Limit checkpoint size for the first resume of run 43987539656 (set 25 minutes and one job)
-        type: boolean
-        default: false
+        default: '12'
+        options: ['12']
       jobs:
         description: Concurrent build actions
         type: choice
         default: '2'
-        options: ['2', '1']
+        options: ['2']
       encrypted_apk_bytes:
         description: Verified encrypted APK byte count (only for recovery)
         type: string
@@ -56,34 +68,106 @@ concurrency:
 jobs:
   validate-build:
     name: Check the requested build segments
-    if: ${{ inputs.mode == 'build-apk' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-coexist-v2.0.4' }}
+    if: ${{ github.run_attempt == '1' && inputs.mode == 'build-apk' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-coexist-v2.0.4' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
     - name: Validate the selected build settings
       shell: bash
       env:
+        APK_RECIPIENT: ${{ inputs.apk_recipient }}
         SEGMENTS: ${{ inputs.build_segments }}
         MINUTES: ${{ inputs.compile_minutes }}
         JOBS: ${{ inputs.jobs }}
         OUTPUT_GIB: ${{ inputs.output_gib }}
-        RETAIN: ${{ inputs.retain_existing_caches }}
+        BACKEND: ${{ inputs.checkpoint_backend }}
+        LOSS_ORIGIN: ${{ inputs.loss_origin_run }}
+        RECOVERY_BYTES: ${{ inputs.encrypted_apk_bytes }}
         PARENT_KEY: ${{ inputs.checkpoint_key }}
         PARENT_SHA: ${{ inputs.checkpoint_sha }}
         PARENT_IDENTITY: ${{ inputs.checkpoint_identity }}
       run: |
-        [[ $SEGMENTS == 1 || $SEGMENTS == 2 ]]
-        if [[ $SEGMENTS == 2 ]]; then
-          [[ $MINUTES == 180 && $JOBS == 2 && $OUTPUT_GIB == 18 && $RETAIN == false ]] || {
-            echo 'Two segments require 180 minutes, two jobs, 18 GiB and normal cache settings.' >&2
-            exit 1
-          }
-          [[ $PARENT_KEY =~ ^bare-coexist-204-[0-9]+-[0-9]+-checkpoint-production(-s2)?$ &&
-            $PARENT_SHA =~ ^[0-9a-f]{64}$ && $PARENT_IDENTITY =~ ^[0-9a-f]{64}$ ]] || {
-            echo 'Two segments require a verified parent checkpoint key, SHA-256 and identity.' >&2
-            exit 1
-          }
+        [[ $SEGMENTS == 12 && $BACKEND == draft && -z $LOSS_ORIGIN$RECOVERY_BYTES ]]
+        [[ $APK_RECIPIENT == age1t69raxytlqula36e8w0tm6p3ezt49ztwnrtz8k57h6mvpwfguy7sjmr4yx ]]
+        [[ $OUTPUT_GIB == 18 && $JOBS == 2 && ($MINUTES == 180 || $MINUTES == 0) ]]
+        if [[ -n $PARENT_KEY$PARENT_SHA$PARENT_IDENTITY ]]; then
+          [[ $PARENT_KEY == bare-coexist-204-45285202990-1-checkpoint-production-s2 ]]
+          [[ $PARENT_SHA == 4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf ]]
+          [[ $PARENT_IDENTITY == a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc ]]
         fi
+  bind-private-receiver:
+    name: Bind the prior private collection registration to this originating run
+    needs: validate-build
+    if: ${{ github.run_attempt == '1' && needs.validate-build.result == 'success' }}
+    permissions:
+      actions: read
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      claim_asset_id: ${{ steps.bind.outputs.claim_asset_id }}
+      latest_start: ${{ steps.bind.outputs.latest_start }}
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - run: python3 preflight28/transport/prepare.py tools
+    - id: bind
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
+        REGISTRATION_ASSET_ID: ${{ inputs.registration_asset_id }}
+        REGISTRATION_SHA: ${{ inputs.registration_sha }}
+      run: python3 preflight28/control/registration.py
+    - name: Bind the allowlisted private claim identities for the registered owner
+      id: owner_witness
+      timeout-minutes: 2
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WITNESS_CLAIM_ID: ${{ steps.bind.outputs.claim_asset_id }}
+      run: python3 preflight28/control/owner_witness.py claim
+    - name: Preserve the registered owner claim witness in the original Draft
+      id: private_witness
+      continue-on-error: true
+      timeout-minutes: 2
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WITNESS_NAME: ${{ steps.owner_witness.outputs.name }}
+        WITNESS_SHA: ${{ steps.owner_witness.outputs.sha }}
+      run: python3 preflight28/control/owner_witness.py preserve claim
+    - name: Attest registered owner claim SHA256 ${{ steps.owner_witness.outputs.sha }}
+      env:
+        WITNESS_SHA: ${{ steps.owner_witness.outputs.sha }}
+      run: '[[ $WITNESS_SHA =~ ^[a-f0-9]{64}$ ]]'
+    - name: Check the free capacity for the optional owner witness Artifact
+      id: witness_budget
+      continue-on-error: true
+      timeout-minutes: 2
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R28_STORAGE_CEILING: ${{ steps.bind.outputs.storage_ceiling }}
+        R28_STORAGE_UNTIL: ${{ steps.bind.outputs.storage_until }}
+        R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
+      run: python3 preflight28/bridge/storage_admission.py witness --file "$RUNNER_TEMP/witness.json"
+    - name: Persist verified owner claim identities
+      id: owner_witness_upload
+      if: ${{ steps.witness_budget.outcome == 'success' }}
+      continue-on-error: true
+      timeout-minutes: 2
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: ${{ steps.owner_witness.outputs.name }}
+        path: ${{ runner.temp }}/witness.json
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 30
+        compression-level: 0
+    - name: Attest registered owner claim IDs ${{ steps.owner_witness.outputs.ids }}
+      env:
+        WITNESS_IDS: ${{ steps.owner_witness.outputs.ids }}
+        WITNESS_SHA: ${{ steps.owner_witness.outputs.sha }}
+      run: python3 preflight28/control/owner_witness.py attest claim
   readback:
     name: Read back the saved continuation on a fresh runner
     needs: production
@@ -143,11 +227,14 @@ jobs:
           printf -- '- Input identity: `%s`\n' "$EXPECTED_IDENTITY"
         } >> "$GITHUB_STEP_SUMMARY"
   production:
-    needs: validate-build
+    if: ${{ github.run_attempt == '1' && inputs.build_segments != '12' && needs.bind-private-receiver.result == 'success' && needs.bind-private-receiver.outputs.claim_asset_id != '' }}
+    needs: [validate-build, bind-private-receiver]
     permissions:
       actions: read
+      contents: write
     uses: ./.github/workflows/bare-arm64-probe.yml
     with:
+      collector_latest_start: ${{ needs.bind-private-receiver.outputs.latest_start }}
       probe: checkpoint-production
       coexist_cold: ${{ inputs.checkpoint_key == '' }}
       expected_checkpoint_key: ${{ inputs.checkpoint_key }}
@@ -158,7 +245,7 @@ jobs:
       apk_output_gib: ${{ fromJSON(inputs.output_gib) }}
       apk_jobs: ${{ fromJSON(inputs.jobs) }}
       compile_minutes: ${{ fromJSON(inputs.compile_minutes) }}
-      retain_existing_caches: ${{ inputs.retain_existing_caches }}
+      retain_existing_caches: false
   read-back-apk:
     name: Read back the encrypted APK on a fresh runner
     needs: production
@@ -174,14 +261,17 @@ jobs:
     steps: &apk_readback_steps
     - name: Download the exact encrypted APK artifact
       if: ${{ env.ARTIFACT_ID != '' }}
+      continue-on-error: true
+      id: exact_artifact
       uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
       timeout-minutes: 10
       with:
         artifact-ids: ${{ env.ARTIFACT_ID }}
-        path: ${{ runner.temp }}/bare-apk-delivery
+        path: ${{ runner.temp }}/bare-apk-artifact
         merge-multiple: true
     - name: Restore the exact encrypted APK fallback cache
-      if: ${{ env.ARTIFACT_ID == '' && env.EXPECTED_CACHE != '' }}
+      if: ${{ !cancelled() && env.EXPECTED_CACHE != '' }}
+      continue-on-error: true
       id: apk_cached
       timeout-minutes: 12
       uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
@@ -192,22 +282,54 @@ jobs:
     - name: Verify the exact encrypted APK bytes
       timeout-minutes: 2
       env:
+        ARTIFACT_OK: ${{ steps.exact_artifact.outcome }}
         CACHE_HIT: ${{ steps.apk_cached.outputs.cache-hit }}
         CACHE_MATCH: ${{ steps.apk_cached.outputs.cache-matched-key }}
       run: |
         [[ $EXPECTED_SHA =~ ^[0-9a-f]{64}$ && $EXPECTED_BYTES =~ ^[1-9][0-9]*$ ]]
-        if [[ -n $EXPECTED_CACHE ]]; then
-          [[ $CACHE_HIT == true && $CACHE_MATCH == "$EXPECTED_CACHE" ]]
-        fi
-        file="$RUNNER_TEMP/bare-apk-delivery/Bare-Personal-2.0.4-arm64-v8a.tar.age"
-        [[ -f $file && ! -L $file && $(stat -c %s -- "$file") == "$EXPECTED_BYTES" ]]
-        [[ $(head -n 1 -- "$file") == age-encryption.org/v1 ]]
-        printf '%s  %s\n' "$EXPECTED_SHA" "$file" | sha256sum --check --strict
-  production-next:
+        (( EXPECTED_BYTES > 0 && EXPECTED_BYTES <= 451 * 1024**2 ))
+        sources=()
+        if [[ -n $ARTIFACT_ID && $ARTIFACT_OK == success ]]; then sources+=(bare-apk-artifact); fi
+        if [[ -n $EXPECTED_CACHE && $CACHE_HIT == true && $CACHE_MATCH == "$EXPECTED_CACHE" ]]; then sources+=(bare-apk-delivery); fi
+        (( ${#sources[@]} > 0 ))
+        for source in "${sources[@]}"; do
+          file="$RUNNER_TEMP/$source/Bare-Personal-2.0.4-arm64-v8a.tar.age"
+          [[ -f $file && ! -L $file && $(stat -c %s -- "$file") == "$EXPECTED_BYTES" ]]
+          [[ $(head -n 1 -- "$file") == age-encryption.org/v1 ]]
+          printf '%s  %s\n' "$EXPECTED_SHA" "$file" | sha256sum --check --strict
+        done
+  collection-lease:
+    name: Re-read the existing owner-bound collection lease for this segment
     needs: [production, readback]
+    if: ${{ github.run_attempt == '1' && inputs.build_segments == '2' && needs.production.outputs.checkpoint_advanced == 'true' && needs.readback.result == 'success' }}
+    permissions:
+      actions: read
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      latest_start: ${{ steps.lease.outputs.latest_start }}
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+        sparse-checkout: |
+          preflight28
+        sparse-checkout-cone-mode: false
+    - run: python3 preflight28/transport/prepare.py tools
+    - name: Verify the prior collector acknowledgement with a GET-only client
+      id: lease
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REGISTRATION_ASSET_ID: ''
+        REGISTRATION_SHA: ''
+      run: python3 preflight28/control/registration.py check-lease
+  production-next:
+    needs: [production, readback, collection-lease]
     if: >-
-      ${{ !cancelled() && inputs.build_segments == '2' &&
-          needs.production.result == 'success' && needs.readback.result == 'success' &&
+      ${{ !cancelled() && github.run_attempt == '1' && inputs.build_segments == '2' &&
+          needs.collection-lease.result == 'success' && needs.production.result == 'success' && needs.readback.result == 'success' &&
           needs.production.outputs.checkpoint_saved == 'true' && needs.production.outputs.checkpoint_advanced == 'true' &&
           needs.production.outputs.apk_artifact_id == '' && needs.production.outputs.apk_cache_key == '' &&
           needs.production.outputs.apk_encrypted_sha == '' && needs.production.outputs.apk_encrypted_bytes == '' &&
@@ -217,8 +339,10 @@ jobs:
           needs.readback.outputs.checkpoint_identity == needs.production.outputs.checkpoint_identity }}
     permissions:
       actions: read
+      contents: write
     uses: ./.github/workflows/bare-arm64-probe.yml
     with:
+      collector_latest_start: ${{ needs.collection-lease.outputs.latest_start }}
       probe: checkpoint-production
       checkpoint_segment: next
       coexist_cold: false
@@ -229,7 +353,7 @@ jobs:
       apk_recipient: ${{ inputs.apk_recipient }}
       apk_output_gib: 18
       apk_jobs: 2
-      compile_minutes: 180
+      compile_minutes: ${{ fromJSON(inputs.compile_minutes) }}
       retain_existing_caches: false
   readback-next:
     name: Read back the second continuation on a fresh runner
@@ -259,7 +383,7 @@ jobs:
       EXPECTED_BYTES: ${{ needs.production-next.outputs.apk_encrypted_bytes }}
     steps: *apk_readback_steps
   recover-encrypted-apk:
-    if: ${{ inputs.mode == 'recover-encrypted-apk' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-coexist-v2.0.4' }}
+    if: ${{ github.run_attempt == '1' && inputs.mode == 'recover-encrypted-apk' && inputs.loss_origin_run == '' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-coexist-v2.0.4' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
@@ -272,7 +396,7 @@ jobs:
     steps:
     - name: Check the exact encrypted APK receipt
       run: |
-        [[ $EXPECTED_KEY =~ ^bare-coexist-204-apk-v1-[0-9]+-[0-9]+$ && $EXPECTED_SHA =~ ^[0-9a-f]{64}$ ]]
+        [[ $EXPECTED_KEY =~ ^bare-coexist-204-apk-v1-[1-9][0-9]*-[1-9][0-9]*(-s2)?$ && $EXPECTED_SHA =~ ^[0-9a-f]{64}$ ]]
         [[ $EXPECTED_BYTES =~ ^[1-9][0-9]{0,8}$ ]]
         (( EXPECTED_BYTES <= 451 * 1024**2 ))
     - name: Restore only the encrypted APK
@@ -284,7 +408,7 @@ jobs:
         fail-on-cache-miss: true
     - name: Verify encrypted bytes before re-upload
       env:
-        CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+        CACHE_HIT: ${{ steps.restore.outputs.cache-hit == 'true' }}
         CACHE_MATCH: ${{ steps.restore.outputs.cache-matched-key }}
       run: |
         [[ $CACHE_HIT == true && $CACHE_MATCH == "$EXPECTED_KEY" ]]
@@ -300,3 +424,770 @@ jobs:
         if-no-files-found: error
         retention-days: 3
         compression-level: 0
+
+
+  deliver-recovered-cached-apk:
+    name: Transfer the original cached ciphertext to its registered owner
+    if: ${{ github.run_attempt == '1' && inputs.mode == 'recover-encrypted-apk' && inputs.loss_origin_run != '' && github.actor == 'Areal-U' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-coexist-v2.0.4' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    permissions:
+      actions: read
+      contents: write
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+        sparse-checkout: |
+          preflight28
+        sparse-checkout-cone-mode: false
+    - run: python3 preflight28/transport/prepare.py tools
+    - name: Bind the exact original cache to its registered owner
+      id: origin
+      timeout-minutes: 7
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 preflight28/bridge/terminal_draft.py authorize-rescue
+    - name: Restore only the original ciphertext and seal
+      if: ${{ steps.origin.outputs.prior_id == '' }}
+      id: cache
+      timeout-minutes: 12
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+      with:
+        path: ${{ runner.temp }}/bare-apk-delivery
+        key: ${{ steps.origin.outputs.cache_key }}
+        fail-on-cache-miss: true
+    - name: Deposit and read back the owner-encrypted bytes and immutable receiver record
+      id: deposited
+      timeout-minutes: 20
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PRIOR_RECEIPT_ID: ${{ steps.origin.outputs.prior_id }}
+        PRIOR_RECEIPT_SHA: ${{ steps.origin.outputs.prior_sha }}
+        R28_SOURCE_RUN: ${{ steps.origin.outputs.source_run }}
+        R28_SLOT: ${{ steps.origin.outputs.ordinal }}
+        R28_PARENT_SHA: ${{ steps.origin.outputs.parent }}
+        R28_COLLECTION_CLAIM: ${{ steps.origin.outputs.claim_id }}
+        CACHE_ID: ${{ steps.origin.outputs.cache_id }}
+        CACHE_KEY: ${{ steps.origin.outputs.cache_key }}
+        CACHE_MATCH: ${{ steps.cache.outputs.cache-matched-key }}
+        CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        CIPHER_SHA: ${{ steps.origin.outputs.sha }}
+        CIPHER_BYTES: ${{ steps.origin.outputs.bytes }}
+      run: python3 preflight28/bridge/terminal_draft.py
+    - name: Bind the allowlisted private terminal identities for the registered owner
+      id: owner_witness
+      timeout-minutes: 2
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WITNESS_RECEIPT_ID: ${{ steps.deposited.outputs.receipt_id }}
+        WITNESS_RECEIPT_SHA: ${{ steps.deposited.outputs.receipt_sha }}
+        R28_SOURCE_RUN: ${{ steps.origin.outputs.source_run }}
+        R28_SLOT: ${{ steps.origin.outputs.ordinal }}
+        R28_PARENT_SHA: ${{ steps.origin.outputs.parent }}
+        R28_COLLECTION_CLAIM: ${{ steps.origin.outputs.claim_id }}
+      run: python3 preflight28/control/owner_witness.py terminal
+    - name: Preserve the registered owner terminal witness in the original Draft
+      id: private_witness
+      continue-on-error: true
+      timeout-minutes: 2
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WITNESS_NAME: ${{ steps.owner_witness.outputs.name }}
+        WITNESS_SHA: ${{ steps.owner_witness.outputs.sha }}
+        R28_SLOT: ${{ steps.origin.outputs.ordinal }}
+      run: python3 preflight28/control/owner_witness.py preserve terminal
+    - name: Attest registered owner terminal SHA256 ${{ steps.owner_witness.outputs.sha }}
+      env:
+        WITNESS_SHA: ${{ steps.owner_witness.outputs.sha }}
+      run: '[[ $WITNESS_SHA =~ ^[a-f0-9]{64}$ ]]'
+    - name: Check the free capacity for the optional owner witness Artifact
+      id: witness_budget
+      continue-on-error: true
+      timeout-minutes: 2
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R28_STORAGE_CEILING: ${{ steps.origin.outputs.storage_ceiling }}
+        R28_STORAGE_UNTIL: ${{ steps.origin.outputs.storage_until }}
+        R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
+      run: python3 preflight28/bridge/storage_admission.py witness --file "$RUNNER_TEMP/witness.json"
+    - name: Persist verified owner terminal identities
+      id: owner_witness_upload
+      if: ${{ steps.witness_budget.outcome == 'success' }}
+      continue-on-error: true
+      timeout-minutes: 2
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: ${{ steps.owner_witness.outputs.name }}
+        path: ${{ runner.temp }}/witness.json
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 30
+        compression-level: 0
+    - name: Attest registered owner terminal IDs ${{ steps.owner_witness.outputs.ids }}
+      env:
+        WITNESS_IDS: ${{ steps.owner_witness.outputs.ids }}
+        WITNESS_SHA: ${{ steps.owner_witness.outputs.sha }}
+      run: python3 preflight28/control/owner_witness.py attest terminal
+
+  loss-admission:
+    name: Reserve one confirmed lost physical interval
+    if: ${{ inputs.mode == 'recover-lost-slot' && github.run_attempt == '1' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-coexist-v2.0.4' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      ordinal: ${{ steps.check.outputs.ordinal }}
+      next_ordinal: ${{ steps.check.outputs.next_ordinal }}
+      parent_sha: ${{ steps.check.outputs.parent_sha }}
+      parent_identity: ${{ steps.check.outputs.parent_identity }}
+      parent_run: ${{ steps.check.outputs.parent_run }}
+      parent_key: ${{ steps.check.outputs.parent_key }}
+      parent_manifest_id: ${{ steps.check.outputs.parent_manifest_id }}
+      parent_manifest_sha: ${{ steps.check.outputs.parent_manifest_sha }}
+      parent_producer: ${{ steps.check.outputs.parent_producer }}
+      claim_asset_id: ${{ steps.check.outputs.claim_asset_id }}
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - run: python3 preflight28/transport/prepare.py tools
+    - name: Claim one certified loss
+      id: check
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
+      run: python3 preflight28/control/loss_resume.py claim
+    - name: Bind the allowlisted private claim identities for the registered owner
+      id: owner_witness
+      timeout-minutes: 2
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WITNESS_CLAIM_ID: ${{ steps.check.outputs.claim_asset_id }}
+      run: python3 preflight28/control/owner_witness.py claim
+    - name: Preserve the registered owner claim witness in the original Draft
+      id: private_witness
+      continue-on-error: true
+      timeout-minutes: 2
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WITNESS_NAME: ${{ steps.owner_witness.outputs.name }}
+        WITNESS_SHA: ${{ steps.owner_witness.outputs.sha }}
+      run: python3 preflight28/control/owner_witness.py preserve claim
+    - name: Attest registered owner claim SHA256 ${{ steps.owner_witness.outputs.sha }}
+      env:
+        WITNESS_SHA: ${{ steps.owner_witness.outputs.sha }}
+      run: '[[ $WITNESS_SHA =~ ^[a-f0-9]{64}$ ]]'
+    - name: Check the free capacity for the optional owner witness Artifact
+      id: witness_budget
+      continue-on-error: true
+      timeout-minutes: 2
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R28_STORAGE_CEILING: ${{ steps.check.outputs.storage_ceiling }}
+        R28_STORAGE_UNTIL: ${{ steps.check.outputs.storage_until }}
+        R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
+      run: python3 preflight28/bridge/storage_admission.py witness --file "$RUNNER_TEMP/witness.json"
+    - name: Persist verified owner claim identities
+      id: owner_witness_upload
+      if: ${{ steps.witness_budget.outcome == 'success' }}
+      continue-on-error: true
+      timeout-minutes: 2
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: ${{ steps.owner_witness.outputs.name }}
+        path: ${{ runner.temp }}/witness.json
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 30
+        compression-level: 0
+    - name: Attest registered owner claim IDs ${{ steps.owner_witness.outputs.ids }}
+      env:
+        WITNESS_IDS: ${{ steps.owner_witness.outputs.ids }}
+        WITNESS_SHA: ${{ steps.owner_witness.outputs.sha }}
+      run: python3 preflight28/control/owner_witness.py attest claim
+  reread-loss-admission:
+    name: Read the existing one-interval replacement claim
+    if: ${{ inputs.mode == 'recover-lost-slot' && github.run_attempt != '1' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-coexist-v2.0.4' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      ordinal: ${{ steps.check.outputs.ordinal }}
+      parent_sha: ${{ steps.check.outputs.parent_sha }}
+      parent_identity: ${{ steps.check.outputs.parent_identity }}
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - run: python3 preflight28/transport/prepare.py tools
+    - id: check
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
+      run: python3 preflight28/control/loss_resume.py reread
+
+  replacement:
+    name: Bounded build segment ${{ needs.loss-admission.outputs.ordinal }}
+    needs: loss-admission
+    if: ${{ github.run_attempt == '1' && inputs.mode == 'recover-lost-slot' && needs.loss-admission.result == 'success' && needs.loss-admission.outputs.claim_asset_id != '' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: ${{ fromJSON(needs.loss-admission.outputs.ordinal) }}
+      backend: draft
+      verify_only: false
+      minutes: 0
+      apk_recipient: ${{ inputs.apk_recipient }}
+      parent_sha: ${{ needs.loss-admission.outputs.parent_sha }}
+      parent_identity: ${{ needs.loss-admission.outputs.parent_identity }}
+      parent_run: ${{ needs.loss-admission.outputs.parent_run }}
+      parent_key: ${{ needs.loss-admission.outputs.parent_key }}
+      parent_manifest_id: ${{ needs.loss-admission.outputs.parent_manifest_id }}
+      parent_manifest_sha: ${{ needs.loss-admission.outputs.parent_manifest_sha }}
+      parent_producer: ${{ needs.loss-admission.outputs.parent_producer }}
+
+  replacement-readback:
+    name: ${{ needs.loss-admission.outputs.ordinal == '12' && 'Independently receive checkpoint at the 12-segment limit' || format('Bounded build segment {0}', needs.loss-admission.outputs.next_ordinal) }}
+    needs: [loss-admission, replacement]
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'recover-lost-slot' && needs.replacement.result == 'success' && needs.replacement.outputs.ordinal == needs.loss-admission.outputs.ordinal && needs.replacement.outputs.status == 'candidate' && needs.replacement.outputs.producer_sha == github.sha && needs.replacement.outputs.accepted_parent == needs.loss-admission.outputs.parent_sha && needs.replacement.outputs.sha != '' && needs.replacement.outputs.sha != needs.loss-admission.outputs.parent_sha }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: ${{ fromJSON(needs.loss-admission.outputs.next_ordinal) }}
+      backend: draft
+      verify_only: true
+      minutes: 0
+      apk_recipient: ${{ inputs.apk_recipient }}
+      parent_sha: ${{ needs.replacement.outputs.sha }}
+      parent_key: ${{ needs.replacement.outputs.key }}
+      parent_identity: ${{ needs.replacement.outputs.identity }}
+      parent_manifest_id: ${{ needs.replacement.outputs.manifest_id }}
+      parent_manifest_sha: ${{ needs.replacement.outputs.manifest_sha }}
+      parent_producer: ${{ needs.replacement.outputs.producer_sha }}
+  slot01:
+    name: Bounded build segment 1
+    needs:
+    - validate-build
+    - bind-private-receiver
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.validate-build.result
+      == 'success' && needs.bind-private-receiver.result == 'success' && needs.bind-private-receiver.outputs.claim_asset_id != '' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: 1
+      backend: ${{ inputs.checkpoint_backend }}
+      verify_only: false
+      parent_key: bare-coexist-204-45285202990-1-checkpoint-production-s2
+      parent_sha: 4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf
+      parent_identity: a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc
+      parent_producer: bf70ddbf474f3390a62220a076b8c43347fecc64
+      apk_recipient: ${{ inputs.apk_recipient }}
+      minutes: ${{ fromJSON(inputs.compile_minutes) }}
+  slot02:
+    name: Bounded build segment 2
+    needs:
+    - slot01
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.slot01.result == 'success'
+      && needs.slot01.outputs.status == 'candidate' && needs.slot01.outputs.ordinal == '1' && needs.slot01.outputs.producer_sha == github.sha &&
+      needs.slot01.outputs.accepted_parent == '4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf' && needs.slot01.outputs.sha !=
+      needs.slot01.outputs.accepted_parent && needs.slot01.outputs.sha != '' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: 2
+      backend: ${{ inputs.checkpoint_backend }}
+      parent_manifest_id: ${{ needs.slot01.outputs.manifest_id }}
+      parent_manifest_sha: ${{ needs.slot01.outputs.manifest_sha }}
+      verify_only: false
+      parent_key: ${{ needs.slot01.outputs.key }}
+      parent_sha: ${{ needs.slot01.outputs.sha }}
+      parent_identity: ${{ needs.slot01.outputs.identity }}
+      parent_producer: ${{ needs.slot01.outputs.producer_sha }}
+      apk_recipient: ${{ inputs.apk_recipient }}
+      minutes: ${{ fromJSON(inputs.compile_minutes) }}
+  slot03:
+    name: Bounded build segment 3
+    needs:
+    - slot01
+    - slot02
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.slot02.result == 'success'
+      && needs.slot02.outputs.status == 'candidate' && needs.slot02.outputs.ordinal == '2' && needs.slot02.outputs.producer_sha == github.sha &&
+      needs.slot02.outputs.accepted_parent == needs.slot01.outputs.sha && needs.slot02.outputs.sha != needs.slot02.outputs.accepted_parent && needs.slot02.outputs.sha
+      != '' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: 3
+      backend: ${{ inputs.checkpoint_backend }}
+      parent_manifest_id: ${{ needs.slot02.outputs.manifest_id }}
+      parent_manifest_sha: ${{ needs.slot02.outputs.manifest_sha }}
+      verify_only: false
+      parent_key: ${{ needs.slot02.outputs.key }}
+      parent_sha: ${{ needs.slot02.outputs.sha }}
+      parent_identity: ${{ needs.slot02.outputs.identity }}
+      parent_producer: ${{ needs.slot02.outputs.producer_sha }}
+      apk_recipient: ${{ inputs.apk_recipient }}
+      minutes: ${{ fromJSON(inputs.compile_minutes) }}
+  slot04:
+    name: Bounded build segment 4
+    needs:
+    - slot02
+    - slot03
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.slot03.result == 'success'
+      && needs.slot03.outputs.status == 'candidate' && needs.slot03.outputs.ordinal == '3' && needs.slot03.outputs.producer_sha == github.sha &&
+      needs.slot03.outputs.accepted_parent == needs.slot02.outputs.sha && needs.slot03.outputs.sha != needs.slot03.outputs.accepted_parent && needs.slot03.outputs.sha
+      != '' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: 4
+      backend: ${{ inputs.checkpoint_backend }}
+      parent_manifest_id: ${{ needs.slot03.outputs.manifest_id }}
+      parent_manifest_sha: ${{ needs.slot03.outputs.manifest_sha }}
+      verify_only: false
+      parent_key: ${{ needs.slot03.outputs.key }}
+      parent_sha: ${{ needs.slot03.outputs.sha }}
+      parent_identity: ${{ needs.slot03.outputs.identity }}
+      parent_producer: ${{ needs.slot03.outputs.producer_sha }}
+      apk_recipient: ${{ inputs.apk_recipient }}
+      minutes: ${{ fromJSON(inputs.compile_minutes) }}
+  slot05:
+    name: Bounded build segment 5
+    needs:
+    - slot03
+    - slot04
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.slot04.result == 'success'
+      && needs.slot04.outputs.status == 'candidate' && needs.slot04.outputs.ordinal == '4' && needs.slot04.outputs.producer_sha == github.sha &&
+      needs.slot04.outputs.accepted_parent == needs.slot03.outputs.sha && needs.slot04.outputs.sha != needs.slot04.outputs.accepted_parent && needs.slot04.outputs.sha
+      != '' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: 5
+      backend: ${{ inputs.checkpoint_backend }}
+      parent_manifest_id: ${{ needs.slot04.outputs.manifest_id }}
+      parent_manifest_sha: ${{ needs.slot04.outputs.manifest_sha }}
+      verify_only: false
+      parent_key: ${{ needs.slot04.outputs.key }}
+      parent_sha: ${{ needs.slot04.outputs.sha }}
+      parent_identity: ${{ needs.slot04.outputs.identity }}
+      parent_producer: ${{ needs.slot04.outputs.producer_sha }}
+      apk_recipient: ${{ inputs.apk_recipient }}
+      minutes: ${{ fromJSON(inputs.compile_minutes) }}
+  slot06:
+    name: Bounded build segment 6
+    needs:
+    - slot04
+    - slot05
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.slot05.result == 'success'
+      && needs.slot05.outputs.status == 'candidate' && needs.slot05.outputs.ordinal == '5' && needs.slot05.outputs.producer_sha == github.sha &&
+      needs.slot05.outputs.accepted_parent == needs.slot04.outputs.sha && needs.slot05.outputs.sha != needs.slot05.outputs.accepted_parent && needs.slot05.outputs.sha
+      != '' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: 6
+      backend: ${{ inputs.checkpoint_backend }}
+      parent_manifest_id: ${{ needs.slot05.outputs.manifest_id }}
+      parent_manifest_sha: ${{ needs.slot05.outputs.manifest_sha }}
+      verify_only: false
+      parent_key: ${{ needs.slot05.outputs.key }}
+      parent_sha: ${{ needs.slot05.outputs.sha }}
+      parent_identity: ${{ needs.slot05.outputs.identity }}
+      parent_producer: ${{ needs.slot05.outputs.producer_sha }}
+      apk_recipient: ${{ inputs.apk_recipient }}
+      minutes: ${{ fromJSON(inputs.compile_minutes) }}
+  slot07:
+    name: Bounded build segment 7
+    needs:
+    - slot05
+    - slot06
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.slot06.result == 'success'
+      && needs.slot06.outputs.status == 'candidate' && needs.slot06.outputs.ordinal == '6' && needs.slot06.outputs.producer_sha == github.sha &&
+      needs.slot06.outputs.accepted_parent == needs.slot05.outputs.sha && needs.slot06.outputs.sha != needs.slot06.outputs.accepted_parent && needs.slot06.outputs.sha
+      != '' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: 7
+      backend: ${{ inputs.checkpoint_backend }}
+      parent_manifest_id: ${{ needs.slot06.outputs.manifest_id }}
+      parent_manifest_sha: ${{ needs.slot06.outputs.manifest_sha }}
+      verify_only: false
+      parent_key: ${{ needs.slot06.outputs.key }}
+      parent_sha: ${{ needs.slot06.outputs.sha }}
+      parent_identity: ${{ needs.slot06.outputs.identity }}
+      parent_producer: ${{ needs.slot06.outputs.producer_sha }}
+      apk_recipient: ${{ inputs.apk_recipient }}
+      minutes: ${{ fromJSON(inputs.compile_minutes) }}
+  slot08:
+    name: Bounded build segment 8
+    needs:
+    - slot06
+    - slot07
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.slot07.result == 'success'
+      && needs.slot07.outputs.status == 'candidate' && needs.slot07.outputs.ordinal == '7' && needs.slot07.outputs.producer_sha == github.sha &&
+      needs.slot07.outputs.accepted_parent == needs.slot06.outputs.sha && needs.slot07.outputs.sha != needs.slot07.outputs.accepted_parent && needs.slot07.outputs.sha
+      != '' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: 8
+      backend: ${{ inputs.checkpoint_backend }}
+      parent_manifest_id: ${{ needs.slot07.outputs.manifest_id }}
+      parent_manifest_sha: ${{ needs.slot07.outputs.manifest_sha }}
+      verify_only: false
+      parent_key: ${{ needs.slot07.outputs.key }}
+      parent_sha: ${{ needs.slot07.outputs.sha }}
+      parent_identity: ${{ needs.slot07.outputs.identity }}
+      parent_producer: ${{ needs.slot07.outputs.producer_sha }}
+      apk_recipient: ${{ inputs.apk_recipient }}
+      minutes: ${{ fromJSON(inputs.compile_minutes) }}
+  slot09:
+    name: Bounded build segment 9
+    needs:
+    - slot07
+    - slot08
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.slot08.result == 'success'
+      && needs.slot08.outputs.status == 'candidate' && needs.slot08.outputs.ordinal == '8' && needs.slot08.outputs.producer_sha == github.sha &&
+      needs.slot08.outputs.accepted_parent == needs.slot07.outputs.sha && needs.slot08.outputs.sha != needs.slot08.outputs.accepted_parent && needs.slot08.outputs.sha
+      != '' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: 9
+      backend: ${{ inputs.checkpoint_backend }}
+      parent_manifest_id: ${{ needs.slot08.outputs.manifest_id }}
+      parent_manifest_sha: ${{ needs.slot08.outputs.manifest_sha }}
+      verify_only: false
+      parent_key: ${{ needs.slot08.outputs.key }}
+      parent_sha: ${{ needs.slot08.outputs.sha }}
+      parent_identity: ${{ needs.slot08.outputs.identity }}
+      parent_producer: ${{ needs.slot08.outputs.producer_sha }}
+      apk_recipient: ${{ inputs.apk_recipient }}
+      minutes: ${{ fromJSON(inputs.compile_minutes) }}
+  slot10:
+    name: Bounded build segment 10
+    needs:
+    - slot08
+    - slot09
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.slot09.result == 'success'
+      && needs.slot09.outputs.status == 'candidate' && needs.slot09.outputs.ordinal == '9' && needs.slot09.outputs.producer_sha == github.sha &&
+      needs.slot09.outputs.accepted_parent == needs.slot08.outputs.sha && needs.slot09.outputs.sha != needs.slot09.outputs.accepted_parent && needs.slot09.outputs.sha
+      != '' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: 10
+      backend: ${{ inputs.checkpoint_backend }}
+      parent_manifest_id: ${{ needs.slot09.outputs.manifest_id }}
+      parent_manifest_sha: ${{ needs.slot09.outputs.manifest_sha }}
+      verify_only: false
+      parent_key: ${{ needs.slot09.outputs.key }}
+      parent_sha: ${{ needs.slot09.outputs.sha }}
+      parent_identity: ${{ needs.slot09.outputs.identity }}
+      parent_producer: ${{ needs.slot09.outputs.producer_sha }}
+      apk_recipient: ${{ inputs.apk_recipient }}
+      minutes: ${{ fromJSON(inputs.compile_minutes) }}
+  slot11:
+    name: Bounded build segment 11
+    needs:
+    - slot09
+    - slot10
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.slot10.result == 'success'
+      && needs.slot10.outputs.status == 'candidate' && needs.slot10.outputs.ordinal == '10' && needs.slot10.outputs.producer_sha == github.sha &&
+      needs.slot10.outputs.accepted_parent == needs.slot09.outputs.sha && needs.slot10.outputs.sha != needs.slot10.outputs.accepted_parent && needs.slot10.outputs.sha
+      != '' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: 11
+      backend: ${{ inputs.checkpoint_backend }}
+      parent_manifest_id: ${{ needs.slot10.outputs.manifest_id }}
+      parent_manifest_sha: ${{ needs.slot10.outputs.manifest_sha }}
+      verify_only: false
+      parent_key: ${{ needs.slot10.outputs.key }}
+      parent_sha: ${{ needs.slot10.outputs.sha }}
+      parent_identity: ${{ needs.slot10.outputs.identity }}
+      parent_producer: ${{ needs.slot10.outputs.producer_sha }}
+      apk_recipient: ${{ inputs.apk_recipient }}
+      minutes: ${{ fromJSON(inputs.compile_minutes) }}
+  slot12:
+    name: Bounded build segment 12
+    needs:
+    - slot10
+    - slot11
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.slot11.result == 'success'
+      && needs.slot11.outputs.status == 'candidate' && needs.slot11.outputs.ordinal == '11' && needs.slot11.outputs.producer_sha == github.sha &&
+      needs.slot11.outputs.accepted_parent == needs.slot10.outputs.sha && needs.slot11.outputs.sha != needs.slot11.outputs.accepted_parent && needs.slot11.outputs.sha
+      != '' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: 12
+      backend: ${{ inputs.checkpoint_backend }}
+      parent_manifest_id: ${{ needs.slot11.outputs.manifest_id }}
+      parent_manifest_sha: ${{ needs.slot11.outputs.manifest_sha }}
+      verify_only: false
+      parent_key: ${{ needs.slot11.outputs.key }}
+      parent_sha: ${{ needs.slot11.outputs.sha }}
+      parent_identity: ${{ needs.slot11.outputs.identity }}
+      parent_producer: ${{ needs.slot11.outputs.producer_sha }}
+      apk_recipient: ${{ inputs.apk_recipient }}
+      minutes: ${{ fromJSON(inputs.compile_minutes) }}
+  slot13:
+    name: Independently receive checkpoint at the 12-segment limit
+    needs:
+    - slot11
+    - slot12
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.slot12.result == 'success'
+      && needs.slot12.outputs.status == 'candidate' && needs.slot12.outputs.ordinal == '12' && needs.slot12.outputs.producer_sha == github.sha &&
+      needs.slot12.outputs.accepted_parent == needs.slot11.outputs.sha && needs.slot12.outputs.sha != needs.slot12.outputs.accepted_parent && needs.slot12.outputs.sha
+      != '' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-r28-native-slot.yml
+    with:
+      ordinal: 13
+      backend: ${{ inputs.checkpoint_backend }}
+      parent_manifest_id: ${{ needs.slot12.outputs.manifest_id }}
+      parent_manifest_sha: ${{ needs.slot12.outputs.manifest_sha }}
+      verify_only: true
+      parent_key: ${{ needs.slot12.outputs.key }}
+      parent_sha: ${{ needs.slot12.outputs.sha }}
+      parent_identity: ${{ needs.slot12.outputs.identity }}
+      parent_producer: ${{ needs.slot12.outputs.producer_sha }}
+      apk_recipient: ${{ inputs.apk_recipient }}
+      minutes: ${{ fromJSON(inputs.compile_minutes) }}
+  terminal-12:
+    name: Record the terminal receipt of any build segment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    needs:
+    - slot01
+    - slot02
+    - slot03
+    - slot04
+    - slot05
+    - slot06
+    - slot07
+    - slot08
+    - slot09
+    - slot10
+    - slot11
+    - slot12
+    - slot13
+    if: ${{ !cancelled() && inputs.mode == 'build-apk' && inputs.build_segments == '12' && github.run_attempt == '1' }}
+    steps:
+    - name: Check every causal transition and select the sole outcome
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      shell: python
+      run: |
+        import json, os, re
+        jobs = json.loads(os.environ["NEEDS"])
+        parent = "4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf"
+        end = None
+        seen = {parent}
+        verified_parent = parent
+        for n in range(1,14):
+            row = jobs["slot%02d"%n]
+            if end is not None:
+                if row["result"] != "skipped": raise SystemExit("Unexpected work after terminal state")
+                continue
+            o = row["outputs"]
+            if row["result"] != "success" or o.get("accepted_parent") != parent or o.get("ordinal") != str(n):
+                print("R28_INTERRUPTED_RECEIPT "+json.dumps({"slot":n, "verified_parent":verified_parent,
+                    "pending_parent":parent if parent != verified_parent else None},sort_keys=True))
+                raise SystemExit(f"Slot {n} failed or returned stale lineage")
+            # Each successful non-bootstrap receipt requires the restored whole parent frontier.
+            if n > 1:
+                verified_parent = parent
+            state = o.get("status")
+            if state == "candidate" and n <= 12:
+                child = o["sha"]
+                if child in seen or not re.fullmatch("[0-9a-f]{64}", child): raise SystemExit("Repeated or invalid child")
+                seen.add(child); parent=child
+            elif state in {"apk", "no-progress", "apk-size-exceeded", "cipher-size-exceeded", "limit-verified", "manifest_present_visibility_pending",
+                           "relay-quota-denied","relay-capacity-exceeded","relay-deadline","relay-missing","relay-ambiguous"}:
+                if state == "limit-verified" and (n != 13 or o["sha"] != parent): raise SystemExit("Unverified terminal parent")
+                if state == "apk" and not (o.get("cipher_id") or o.get("cipher_cache")): raise SystemExit("No recoverable APK")
+                end = dict(o, slot=n, verified_parent=verified_parent)
+            else:
+                raise SystemExit("Unknown terminal state")
+        if end is None: raise SystemExit("No final receipt")
+        print("R28_TERMINAL_RECEIPT "+json.dumps(end, sort_keys=True, separators=(",", ":")))
+        if end["status"] == "apk":
+            print("Encrypted APK preserved. The independently registered collector must verify owner access, signing and final delivery.")
+        if end["status"] != "apk": raise SystemExit("Stopped: " + end["status"])
+
+  recover-first-attempt:
+    needs: [terminal-12, reread-loss-admission]
+    name: Read-only recovery of the original 12-slot operation
+    if: ${{ !cancelled() && github.run_attempt != '1' && github.repository == 'Areal-U/bare-runner-disk-probe' &&
+      github.ref == 'refs/heads/bare-coexist-v2.0.4' && ((inputs.mode == 'build-apk' && inputs.build_segments == '12') ||
+      (inputs.mode == 'recover-lost-slot' && needs.reread-loss-admission.result == 'success')) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    timeout-minutes: 35
+    outputs:
+      private_ordinal: ${{ steps.lookup.outputs.private_ordinal }}
+      private_parent: ${{ steps.lookup.outputs.private_parent }}
+      private_identity: ${{ steps.lookup.outputs.private_identity }}
+      expected_manifest: ${{ steps.lookup.outputs.manifest_id }}
+      expected_manifest_sha: ${{ steps.lookup.outputs.manifest_sha }}
+    steps:
+    - name: Load the exact read-only reconciliation code
+      run: |-
+        set -euo pipefail
+        cd "$RUNNER_TEMP"
+        for file in admission.py receipt_journal.py apk_seal.py recover.py; do
+          curl --proto '=https' -fsS --retry 2 --max-time 60 "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/preflight28/control/$file" -o "$file"
+        done
+    - name: Resolve the original producing attempt and immutable receipts
+      id: lookup
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R28_REPLAY_MODE: ${{ inputs.mode }}
+        R28_REPLAY_ORDINAL: ${{ needs.reread-loss-admission.outputs.ordinal }}
+        R28_REPLAY_PARENT: ${{ needs.reread-loss-admission.outputs.parent_sha }}
+        R28_REPLAY_IDENTITY: ${{ needs.reread-loss-admission.outputs.parent_identity }}
+      run: python3 "$RUNNER_TEMP/recover.py"
+    - name: Download and authenticate the exact encrypted APK Artifact ZIP
+      if: ${{ !cancelled() && steps.lookup.outputs.status == 'inspect-terminal' && steps.lookup.outputs.cipher_id != '' }}
+      id: exact_artifact
+      continue-on-error: true
+      timeout-minutes: 10
+      env:
+        GH_TOKEN: ${{ github.token }}
+        ARTIFACT_ID: ${{ steps.lookup.outputs.cipher_id }}
+        ARCHIVE_BYTES: ${{ steps.lookup.outputs.cipher_zip_bytes }}
+        ARCHIVE_DIGEST: ${{ steps.lookup.outputs.cipher_outer_digest }}
+      run: python3 "$RUNNER_TEMP/recover.py" fetch-terminal
+    - name: Restore the exact encrypted APK fallback cache
+      if: ${{ !cancelled() && steps.lookup.outputs.status == 'inspect-terminal' && steps.lookup.outputs.cipher_cache != '' }}
+      continue-on-error: true
+      id: apk_cached
+      timeout-minutes: 12
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+      with:
+        path: ${{ runner.temp }}/bare-apk-delivery
+        key: ${{ steps.lookup.outputs.cipher_cache }}
+        fail-on-cache-miss: true
+    - name: Verify the exact encrypted APK bytes
+      timeout-minutes: 2
+      env:
+        GH_TOKEN: ${{ github.token }}
+        CACHE_ID: ${{ steps.lookup.outputs.cipher_cache_id }}
+        ARTIFACT_OK: ${{ steps.exact_artifact.outcome }}
+        CACHE_HIT: ${{ steps.apk_cached.outputs.cache-hit }}
+        CACHE_MATCH: ${{ steps.apk_cached.outputs.cache-matched-key }}
+        ARTIFACT_ID: ${{ steps.lookup.outputs.cipher_id }}
+        EXPECTED_CACHE: ${{ steps.lookup.outputs.cipher_cache }}
+        EXPECTED_SHA: ${{ steps.lookup.outputs.cipher_sha }}
+        EXPECTED_BYTES: ${{ steps.lookup.outputs.cipher_bytes }}
+        ORDINAL: ${{ steps.lookup.outputs.ordinal }}
+        ACCEPTED_PARENT: ${{ steps.lookup.outputs.accepted_parent }}
+      run: python3 "$RUNNER_TEMP/recover.py" verify-terminal
+      if: ${{ !cancelled() && steps.lookup.outputs.status == 'inspect-terminal' }}
+
+
+  recover-draft-checkpoint:
+    name: Re-read the exact last private checkpoint without resuming compilation
+    needs: recover-first-attempt
+    if: ${{ !cancelled() && github.run_attempt != '1' && inputs.checkpoint_backend == 'draft' && needs.recover-first-attempt.result == 'success' && needs.recover-first-attempt.outputs.private_ordinal != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    permissions:
+      contents: write
+      actions: read
+    env:
+      R28_SLOT: ${{ needs.recover-first-attempt.outputs.private_ordinal }}
+      R28_PARENT_SHA: ${{ needs.recover-first-attempt.outputs.private_parent }}
+      R28_PARENT_IDENTITY: ${{ needs.recover-first-attempt.outputs.private_identity }}
+      R28_HEAD_SHA: ${{ github.sha }}
+      R28_EXPECTED_RECOVERY_MANIFEST: ${{ needs.recover-first-attempt.outputs.expected_manifest }}
+      R28_EXPECTED_RECOVERY_MANIFEST_SHA: ${{ needs.recover-first-attempt.outputs.expected_manifest_sha }}
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+        sparse-checkout: |
+          preflight28
+        sparse-checkout-cone-mode: false
+    - run: python3 preflight28/transport/prepare.py tools
+    - name: Reacquire the canonical Draft assets with a GET-only client
+      id: recovered
+      timeout-minutes: 80
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R28_CHECK_RUN: ${{ job.check_run_id }}
+      run: |
+        export R28_STEP_START="$(date +%s)"
+        python3 preflight28/control/recover_private.py
+    - name: Record the recovered checkpoint receipt
+      env:
+        PRIVATE_VERIFIED: ${{ steps.recovered.outputs.private_readback_verified }}
+        PARTIAL: ${{ steps.recovered.outputs.recovery_status }}
+        OWNER_OUTCOME_ARTIFACT_ID: ${{ steps.recovered.outputs.owner_outcome_artifact_id }}
+        MANIFEST_ID: ${{ steps.recovered.outputs.checkpoint_manifest_id }}
+        MANIFEST_SHA: ${{ steps.recovered.outputs.checkpoint_manifest_sha }}
+        DIGEST: ${{ steps.recovered.outputs.checkpoint_sha }}
+      run: |
+        if [[ $PRIVATE_VERIFIED == false ]]; then
+          case "$PARTIAL" in
+            manifest_present_visibility_pending)
+              [[ $MANIFEST_ID =~ ^[1-9][0-9]*$ && $MANIFEST_SHA =~ ^[0-9a-f]{64}$ && $DIGEST =~ ^[0-9a-f]{64}$ ]]
+              printf 'Original slot %s manifest %s SHA-256 %s. Authenticated bytes agree. Anonymous visibility confirmation is pending.\n' "$R28_SLOT" "$MANIFEST_ID" "$MANIFEST_SHA"
+              exit 1 ;;
+            owner_outcome_artifact_available)
+              printf 'Owner outcome Artifact %s. The preceding record contains its ZIP digest and expiry.\n' "$OWNER_OUTCOME_ARTIFACT_ID"
+              exit 0 ;;
+            partial_private_parts|all_private_bytes_verified_manifest_absent)
+              printf 'Original slot %s private recovery: %s. Immutable intent and verified part IDs are in the preceding evidence. Compilation remains stopped.\n' "$R28_SLOT" "$PARTIAL"
+              exit 0 ;;
+            *) exit 1 ;;
+          esac
+        fi
+        [[ $PRIVATE_VERIFIED == true ]]
+        [[ $MANIFEST_ID =~ ^[1-9][0-9]*$ && $DIGEST =~ ^[0-9a-f]{64}$ ]]
+        printf 'Prior attempt slot %s checkpoint SHA-256 %s, private manifest ID %s.\n' "$R28_SLOT" "$DIGEST" "$MANIFEST_ID"

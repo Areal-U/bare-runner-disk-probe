@@ -1,0 +1,189 @@
+import hashlib
+import json
+import unittest
+from unittest.mock import patch
+from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
+from registration import BASE_REF, CAMPAIGN, CLAIM, OWNER, RECIPIENT, RELEASE_ID, REPO, REPO_ID, S2_SHA, WORKFLOW, bind
+
+
+class OwnerDraft:
+    BASE = "test"
+    def __init__(self):
+        self.ticket = dict(schema=1,campaign=CAMPAIGN,repository_id=REPO_ID,workflow=WORKFLOW,branch=BASE_REF,
+                           head="a"*40,initial_parent=S2_SHA,release_id=RELEASE_ID,recipient=RECIPIENT,
+                           collector_registration_id="Automation_"+"f"*32, issued_at="2026-11-25T01:00:00Z",
+                           expires_at="2026-11-28T01:00:00Z")
+        self.ack=dict(schema=1, campaign=CAMPAIGN, branch=BASE_REF,head="a"*40,collector_registration_id="Automation_"+"f"*32,
+                      owner_destination_id="libfile_private_owner",registration_nonce="b"*32,recipient=RECIPIENT,
+                      observed_at="2026-11-25T00:58:00Z",valid_until="2026-11-29T00:00:00Z",state="collector-read-back-owner-reservation",
+                      poll_seconds=3600,pickup_retry_seconds=900)
+        storage = dict(storage_policy="github-public-standard-r28-v1",artifact_ceiling_bytes=10*1024**3,
+                       storage_valid_until="2027-01-01T00:00:00Z")
+        self.ack.update(storage)
+        self.ticket.update(storage)
+        self.ticket.update(registration_nonce=self.ack["registration_nonce"],owner_destination_id=self.ack["owner_destination_id"],
+                           collector_ack_asset_id=812,collector_ack_sha=hashlib.sha256(self.data(812)).hexdigest())
+        self.ack_asset = dict(name=CAMPAIGN+"-collector-ack-"+self.ticket["registration_nonce"]+".json",id=812,
+                              created_at="2026-11-25T00:59:00Z")
+        self.asset = dict(name=CAMPAIGN+"-collection-registration.json",id=901,uploader=OWNER,created_at="2026-11-25T01:00:00Z")
+        self.origin = dict(id=81,run_attempt=1,head_sha="a"*40,path=WORKFLOW,event="workflow_dispatch",
+                           head_branch=BASE_REF,actor=OWNER,repository={"id":REPO_ID},head_repository={"id":REPO_ID},
+                           created_at="2026-11-25T01:03:00Z")
+    def data(self,n=901): return json.dumps(self.ticket if n==901 else self.ack).encode()
+    def draft(self, rid):
+        assert rid == RELEASE_ID
+        return {"assets":[dict(self.asset,size=len(self.data()),digest="sha256:"+hashlib.sha256(self.data()).hexdigest()),dict(self.ack_asset,size=len(self.data(812)))]}
+    def asset_info(self, release, name, size, sha, aid):
+        assert len(self.data(aid)) == size and aid in (901,812)
+    def metadata(self, path):
+        if path == "/repos/"+REPO:
+            return dict(id=REPO_ID,full_name=REPO,private=False,fork=False,visibility="public")
+        if "/actions/runs?status=" in path:
+            return dict(total_count=0,workflow_runs=[])
+        if "/actions/artifacts?" in path:
+            return dict(total_count=0,artifacts=[])
+        if "/releases/" in path:
+            return self.draft(RELEASE_ID)["assets"]
+        return self.origin
+    def download(self, aid, size, digest, target): target.write(self.data(aid))
+
+
+class TicketTests(unittest.TestCase):
+    def setUp(self):
+        self.d = OwnerDraft()
+        self.env = dict(RUNNER_ENVIRONMENT="github-hosted",REGISTRATION_ASSET_ID="901",GITHUB_SHA="a"*40,GITHUB_JOB="bind-private-receiver",
+                        GITHUB_RUN_ID="81",GITHUB_RUN_ATTEMPT="1",GITHUB_REPOSITORY=REPO,GITHUB_EVENT_NAME="workflow_dispatch",
+                        GITHUB_REF="refs/heads/"+BASE_REF)
+        self.event = dict(repository={"id":REPO_ID},sender=OWNER,inputs={"mode":"build-apk","build_segments":"12","apk_recipient":RECIPIENT})
+        self.now = datetime(2026,11,26,tzinfo=timezone.utc)
+    def enter(self):
+        self.env["REGISTRATION_SHA"]=hashlib.sha256(self.d.data()).hexdigest()
+        return bind(self.d,self.env,self.event,self.now)
+
+    def test_late_page_registration_ack_and_lost_claim_response(self):
+        class Release(OwnerDraft):
+            UPLOAD = "uploads.github.com"
+
+            def __init__(self):
+                super().__init__()
+                ticket, ack = super().draft(RELEASE_ID)["assets"]
+                self.assets = [dict(id=i, name="old-"+str(i)) for i in range(1,101)] + [ticket, ack]
+                self.assets.extend(dict(id=i, name="old-"+str(i)) for i in range(101,199))
+                self.posts = 0
+                self.pages = []
+
+            def draft(self, ident):
+                self.assert_release(ident)
+                return {"assets": self.assets[:30]}
+
+            def assert_release(self, ident):
+                assert ident == RELEASE_ID
+
+            def metadata(self, path):
+                if "/releases/" not in path:
+                    return super().metadata(path)
+                uri = urlsplit(path)
+                assert uri.path.endswith(f"/releases/{RELEASE_ID}/assets")
+                query = parse_qs(uri.query)
+                assert query["per_page"] == ["100"]
+                page = int(query["page"][0])
+                self.pages.append(page)
+                return self.assets[(page-1)*100:page*100]
+
+            def request(self, host, method, path, **args):
+                assert host == self.UPLOAD and method == "POST" and args["auth"]
+                assert parse_qs(urlsplit(path).query)["name"] == [CLAIM]
+                self.posts += 1
+                self.claim = args["body"]
+                self.assets.append(dict(id=940, name=CLAIM, size=len(self.claim),
+                                        digest="sha256:"+hashlib.sha256(self.claim).hexdigest()))
+                raise ConnectionResetError("response lost after creation")
+
+            def asset_info(self, release, name, size, digest, aid=None):
+                matches = [a for a in release["assets"] if a["name"] == name]
+                assert len(matches) == 1
+                record = matches[0]
+                assert record["size"] == size and (aid is None or record["id"] == aid)
+                return record
+
+            def download(self, aid, size, digest, target):
+                data = self.claim if aid == 940 else self.data(aid)
+                assert len(data) == size and hashlib.sha256(data).hexdigest() == digest
+                target.write(data)
+
+        self.d=Release()
+        self.env.update(REGISTRATION_ASSET_ID="",REGISTRATION_SHA="")
+        self.assertEqual(bind(self.d,self.env,self.event,self.now)[0],940)
+        self.env["GITHUB_JOB"]="collection-lease"
+        self.assertEqual(bind(self.d,self.env,self.event,self.now,verify_only=True)[0],940)
+        self.assertEqual(self.d.posts,1)
+        self.assertGreaterEqual(self.d.pages.count(3),3)
+    @patch("registration.admit")
+    def test_nominal_ticket_cannot_reserve_a_legacy_or_alternate_build(self, claim):
+        fixed = dict(checkpoint_key="bare-coexist-204-45285202990-1-checkpoint-production-s2",
+                     checkpoint_sha=S2_SHA, checkpoint_identity="a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc")
+        for override in ({"checkpoint_backend":"cache"}, dict(fixed,build_segments="1"), dict(fixed,build_segments="2"),
+                         dict(fixed,checkpoint_key="foreign"), {"checkpoint_sha":S2_SHA}, {"compile_minutes":"25"},
+                         {"loss_origin_run":"42"}, {"retain_existing_caches":"true"}, {"jobs":"1"}, {"output_gib":"19"},
+                         {"encrypted_apk_bytes":"859"}, {"apk_recipient":"other"}):
+            with self.subTest(override=override), patch.dict(self.event["inputs"],override), \
+                 patch.object(self.d,"metadata",side_effect=AssertionError("Unexpected provider I/O")), \
+                 self.assertRaises(ValueError):
+                self.enter()
+        claim.assert_not_called()
+        with patch.dict(self.event["inputs"],dict(fixed,compile_minutes="180")):
+            self.enter()
+        claim.assert_called_once()
+
+    @patch("registration.admit")
+    def test_unconfirmed_storage_never_writes_origin_claim(self, claim):
+        del self.d.ticket["artifact_ceiling_bytes"]
+        with self.assertRaisesRegex(ValueError, "storage policy"):
+            self.enter()
+        claim.assert_not_called()
+
+    @patch("registration.admit",return_value=123)
+    def test_prior_registration_and_binding(self, claim):
+        self.assertEqual(self.enter()[0],123)
+        holder=claim.call_args.args[1]
+        self.assertEqual((holder["run_id"],holder["producer_attempt"],holder["ticket_asset_id"]),(81,1,901))
+        self.assertEqual(claim.call_args.kwargs["name"],CLAIM)
+    @patch("registration.admit",return_value=92)
+    def test_dispatch_with_defaults_discovers_exact_owner_ticket(self, claim):
+        self.env.update(REGISTRATION_ASSET_ID="",REGISTRATION_SHA="")
+        self.event["inputs"]={}
+        self.assertEqual(bind(self.d,self.env,self.event,self.now)[0],92)
+        self.assertEqual(claim.call_args.args[1]["ticket_asset_id"],901)
+        asset=self.d.draft(RELEASE_ID)["assets"][0]
+        with patch.object(self.d,"draft",return_value={"assets":[asset,asset]}), self.assertRaises(ValueError):
+            bind(self.d,self.env,self.event,self.now)
+    @patch("registration.admit",return_value=123)
+    def test_once_ack_reused_only_while_lease_covers_remaining_local_segment(self, claim):
+        self.env.update(REGISTRATION_ASSET_ID="",REGISTRATION_SHA="",GITHUB_JOB="collection-lease")
+        bind(self.d,self.env,self.event,self.now,verify_only=True)
+        self.assertEqual(claim.call_args.args[0],"recover")
+        self.d.ack["valid_until"]="2026-11-26T04:00:00Z"
+        self.d.ticket["collector_ack_sha"]=hashlib.sha256(self.d.data(812)).hexdigest()
+        with self.assertRaisesRegex(ValueError,"lease"):
+            bind(self.d,self.env,self.event,self.now,verify_only=True)
+        self.d.ack["valid_until"]="2026-11-28T04:00:00Z"
+        with self.assertRaisesRegex(ValueError,"ACK bytes"):
+            bind(self.d,self.env,self.event,self.now,verify_only=True)
+
+    def test_lease_includes_receiver_private_deposit_and_receipt(self):
+        from registration import checked_ack, instant
+        created = instant(self.d.origin["created_at"])
+        expiry = instant(self.d.ticket["expires_at"])
+        latest, _ = checked_ack(self.d,self.d.draft(RELEASE_ID),self.d.ticket,created,created)
+        self.assertEqual(int(expiry.timestamp())-latest,(350+25+45+7)*60+2*3600+900)
+
+    @patch("registration.admit")
+    def test_ticket_not_prepared_earlier_or_wrong_actor_or_expired(self, claim):
+        for target, key, bad in [(self.d.asset,"created_at","2026-11-25T01:04:00Z"),
+                                (self.d.ticket,"expires_at","2026-11-25T01:04:00Z"),
+                                (self.d.ticket,"head","f"*40),(self.d.ticket,"collector_registration_id",""),
+                                (self.d.asset,"uploader",{}),(self.env,"GITHUB_RUN_ATTEMPT","2"),(self.env,"REGISTRATION_ASSET_ID","")]:
+            with self.subTest(key=key), patch.dict(target,{key:bad}), self.assertRaises(ValueError):
+                self.enter()
+        claim.assert_not_called()
