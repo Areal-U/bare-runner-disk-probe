@@ -1,4 +1,6 @@
 """Normal segment production/recovery entry points against native pinned Siso."""
+from contextlib import redirect_stdout
+import io
 import hashlib
 import json
 import os
@@ -72,6 +74,71 @@ class NormalSegmentTest(unittest.TestCase):
 
     def receive(self, name):
         return begin(self.out, self.report.parent/name, self.child, self.command, verify_only=True)
+
+    def test_locate_unproved_retirement_without_accepting_it(self):
+        metrics = self.report.parent / "siso-metrics-restore.json"
+        self.report.write_text(json.dumps({"target":"chrome_public_apk", "phase":"restore", "reason":"time-limit",
+            "container_quiescence_verified":True, "ready_for_restore_test":True, "failed_step_count":0,
+            "forced_kill":False, "metrics_path":str(metrics)}))
+        begin(self.out, self.baseline, self.parent, self.command, bootstrap=True)
+        base = json.loads(self.baseline.read_bytes())
+        def execute(path, *targets):
+            subprocess.run([*self.command, '-C',str(self.out), '-metrics_json', str(path), *targets],
+                           check=True, capture_output=True)
+        def rejected():
+            log = io.StringIO()
+            with redirect_stdout(log), self.assertRaisesRegex(ValueError, "without success evidence"):
+                finish(self.out, self.baseline, self.report, self.command, private_intermediates=True)
+            raw = next(s for s in log.getvalue().splitlines() if s.startswith('BARE_FRONTIER_REJECTION '))
+            self.assertLess(len(raw), 4096)
+            for name in ('obj/b.o', 'implicit.dat', 'obj/c.o'):
+                self.assertNotIn(name, raw)
+            diagnostic = json.loads(raw.split(' ',1)[1])
+            self.assertEqual((diagnostic['parent_sha256'], diagnostic['graph']), (self.parent, base['graph']))
+            self.assertEqual((diagnostic['removed'], diagnostic['unsupported_count']), (2, 1))
+            self.assertFalse((self.out / PROOF).exists())
+            return diagnostic['first_group']
+
+        original_tree = self.report.parent / 'original-tree'
+        shutil.copytree(self.out, original_tree, symlinks=True)
+        # One edge belongs to a different real invocation. Only the second invocation is authorized.
+        donor = metrics.with_name('other-invocation.json')
+        execute(donor, 'obj/b.o')
+        execute(metrics, 'obj/c.o')
+        foreign = rejected()
+        self.assertEqual((foreign['new'], foreign['members'], foreign['current_metric_rows']['exact_success']), (2,2,0))
+
+        # Repeat from the same cold graph. Here BOTH edges really execute in the current invocation.
+        shutil.rmtree(self.out)
+        shutil.copytree(original_tree, self.out, symlinks=True)
+        metrics.unlink()
+        execute(metrics, 'obj/b.o', 'obj/c.o')
+        original_metrics = metrics.read_bytes()
+        rows = [json.loads(line) for line in original_metrics.splitlines()]
+        metrics.write_text(''.join(json.dumps(row)+'\n' for row in rows if 'obj/b.o' not in row.get('outputs',[])))
+        lost = rejected()
+        self.assertEqual((lost['group_id'], lost['current_metric_rows']), (foreign['group_id'], foreign['current_metric_rows']))
+        self.assertEqual(lost['ninja_members'],2)
+
+        # Even a wholly missing current success table must yield a bounded diagnostic,
+        # before the separate check that requires at least one persistable witness.
+        metrics.write_text('')
+        no_rows = io.StringIO()
+        with redirect_stdout(no_rows), self.assertRaisesRegex(ValueError, 'without success evidence'):
+            finish(self.out, self.baseline, self.report, self.command, private_intermediates=True)
+        raw = next(s for s in no_rows.getvalue().splitlines() if s.startswith('BARE_FRONTIER_REJECTION '))
+        self.assertEqual(json.loads(raw.split(' ', 1)[1])['unsupported_count'], 2)
+
+        # A distinct failure discards one implicit-output Ninja row while the real full metrics survive.
+        metrics.write_bytes(original_metrics)
+        ninja = self.out/'.ninja_log'
+        original_ninja = ninja.read_bytes()
+        ninja.write_bytes(b''.join(row for row in original_ninja.splitlines(keepends=True) if b'\timplicit.dat\t' not in row))
+        missing_log = rejected()
+        self.assertEqual((missing_log['current_metric_rows']['exact_success'],missing_log['ninja_members']), (1,1))
+        ninja.write_bytes(original_ninja)
+        clean = finish(self.out, self.baseline, self.report, self.command, private_intermediates=True)
+        self.assertEqual((clean['frontier_status'],clean['advanced_edges']), ('candidate',2))
 
     def test_two_steps_and_independent_recovery(self):
         self.advance()
