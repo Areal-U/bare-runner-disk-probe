@@ -80,6 +80,21 @@ class SourcePlan(unittest.TestCase):
             if action=='truncated':meta['actions/runs/40/artifacts?per_page=100']['total_count']=2
             with self.subTest(action=action),self.assertRaises(ValueError):self.issue(args,meta,logs)
 
+    def test_fixed_os_failure_and_host_compatibility_never_issue_a_seed(self):
+        for mismatch in ('failed-run', 'host-mode', 'host-job', 'host-markers'):
+            args,meta,logs=fixture()
+            attempt=meta['actions/runs/41/attempts/1']
+            if mismatch=='failed-run':
+                attempt['conclusion']='failure'
+            if mismatch=='host-mode':
+                attempt['display_title']='Bare next-build trial source-android-host '+args[4]
+            if mismatch=='host-job':
+                meta['actions/runs/41/attempts/1/jobs?per_page=100']['jobs'][0]['name']='android-host-source / linux24-android-checkout'
+            if mismatch=='host-markers':
+                logs[410]=logs[410].replace('BARE_ANDROID_', 'BARE_ANDROID_HOST_')
+            with self.subTest(mismatch=mismatch), self.assertRaises(ValueError):
+                self.issue(args,meta,logs)
+
     def test_use_guards_and_download(self):
         args,meta,logs=fixture();plan=self.issue(args,meta,logs)
         with tempfile.TemporaryDirectory() as td:
