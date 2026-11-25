@@ -8,7 +8,7 @@ on:
         description: Optional bounded next-build comparison on the dedicated test branch
         type: choice
         default: disk
-        options: [disk, source-v8, source-chromium, split, receiver]
+        options: [disk, source-v8, source-chromium, source-android, split, receiver]
       expected_sha:
         description: Reviewed test branch SHA from next_build/trials.py
         type: string
@@ -160,3 +160,11 @@ jobs:
     with:
       storage_ceiling: ${{ needs.trial-admission.outputs.ceiling }}
       storage_until: ${{ needs.trial-admission.outputs.until }}
+
+  android-source-import:
+    needs: trial-admission
+    if: ${{ inputs.trial == 'source-android' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/next-android-source-import.yml
