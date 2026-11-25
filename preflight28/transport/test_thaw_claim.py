@@ -147,7 +147,8 @@ def report():
     def metric(name,i):
         return {"name":name,"version":"1.6.5","producer_revision":"b521b230cb7c56c821235e498285cf8e548a73ee",
                 "schema":"siso.StepMetric.jsonl","graph_references":0,"diagnostic_query":"unknown target",
-                "mode":0o644,"size":123,"sha256":ident(i).rsplit(":",1)[-1],"step_rows":1,"summary_rows":0,"error_steps":0}
+                "mode":0o644,"size":123,"sha256":ident(i).rsplit(":",1)[-1],"step_rows":1,"summary_rows":0,"error_steps":0,
+                "build_id":None,"last_summary_nanos":None,"build_error":None}
     def regen(name):
         return {"path":"build.ninja.d","target":"build.ninja.stamp","role":"regeneration-input","references":1,
              "generator":"gn","token":name,"gn_revision":"0035961837fbcfe875d855744b3eda4fd2eefb43","sha256":"c"*64}
@@ -267,6 +268,25 @@ class Tests(unittest.TestCase):
         self.assertEqual(new["supersedes_claim_sha256"],stop.claim_sha)
         self.assertEqual(new["supersedes_outcome"],stop.outcome)
         self.assertEqual(new["supersedes_artifacts"][1]["id"],14980236546)
+
+    def test_pinned_parser_aggregate_including_manifest_phases_and_interrupted_file(self):
+        import sys,io
+        from pathlib import Path
+        graphs=Path(__file__).resolve().parents[1]/"graph"
+        sys.path.insert(0,str(graphs))
+        try:
+            import metrics_evidence
+        finally:
+            sys.path.pop(0)
+        data=[b"",b'{"step_id":"00600000-0000-4000-8000-000000000041","action":"compile","duration_nanos":21}\n',
+              b"".join((json.dumps({"build_id":"00600000-0000-4000-8000-000000000042","duration_nanos":i},
+                          separators=(",",":"))+"\n").encode() for i in (1,19,37))]
+        for raw in data:
+            e=metrics_evidence.inspect_metrics("siso_metrics.json",0o644,len(raw),io.BytesIO(raw))
+            e.update(graph_references=0,diagnostic_query="unknown target")
+            t.qualified_metric("siso_metrics.json","f:0:"+str(len(raw))+":"+hashlib.sha256(raw).hexdigest(),e)
+        bad=dict(e,summary_rows=4)
+        with self.assertRaises(ValueError):t.qualified_metric("siso_metrics.json","f:0:"+str(len(raw))+":"+e["sha256"],bad)
 
     def test_bad_audit_cannot_authorize(self):
         h=Service();apply(h)

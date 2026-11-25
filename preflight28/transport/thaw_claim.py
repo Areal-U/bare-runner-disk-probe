@@ -377,27 +377,43 @@ def added_outputs(report, depfiles):
                     depfiles=={dep["sha256"]},"GN descriptors do not share the original frozen regeneration input")
 
 
+def qualified_metric(name, identity, evidence):
+    mode,size,digest=evidence["mode"],evidence["size"],evidence["sha256"]
+    require(evidence["name"]==name and evidence["producer_revision"]=="b521b230cb7c56c821235e498285cf8e548a73ee" and
+            evidence["version"]=="1.6.5" and evidence["schema"]=="siso.StepMetric.jsonl" and
+            evidence["graph_references"]==0 and evidence["diagnostic_query"]=="unknown target" and
+            type(mode) is int and 0<=mode<=0o777 and not mode & 0o111 and
+            type(size) is int and 0<=size<=128*1024**2 and re.fullmatch("[a-f0-9]{64}",digest) and
+            identity==f"f:0:{size}:{digest}", "Frozen Siso file lacks byte-bound typed diagnostic evidence")
+    n,summaries,errors=evidence["step_rows"],evidence["summary_rows"],evidence["error_steps"]
+    require(type(n) is int and type(summaries) is int and type(errors) is int and n>=0 and
+            0<=summaries<=3 and 0<=errors<=n, "Invalid metric step or summary counts")
+    phase=evidence["last_summary_nanos"]
+    build_id=evidence["build_id"]
+    if summaries:
+        # The pinned parser validates one build ID and increasing elapsed time on
+        # every row. A GN generator invocation can emit three phase summaries.
+        require(isinstance(build_id,str) and re.fullmatch("[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}",build_id)
+                and type(phase) is int and phase>=0 and type(evidence["build_error"]) is bool,
+                "Unbound cumulative build summaries")
+    else:
+        require(build_id is None and phase is None and evidence["build_error"] is None,
+                "Unfinished step stream claims a build result")
+    empty=(n+summaries==0)
+    require(empty==(size==0) and (not empty or digest==hashlib.sha256(b"").hexdigest()),
+            "Empty or truncated Siso metrics do not match their typed bytes")
+
+
 def qualified_metrics(report):
     rows={v["path"]:v for v in report["metrics"]}
     require(len(report["metrics"])==len(rows)==11 and set(rows)==set(METRIC_PATHS) and
             report["metric_rotation"]=={"steps":3,"matched":8,"bounded_files":11},
             "Missing complete frozen Siso metric history")
-    for path in METRIC_PATHS:
-        rec=rows[path]
+    for name in METRIC_PATHS:
+        rec=rows[name]
         require(rec["parent"]!=rec["child"], "Identical metrics incorrectly classified as changed")
         for side in ("parent","child"):
-            evidence=rec["evidence"][side]
-            mode,size,digest=evidence["mode"],evidence["size"],evidence["sha256"]
-            require(evidence["name"]==path and evidence["producer_revision"]=="b521b230cb7c56c821235e498285cf8e548a73ee" and
-                    evidence["version"]=="1.6.5" and evidence["schema"]=="siso.StepMetric.jsonl" and
-                    evidence["graph_references"]==0 and evidence["diagnostic_query"]=="unknown target" and
-                    type(mode) is int and 0<=mode<=0o777 and not mode & 0o111 and
-                    type(size) is int and 0<size<=128*1024**2 and re.fullmatch("[a-f0-9]{64}",digest) and
-                    rec[side]==f"f:0:{size}:{digest}", "Frozen Siso file lacks byte-bound typed diagnostic evidence")
-            n,summaries,errors=evidence["step_rows"],evidence["summary_rows"],evidence["error_steps"]
-            require(type(n) is int and type(summaries) is int and type(errors) is int and n>=0 and
-                    summaries in (0,1) and 0<=errors<=n and n+summaries>0,
-                    "Metric has no valid parsed data or build summary")
+            qualified_metric(name,rec[side],rec["evidence"][side])
     for old_path,new_path in zip(METRIC_PATHS,METRIC_PATHS[3:]):
         require(rows[old_path]["parent"]==rows[new_path]["child"], "Siso history bytes do not survive ordered rotation")
 
