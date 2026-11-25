@@ -1,18 +1,17 @@
 """No compiler is invoked. Ninja parses the archived graph using its query tool."""
 import hashlib
 import json
-import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
 import retained
-from test_retained import ArchiveTest
+import test_retained
 
 
 class DiagnosticTest(unittest.TestCase):
-    write = ArchiveTest.write
+    write = test_retained.ArchiveTest.write
     log = (retained.GN_HEADER + "\n\n### siso.gni ###\nuse_siso=true\n"
            "#### get_concurrent_links.py ####\n").encode()
 
@@ -56,6 +55,10 @@ class DiagnosticTest(unittest.TestCase):
         self.assertEqual(diag["evidence"]["parent"]["manifest_content"]["files"], 2)
         self.assertEqual(r["counts"]["unchanged"], 3)
         self.assertEqual(r["counts"]["added"], 1)
+
+    def test_ninja_spelling_suggestion_for_an_unknown_query(self):
+        r = self.audit({"rules.ninja":b"build chrome_public_apk: phony gn_log.txt\n"}, {})
+        self.assertEqual(r["status"], "passed", r["issues"])
 
     def test_every_unknown_change_and_missing_input_reported(self):
         r = self.audit({"obj/gn_logs.txt":b"other","required.o":b"required","renamed-log.txt":b"a"},

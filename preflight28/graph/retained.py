@@ -196,7 +196,9 @@ class ArchiveEvidence:
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ValueError("failed to parse complete Ninja graph with the read-only query tool") from exc
         if (apk.returncode != 0 or not re.search(rb"(?m)^chrome_public_apk:$", apk.stdout)
-                or log.returncode != 1 or log.stderr.strip() != b"ninja: error: unknown target 'gn_logs.txt'"):
+                or log.returncode != 1 or not re.fullmatch(
+                    rb"ninja: error: unknown target 'gn_logs\.txt'(?:, did you mean '[^\r\n]+'\?)?",
+                    log.stderr.strip())):
             raise ValueError("Ninja graph did not confirm the APK target and unknown GN diagnostic")
         sections = {}
         section = "<header>"
