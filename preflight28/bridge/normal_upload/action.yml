@@ -1,0 +1,31 @@
+name: Upload the current numbered checkpoint outcome
+description: Run the pinned official artifact client and report its observed transfer result
+inputs:
+  name:
+    required: true
+    description: Canonical name of this attempt-one outcome
+  path:
+    required: true
+    description: Outcome record and, for a checkpoint, its existing sealed bytes
+  if-no-files-found:
+    default: error
+    description: Fail when the required files are absent
+  overwrite:
+    default: 'false'
+    description: Preserve any existing same-name outcome
+  retention-days:
+    default: '1'
+    description: Retain the temporary relay for one day
+  compression-level:
+    default: '0'
+    description: Store already encrypted bytes without compression
+outputs:
+  upload-status:
+    description: uploaded, quota-denied, or transfer-unknown
+  artifact-id:
+    description: Immutable ID returned by the official uploader on success
+  artifact-digest:
+    description: Official outer archive SHA-256 on success
+runs:
+  using: node24
+  main: index.cjs
