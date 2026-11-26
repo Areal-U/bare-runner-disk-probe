@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import signal
 import sys
 import time
 from datetime import datetime
@@ -135,14 +136,67 @@ def receipt_rows(get):
     return first
 
 
+ACTIVE_STATES = ("in_progress", "queued", "waiting", "pending", "requested")
+
+
+def active_listing(get, run):
+    """Return the sole observed state of this run and any evidence of an incomplete listing."""
+    present = []
+    issues = []
+    for state in ACTIVE_STATES:
+        data = get(f"{BASE}/actions/runs?status={state}&per_page=2")
+        count = data.get("total_count") if isinstance(data, dict) else None
+        rows = data.get("workflow_runs") if isinstance(data, dict) else None
+        count_label = str(count) if type(count) is int else "invalid"
+        length = len(rows) if isinstance(rows, list) else "invalid"
+        summary = f"state={state} count={count_label} rows={length}"
+        if not isinstance(rows, list):
+            issues.append(summary)
+            continue
+        ids = [row.get("id") if isinstance(row, dict) else None for row in rows]
+        for rid in ids:
+            if type(rid) is int and rid > 0 and rid != run:
+                raise StorageUnconfirmed(f"Another run {rid} in {summary} (current {run})")
+        if type(count) is not int or count != len(rows):
+            issues.append(summary + " (total and returned rows disagree)")
+        elif any(type(rid) is not int or rid != run for rid in ids):
+            issues.append(summary + " (invalid run ID)")
+        elif len(rows) > 1:
+            issues.append(summary + f" (duplicate current run {run})")
+        elif any(row.get("status", state) != state for row in rows):
+            issues.append(summary + f" (current run {run} row status disagrees with filter)")
+        elif ids:
+            present.append(state)
+    if len(present) > 1:
+        issues.append(f"current run {run} appears in multiple states {present}")
+    return tuple(present), issues
+
+
 def check_active_runs(get, env):
-    run = int(env["GITHUB_RUN_ID"])
-    for status in ("in_progress","queued","waiting","pending","requested"):
-        active = get(f"{BASE}/actions/runs?status={status}&per_page=2")
-        runs = active["workflow_runs"]
-        require(type(active["total_count"]) is int and type(runs) is list and
-                active["total_count"] == len(runs) and len(runs) <= 1 and
-                all(row["id"] == run for row in runs), "Another or unknown run may be writing repository storage")
+    run = integer(int(env["GITHUB_RUN_ID"]), "current run ID")
+    _, issues = active_listing(get, run)
+    if not issues:
+        return
+    print("Active-run inventory needs recheck: " + "; ".join(issues), flush=True)
+
+    # Only an inconsistent inventory gets two independent re-reads. Require the
+    # two complete views to agree. A foreign ID or a failed read never permits a write.
+    def expired(*_):
+        raise StorageUnconfirmed("Active-run inventory recheck exceeded 30 seconds")
+    require(not signal.getitimer(signal.ITIMER_REAL)[0], "Another deadline is active during run recheck")
+    previous = signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 30)
+        snapshots = []
+        for _ in range(2):
+            time.sleep(2)
+            present, issues = active_listing(get, run)
+            require(not issues, "Active-run inventory recheck incomplete: " + "; ".join(issues))
+            snapshots.append(present)
+        require(snapshots[0] == snapshots[1], f"Active-run inventory rechecks differ: {snapshots}")
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def admit(get, env, size, days, *, stage, now=None, lead=0, exact_name=None):
