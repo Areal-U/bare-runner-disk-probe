@@ -24,6 +24,7 @@ FIRST_JOBS = {139718818153: "success", 139718863397: "failure", 139718917585: "f
 WORKFLOW = ".github/workflows/bare-checkpoint-transfer.yml"
 OWNER = {"id": 292261483, "login": "Areal-U"}
 RECIPIENT = "age1t69raxytlqula36e8w0tm6p3ezt49ztwnrtz8k57h6mvpwfguy7sjmr4yx"
+SEGMENT_MINUTES = 350
 
 
 def instant(value):
@@ -123,7 +124,7 @@ def checked_ack(helper, release, ticket, created, now):
     period, retry = ack.get("poll_seconds"), ack.get("pickup_retry_seconds")
     require(type(period) is int and period>0 and type(retry) is int and retry>0,
             "Pickup cadence and retry window must be measured and declared by the collector")
-    latest = min(instant(ack["valid_until"]),instant(ticket["expires_at"])) - timedelta(seconds=(350+25+45+7)*60+2*period+retry)
+    latest = min(instant(ack["valid_until"]),instant(ticket["expires_at"])) - timedelta(seconds=(SEGMENT_MINUTES+25+45+7)*60+2*period+retry)
     require(instant(ack["observed_at"]) <= created <= now <= latest,
             "Collector lease does not cover this segment and pickup")
     return int(latest.timestamp()), dict(ack, collector_ack_asset_id=aid)
@@ -149,7 +150,11 @@ def checked_build_route(inputs, *, resume=False):
     require(parent in (("", "", ""), pinned), "Only the complete fixed parent may be supplied")
 
 
-def bind(helper, env, event, now, *, verify_only=False):
+def bind(helper, env, event, now=None, *, verify_only=False):
+    # Explicit reference times remain available to replay historical evidence.
+    live_clock = now is None
+    if live_clock:
+        now = datetime.now(timezone.utc)
     aid, digest = env["REGISTRATION_ASSET_ID"], env["REGISTRATION_SHA"]
     require((not aid and not digest) or
             (re.fullmatch(r"[1-9][0-9]{0,18}", aid) and re.fullmatch("[0-9a-f]{64}", digest)),
@@ -212,7 +217,7 @@ def bind(helper, env, event, now, *, verify_only=False):
     # Before the immutable production claim and again on each collection lease.
     storage_admission.draft_room(release, settings, claim=not verify_only)
     storage_admission.admit(helper.metadata, settings, storage_admission.lease_size(settings), 1,
-                            stage="lease", now=now.timestamp(), lead=350*60)
+                            stage="lease", now=None if live_clock else now.timestamp(), lead=SEGMENT_MINUTES*60)
     holder = dict(expected, registration_id=service, ticket_asset_id=int(aid), ticket_sha=digest,
                   run_id=run, producer_attempt=1, source_run_id=gate.SOURCE_RUN,
                   source_claim_id=gate.SOURCE_CLAIM_ID, source_claim_sha=gate.SOURCE_CLAIM_SHA)
@@ -223,8 +228,21 @@ def bind(helper, env, event, now, *, verify_only=False):
         gate.check_reference(holder, ticket)
     else:
         slot1_handoff.check_reference(holder)
-    # Independent of ticket ID: two concurrent dispatches cannot bind this campaign twice.
-    return admit("recover" if verify_only else "compute", holder, helper, name=gate.CLAIM), service, latest, ceiling, until
+    storage_latest = (until - SEGMENT_MINUTES*60 - storage_admission.JOURNAL_TAIL
+                      - storage_admission.JOURNAL_DAYS*storage_admission.DAY)
+
+    def check_window():
+        decision = datetime.now(timezone.utc) if live_clock else now
+        require(now <= decision and decision.timestamp() <= latest,
+                "Collector lease no longer covers this segment and pickup after admission reads")
+        require(decision.timestamp() <= storage_latest, "Storage policy expired during registration")
+
+    # Check again at the real claim POST after the final private inventory, and
+    # before handing the verified lease to the next job after claim readback.
+    check_window()
+    claim = admit("recover" if verify_only else "compute", holder, helper, name=gate.CLAIM, before_write=check_window)
+    check_window()
+    return claim, service, latest, ceiling, until
 
 
 def main():
@@ -236,7 +254,7 @@ def main():
     if verify_only:
         from recover_private import read_only
         transfer.request = read_only(transfer.request)
-    claim, service, latest, ceiling, until = bind(transfer, os.environ, event, datetime.now(timezone.utc), verify_only=verify_only)
+    claim, service, latest, ceiling, until = bind(transfer, os.environ, event, verify_only=verify_only)
     with open(os.environ["GITHUB_OUTPUT"], "a") as out:
         print(f"claim_asset_id={claim}\ncollector_registration_id={service}\nlatest_start={latest}\nstorage_ceiling={ceiling}\nstorage_until={until}", file=out)
     print(f"Bound prior collection ticket to original run {os.environ['GITHUB_RUN_ID']} attempt 1; claim {claim}")

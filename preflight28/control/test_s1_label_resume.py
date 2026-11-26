@@ -54,7 +54,9 @@ class LabelAdmission(LabelTest):
                          source_sha256=gate.PARENT_SHA, raw_sha256="7"*64, optimized_sha256="8"*64,
                          trial_workflow_blob="b"*40, trial_worker_blob="a"*40,
                          helpers={Path(p).name:hashlib.sha256((self.root/p).read_bytes()).hexdigest() for p in gate.HELPERS})
-        labels = dict(application=["Bare Personal"], enabled=["Main"], launchers={"Main":["Bare Personal"]})
+        main = "com.google.android.apps.chrome.Main"
+        names = (main, main + "NewIcon", main + "IconRetro", main + "IconDark")
+        labels = dict(application=["Bare Personal"], enabled=[main], launchers={name:["Bare Personal"] for name in names})
         self.report = dict(mode="trial", parent_sha256=gate.PARENT_SHA, old_pending=1911, remaining=1911,
                            resource_sha256="7"*64, optimized_sha256="8"*64, raw_labels=labels, optimized_labels=labels)
 
@@ -73,6 +75,8 @@ class LabelAdmission(LabelTest):
         for mapping,key,wrong in [(self.cert,"raw_sha256","6"*64),(self.cert,"trial_worker_blob","f"*40),
                                  (self.cert,"status","awaiting-independent-resource-trial"),
                                  (self.report,"remaining",1920),(self.report["optimized_labels"],"application",["Bare"]),
+                                 (self.report["raw_labels"],"launchers",{"com.google.android.apps.chrome.Main":["Bare Personal"]}),
+                                 (self.normal_tree,"preflight28/bridge/storage_admission.py","c"*40),
                                  (self.normal_tree,gate.COMMON[0],"c"*40),(self.jobs[8],"conclusion","failure")]:
             with self.subTest(key=key):
                 old=mapping[key]; mapping[key]=wrong

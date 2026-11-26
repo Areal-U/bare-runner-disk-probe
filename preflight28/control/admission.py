@@ -64,7 +64,7 @@ def claim_info(helper, payload, name, *, before_write=False):
     return asset["id"]
 
 
-def admit(mode, holder, helper, pause=time.sleep, *, name):
+def admit(mode, holder, helper, pause=time.sleep, *, name, before_write=None):
     require(re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,125}\.json", name), "Invalid claim name")
     payload = encode(holder)
     found = claim_info(helper, payload, name, before_write=(mode == "compute"))
@@ -75,6 +75,8 @@ def admit(mode, holder, helper, pause=time.sleep, *, name):
     # alternate filename is allowed for a run claim, even on a lost response.
     path = f"{helper.BASE}/releases/{RELEASE_ID}/assets?name={name}"
     status = None
+    if before_write is not None:
+        before_write()
     try:
         connection, response = helper.request(helper.UPLOAD, "POST", path, auth=True, body=payload,
                                               length=len(payload), content_type="application/json")

@@ -38,6 +38,9 @@ HELPERS = ("preflight28/graph/graph.py", "preflight28/graph/personal_label.py",
 COMMON = (*HELPERS, "coexist_inputs.py", "checkpoint.py", "build_trial.py",
           "preflight28/graph/angle_restore.py", "preflight28/graph/segment_graph.py",
           "preflight28/graph/retained.py", "preflight28/graph/contract_gate.py",
+          "preflight28/graph/android_outputs.py", "preflight28/graph/metrics_evidence.py",
+          "preflight28/bridge/storage_admission.py", "preflight28/bridge/bridge.py",
+          "preflight28/bridge/artifact_poll.py", "preflight28/bridge/normal.py",
           "preflight28/transport/prepare.py", "preflight28/transport/recipes/install_six.sh")
 WORKER = ".github/workflows/bare-arm64-probe.yml"
 ROOT = Path(__file__).resolve().parents[2]
@@ -177,10 +180,12 @@ def verify_trial(helper, ticket):
     require(len(set(hashes.values())) == 2 and all(re.fullmatch("[0-9a-f]{64}", v) and v not in previous
             for v in hashes.values()), "Resources were not both regenerated")
     s1.fields(cert, hashes, "The normal certificate differs from the actual trial data")
+    main = "com.google.android.apps.chrome.Main"
+    launchers = {main + suffix for suffix in ("", "NewIcon", "IconDark", "IconRetro")}
     for key in ("raw_labels", "optimized_labels"):
         labels = report[key]
-        require(labels["application"] == ["Bare Personal"] and labels["enabled"] and
-                set(labels["enabled"]) <= labels["launchers"].keys() and
+        require(labels["application"] == ["Bare Personal"] and labels["enabled"] == [main] and
+                labels["launchers"].keys() == launchers and
                 all(v == ["Bare Personal"] for v in labels["launchers"].values()), "Wrong trial launcher label")
 
 
