@@ -94,8 +94,11 @@ def relink(out, command, target, permitted, old):
     print("BARE_LABEL_RELINK " + json.dumps({"target": target, "planned": len(ids)}), flush=True)
     executed = run(out, command, [target], dry=False, isolated_logs=True,
                    timeout_seconds=1080 if target == OPTIMIZED else 600)
-    if not executed or not set(executed) <= set(expected) or not any(target in group for group in executed):
-        raise ValueError(f"{target} execution escaped its plan or did not relink")
+    actual = {canonical(group) for group in executed}
+    # Siso -n cannot foresee a restat producer changing one of several outputs.
+    # A downstream action may run only after that producer has actually finished.
+    if not actual or not actual <= permitted or actual & old or not any(target in group for group in executed):
+        raise ValueError(f"{target} execution escaped its fixed GN dependency scope or did not relink")
     if run(out, command, [target], dry=True):
         raise ValueError(f"{target} remained dirty after execution")
     return executed

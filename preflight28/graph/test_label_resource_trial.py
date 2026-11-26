@@ -34,3 +34,13 @@ class RelinkGateTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "original APK work"):
                 relink(None, ["autoninja"], OPTIMIZED, {canonical(native)}, {canonical(native)})
             self.assertEqual(invoke.call_count, 1)
+
+    def test_restat_may_activate_a_dormant_downstream_action(self):
+        from unittest.mock import patch
+        from label_resource_trial import canonical, relink
+
+        producer, target = ("ids", "values"), ("final",)
+        observed = [{producer: "restat"}, {producer: "restat", target: "link"}, {}]
+        with patch("label_resource_trial.run", side_effect=observed):
+            self.assertEqual(set(relink(None, ["ninja"], "final", {canonical(producer), canonical(target)}, set())),
+                             {producer, target})
