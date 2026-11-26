@@ -78,6 +78,29 @@ class TestTransport(unittest.TestCase):
         sha = publish(h.TICKET_NAME,500,json.dumps(ticket).encode(),owner=True)
         publish(h.CLAIM,aid,json.dumps(dict(claim,ticket_asset_id=500,ticket_sha=sha,**refs)).encode())
 
+    def test_resumed_claim_matches_the_physical_run_across_old_and_new_grants(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "control"))
+        import s1_resume
+        import s1_label_resume
+        api = LocalDraft()
+        release = api.draft(b.RELEASE)
+
+        def claim(gate, aid, run):
+            raw = json.dumps({"run_id": run}).encode()
+            row = dict(id=aid, name=gate.CLAIM, size=len(raw), digest="sha256:" + hashlib.sha256(raw).hexdigest())
+            api.assets.append(row)
+            api.data[aid] = raw
+
+        claim(s1_label_resume, 14, 200)
+        claim(s1_resume, 15, 100)
+        for gate, run, aid in ((s1_resume, 100, 15), (s1_label_resume, 200, 14)):
+            self.assertEqual(n.owner_recovery.resumed_claim(api, release, run), (gate, (aid, {"run_id": run})))
+        self.assertEqual(n.owner_recovery.resumed_claim(api, release, 300), (None, None))
+        api.assets.pop()
+        claim(s1_resume, 15, 200)
+        with self.assertRaisesRegex(ValueError, "Multiple continuation claims"):
+            n.owner_recovery.resumed_claim(api, release, 200)
+
     def test_recovery_reads_only_the_new_campaign_claim(self):
         api = LocalDraft()
         ctx = {"producer_sha": "d" * 40, "run": 81}

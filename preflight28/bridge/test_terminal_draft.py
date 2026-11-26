@@ -103,6 +103,15 @@ class TerminalDraft(unittest.TestCase):
             out["cipher_id"]="37"
             with self.assertRaises(ValueError): d.authorize_rescue(env,Api())
             self.assertEqual(capture.call_count,1)
+            out["cipher_id"] = ""
+            import s1_label_resume
+            for gate in (owner.s1_resume, s1_label_resume):
+                owner.private_row.reset_mock()
+                with patch.object(d.normal.owner_recovery, "resumed_claim", return_value=(gate, (22, {}))) as select:
+                    d.authorize_rescue(env, Api())
+                self.assertEqual(select.call_args.args[2], 9)
+                self.assertEqual(owner.private_row.call_args_list[0].args[1], gate.TICKET_NAME)
+
 
     def test_private_pair_reread_needs_neither_cache_nor_another_encrypted_write(self):
         import owner_witness

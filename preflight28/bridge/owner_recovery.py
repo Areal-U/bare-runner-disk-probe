@@ -121,16 +121,31 @@ def read_claim(api, release, name):
     return r["id"], json.loads(raw.getvalue())
 
 
+def resumed_claim(api, release, source_run):
+    """Select by the physical producer recorded in the immutable claim, even when both grants exist."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "control"))
+    import s1_resume
+    import s1_label_resume
+
+    matches = []
+    for gate in (s1_resume, s1_label_resume):
+        entry = read_claim(api, release, gate.CLAIM)
+        if entry and entry[1].get("run_id") == source_run:
+            matches.append((gate, entry))
+    b.require(len(matches) <= 1, "Multiple continuation claims for one source run")
+    return matches[0] if matches else (None, None)
+
+
 def collection_claim(api,release,ctx):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "control"))
-    from registration import CAMPAIGN, CLAIM, TICKET_NAME
+    from registration import CAMPAIGN, CLAIM
     import slot1_handoff as handoff
 
-    import s1_resume
-    successor = read_claim(api,release,s1_resume.CLAIM)
-    resumed = successor is not None and successor[1].get("run_id") == ctx["run"]
-    gate = s1_resume if resumed else handoff
-    genesis = successor if resumed else read_claim(api, release, CLAIM)
+    gate, genesis = resumed_claim(api, release, ctx["run"])
+    resumed = gate is not None
+    if not resumed:
+        gate = handoff
+        genesis = read_claim(api, release, CLAIM)
     if not genesis:
         return None
     original_id, original = genesis
@@ -151,7 +166,7 @@ def collection_claim(api,release,ctx):
     binding = {"schema":1,"campaign":CAMPAIGN,"repository_id":1450926240,
                "workflow":".github/workflows/bare-checkpoint-transfer.yml","branch":"bare-coexist-v2.0.4",
                "head":ctx["producer_sha"],"release_id":b.RELEASE,"recipient":RECIPIENT,"producer_attempt":1}
-    b.require(original.get("initial_parent") == (s1_resume.PARENT_SHA if resumed else b.PARENT_SHA) and
+    b.require(original.get("initial_parent") == (gate.PARENT_SHA if resumed else b.PARENT_SHA) and
               all(original.get(k) == v for k,v in binding.items()), "Wrong original collection claim")
     if original["run_id"] == ctx["run"]:
         return original_id
