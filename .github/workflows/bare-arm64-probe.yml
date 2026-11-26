@@ -366,10 +366,10 @@ jobs:
       timeout-minutes: 5
       run: |
         mkdir -p "$RUNNER_TEMP/bare-ci"
-        for file in checkpoint.py build_trial.py coexist_inputs.py launcher_labels.py guard.py check_archive.py graph.py retained.py metrics_evidence.py migration_graph.py segment_graph.py angle_restore.py android_outputs.py contract_gate.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+        for file in checkpoint.py build_trial.py coexist_inputs.py launcher_labels.py apk_qc_evidence.py guard.py check_archive.py graph.py retained.py metrics_evidence.py migration_graph.py segment_graph.py angle_restore.py android_outputs.py contract_gate.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
           source=$file
           [[ $file != guard.py ]] || source=preflight28/limits/guard.py
-          [[ $file != launcher_labels.py ]] || source=preflight28/signing/launcher_labels.py
+          [[ $file != launcher_labels.py && $file != apk_qc_evidence.py ]] || source=preflight28/signing/$file
           [[ $file != check_archive.py ]] || source=preflight28/bridge/check_archive.py
           [[ $file != graph.py && $file != retained.py && $file != metrics_evidence.py && $file != migration_graph.py && $file != segment_graph.py && $file != angle_restore.py && $file != android_outputs.py && $file != contract_gate.py ]] || source=preflight28/graph/$file
           [[ $file != *.yml ]] || source=".github/workflows/$file"
@@ -1450,8 +1450,17 @@ jobs:
         set -o pipefail
         cd /work/chromium/src
         temp=$(mktemp -d)
-        trap 'rm -rf -- "$temp"' EXIT
         apk=out/Bare/apks/ChromePublic.apk
+        # Diagnose the immutable candidate only if QC fails. Keep stdout exclusively for the accepted tar.
+        finish_qc() {
+          local status=$?
+          if (( status != 0 )); then
+            python3 -I /exchange/apk_qc_evidence.py "$apk" "$temp" >&2 || echo 'APK QC diagnostics unavailable.' >&2
+          fi
+          rm -rf -- "$temp"
+          exit "$status"
+        }
+        trap finish_qc EXIT
         sdk=third_party/android_sdk/public/build-tools/37.0.0
         [[ -x $sdk/aapt2 && -x $sdk/apksigner && -x third_party/jdk/current/bin/java ]]
         export JAVA_HOME="$PWD/third_party/jdk/current"
