@@ -143,7 +143,9 @@ jobs:
   compile-probe:
     permissions:
       actions: read
-    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' && github.ref == 'refs/heads/bare-coexist-v2.0.4' &&
+    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' && (github.ref == 'refs/heads/bare-coexist-v2.0.4' || (github.ref == 'refs/heads/bare-r30-s1-restore-20261126' && github.event_name == 'workflow_dispatch' &&
+      fromJSON(toJSON(github.event.inputs)).mode == 'verify-r30-s1' && github.actor == 'Areal-U' && github.run_attempt == '1' &&
+      inputs.verify_frontier_only && inputs.segment_ordinal == 2 && inputs.parent_run == '45771045621' && inputs.backend == 'draft')) &&
       inputs.probe == 'checkpoint-production' && (github.run_attempt == '1' || inputs.verify_frontier_only) }}
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ inputs.probe == 'checkpoint-production' && 350 || inputs.probe == 'checkpoint-large' && 250 || inputs.probe == 'checkpoint-scale' && 190 || 120
@@ -235,13 +237,27 @@ jobs:
       run: |
         [[ $CHECKPOINT_BACKEND == cache || $CHECKPOINT_BACKEND == draft ]]
         if [[ -n $R28_PARENT_RUN ]]; then
-          [[ $CHECKPOINT_BACKEND == draft && $VERIFY_FRONTIER_ONLY == false ]]
-          [[ $R28_PARENT_RUN =~ ^[1-9][0-9]{0,18}$ && $R28_PARENT_RUN != "$GITHUB_RUN_ID" ]]
-          jq -e --arg run "$R28_PARENT_RUN" '.inputs.mode == "recover-lost-slot" and .inputs.loss_origin_run == $run' "$GITHUB_EVENT_PATH" >/dev/null
+          [[ $CHECKPOINT_BACKEND == draft && $R28_PARENT_RUN =~ ^[1-9][0-9]{0,18}$ && $R28_PARENT_RUN != "$GITHUB_RUN_ID" ]]
+          if [[ $R28_PARENT_RUN == 45771045621 && $SEGMENT_ORDINAL == 2 ]]; then
+            [[ $EXPECTED_SHA == fa44728d39b61c25d4116579e6da2c63ca7898cec24ada0e7ae453548bbd73bf ]]
+            [[ $EXPECTED_IDENTITY == 8f6e0fc60ac76d6558ff3f7f593a8db5a3a5c2da523b251b3847fb594fa2e3be ]]
+            [[ $R28_PARENT_MANIFEST == 795559195 && $R28_PARENT_MANIFEST_SHA == f48700364b590b28188715d565d564b1afba5d5d90df1e4b98efa5cef04971c8 ]]
+            mode=$(jq -er '.inputs.mode' "$GITHUB_EVENT_PATH")
+            case "$GITHUB_REF,$mode,$VERIFY_FRONTIER_ONLY" in
+              refs/heads/bare-r30-s1-restore-20261126,verify-r30-s1,true|refs/heads/bare-coexist-v2.0.4,build-apk,false) ;;
+              *) exit 1 ;;
+            esac
+          else
+            [[ $VERIFY_FRONTIER_ONLY == false ]]
+            jq -e --arg run "$R28_PARENT_RUN" '.inputs.mode == "recover-lost-slot" and .inputs.loss_origin_run == $run' "$GITHUB_EVENT_PATH" >/dev/null
+          fi
           [[ $SEGMENT_ORDINAL =~ ^([2-9]|1[0-2])$ ]]
         fi
         if [[ $CHECKPOINT_BACKEND == draft ]]; then
-          [[ $GITHUB_REF == refs/heads/bare-coexist-v2.0.4 && $GITHUB_RUN_ATTEMPT == 1 && $GITHUB_ACTOR == Areal-U ]]
+          [[ $GITHUB_RUN_ATTEMPT == 1 && $GITHUB_ACTOR == Areal-U ]]
+          if [[ $GITHUB_REF != refs/heads/bare-coexist-v2.0.4 ]]; then
+            [[ $GITHUB_REF == refs/heads/bare-r30-s1-restore-20261126 && $R28_PARENT_RUN == 45771045621 && $SEGMENT_ORDINAL == 2 && $VERIFY_FRONTIER_ONLY == true ]]
+          fi
           [[ $SEGMENT_ORDINAL =~ ^([1-9]|1[0-3])$ ]]
           if (( SEGMENT_ORDINAL == 1 )); then [[ -z $R28_PARENT_MANIFEST || $R28_PARENT_MANIFEST == 0 ]]; [[ -z $R28_PARENT_MANIFEST_SHA ]];
           else [[ $R28_PARENT_MANIFEST =~ ^[1-9][0-9]*$ && $R28_PARENT_MANIFEST_SHA =~ ^[0-9a-f]{64}$ ]]; fi
@@ -265,7 +281,11 @@ jobs:
             [[ $EXPECTED_KEY == bare-coexist-204-45285202990-1-checkpoint-production-s2 ]]
             [[ $PARENT_PRODUCER == bf70ddbf474f3390a62220a076b8c43347fecc64 ]]
           else
-            [[ $PARENT_PRODUCER == "$GITHUB_SHA" ]]
+            if [[ $R28_PARENT_RUN == 45771045621 && $SEGMENT_ORDINAL == 2 ]]; then
+              [[ $PARENT_PRODUCER == 9869f9af1ba14eeb943e6ef38af7dc77456f4ec3 ]]
+            else
+              [[ $PARENT_PRODUCER == "$GITHUB_SHA" ]]
+            fi
             [[ $EXPECTED_KEY == "bare-coexist-204-${R28_PARENT_RUN:-$GITHUB_RUN_ID}-1-checkpoint-production-s$((SEGMENT_ORDINAL-1))" ]]
           fi
           [[ $SEGMENT_ORDINAL != 13 || ${{ inputs.verify_frontier_only && 'true' || 'false' }} == true ]]
@@ -305,6 +325,10 @@ jobs:
             predecessor_rev=$COEXIST_22_REV
             predecessor_arm_sha=26f64ca7ab4d8b72a53608d57bd5c856e1b456a337ce9cc5e7f1ae14f425760a
             predecessor_transfer_sha=82c7036b25749a164041ec52ddb02fe373a600bcf643b9ad3920dee4a8368033
+          elif [[ $R28_PARENT_RUN == 45771045621 && $SEGMENT_ORDINAL == 2 ]]; then
+            predecessor_rev=$PARENT_PRODUCER
+            predecessor_arm_sha=e1441995da92562c2a4c277bbbff2323ade6c8b00342d799f5a062c0de9fdb10
+            predecessor_transfer_sha=7db22a070def67111c878b98bed2759921d4048dd8d0e1fc6b15acd890016122
           elif [[ $EXPECTED_KEY == "$COEXIST_27_S2_KEY" ]]; then
             [[ $EXPECTED_SHA == 4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf ]]
             [[ $EXPECTED_IDENTITY == a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc ]]
@@ -319,7 +343,7 @@ jobs:
             predecessor_transfer_sha=fe0d87368877bb6c575f90e12a7102c03ec283db63361a50a159438a4e15eaaf
           fi
         fi
-        [[ $CHECKPOINT_SEGMENT == initial || -z $predecessor_rev ]]
+        [[ $CHECKPOINT_SEGMENT == initial || -z $predecessor_rev || ($R28_PARENT_RUN == 45771045621 && $SEGMENT_ORDINAL == 2) ]]
         {
           echo "COEXIST_PREDECESSOR_REV=$predecessor_rev"
           echo "COEXIST_PREDECESSOR_ARM_SHA=$predecessor_arm_sha"
@@ -331,11 +355,11 @@ jobs:
       timeout-minutes: 5
       run: |
         mkdir -p "$RUNNER_TEMP/bare-ci"
-        for file in checkpoint.py build_trial.py coexist_inputs.py guard.py check_archive.py graph.py retained.py metrics_evidence.py migration_graph.py segment_graph.py android_outputs.py contract_gate.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+        for file in checkpoint.py build_trial.py coexist_inputs.py guard.py check_archive.py graph.py retained.py metrics_evidence.py migration_graph.py segment_graph.py angle_restore.py android_outputs.py contract_gate.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
           source=$file
           [[ $file != guard.py ]] || source=preflight28/limits/guard.py
           [[ $file != check_archive.py ]] || source=preflight28/bridge/check_archive.py
-          [[ $file != graph.py && $file != retained.py && $file != metrics_evidence.py && $file != migration_graph.py && $file != segment_graph.py && $file != android_outputs.py && $file != contract_gate.py ]] || source=preflight28/graph/$file
+          [[ $file != graph.py && $file != retained.py && $file != metrics_evidence.py && $file != migration_graph.py && $file != segment_graph.py && $file != angle_restore.py && $file != android_outputs.py && $file != contract_gate.py ]] || source=preflight28/graph/$file
           [[ $file != *.yml ]] || source=".github/workflows/$file"
           curl --fail --location --retry 2 --max-time 60 \
             "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/$source" \
@@ -467,7 +491,7 @@ jobs:
           printf '%s  %s\n' "$R28_PARENT_SHA" "$file" | sha256sum --check --strict
           for operation in validate-archive verify-continuation inspect-input-paths; do
             args=(--production)
-            if [[ $operation == verify-continuation ]]; then args+=(--ci-revision "$R28_HEAD_SHA" --expected-identity "$R28_PARENT_IDENTITY"); fi
+            if [[ $operation == verify-continuation ]]; then args+=(--ci-revision "${COEXIST_PREDECESSOR_REV:-$R28_HEAD_SHA}" --expected-identity "$R28_PARENT_IDENTITY"); fi
             python3 preflight28/bridge/check_archive.py "$RUNNER_TEMP/bare-ci/checkpoint.py" "$operation" "$file" "${args[@]}"
           done
         fi
@@ -994,6 +1018,11 @@ jobs:
             'build_trial.py': '5102b18404ccdfe8071549f411e28f75f1b10dec7d0f6007056339dc8e94094a',
             'coexist_inputs.py': '0ca8a1136dbe23c3f4c70c1e2f47ddd7ce1b3f19b57ccbd6f0e33d00dc18f183',
         }
+        if os.environ['COEXIST_PREDECESSOR_REV'] == '9869f9af1ba14eeb943e6ef38af7dc77456f4ec3':
+            helpers.update({
+                'checkpoint.py': 'e8ffcd9e91be2eac0eb71a0940440a3e7d8fc55f7005544b61947a21d82ee2fe',
+                'build_trial.py': 'c64a9a3a9348b29fba0051af214ed3457a2408d169f22243ace23e27139c8584',
+            })
         workflows = {
             'bare-arm64-probe.yml': os.environ['COEXIST_PREDECESSOR_ARM_SHA'],
             'bare-checkpoint-transfer.yml': os.environ['COEXIST_PREDECESSOR_TRANSFER_SHA'],
@@ -1150,6 +1179,17 @@ jobs:
         fi
         touch /exchange/checkpoint/reuse-verified
         CONTAINER
+    - name: Reject changed inputs on the restored candidate
+      if: ${{ github.ref == 'refs/heads/bare-r30-s1-restore-20261126' && inputs.verify_frontier_only && inputs.parent_run == '45771045621' }}
+      timeout-minutes: 4
+      run: |
+        set -euo pipefail
+        cd "$RUNNER_TEMP/bare-official"
+        docker compose exec -T chromium-builder bash -euc '
+          cd /work/chromium/src
+          printf "%s  %s\n" 27b52991ec81306daf99437ba9c0488a5a510180e75bc3d3e3be9cfa32cc482a out/Bare/checkpoint-segment-frontier.json | sha256sum --check --strict
+          python3 -I /exchange/angle_restore.py --out "$PWD/out/Bare" --negative-control
+        '
     - name: Verify the received APK frontier and establish the segment baseline
       id: frontier
       if: ${{ inputs.probe == 'checkpoint-production' }}
@@ -1168,7 +1208,7 @@ jobs:
               args+=(--parent-sha cold --bootstrap)
             else
               args+=(--parent-sha "$PARENT_ARCHIVE_SHA")
-              if [[ -n $COEXIST_PREDECESSOR_REV ]]; then
+              if [[ -n $COEXIST_PREDECESSOR_REV && $PARENT_ARCHIVE_SHA != fa44728d39b61c25d4116579e6da2c63ca7898cec24ada0e7ae453548bbd73bf ]]; then
                 args+=(--bootstrap)
               else
                 args+=(--require-current-proof)
@@ -1181,6 +1221,9 @@ jobs:
         verified=$(tail -n 1 exchange/checkpoint/frontier-before.log | jq -r .parent_frontier_verified)
         [[ $verified == true || $verified == false ]]
         [[ $VERIFY_FRONTIER_ONLY != true || $verified == true ]]
+        if [[ $PARENT_ARCHIVE_SHA == fa44728d39b61c25d4116579e6da2c63ca7898cec24ada0e7ae453548bbd73bf ]]; then
+          tail -n 1 exchange/checkpoint/frontier-before.log | jq -e '.parent_frontier_verified == true and .pending == 1911'
+        fi
         echo "verified=$verified" >> "$GITHUB_OUTPUT"
     - name: Run the real APK target within its time and output budgets
       id: trial
@@ -2166,7 +2209,9 @@ jobs:
     name: Compile or verify authenticated APK slot ${{ inputs.segment_ordinal }}
   draft-publisher:
     name: Private checkpoint receipt for slot ${{ inputs.segment_ordinal }}
-    if: ${{ inputs.backend == 'draft' && github.event_name == 'workflow_dispatch' && github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-coexist-v2.0.4'
+    if: ${{ inputs.backend == 'draft' && github.event_name == 'workflow_dispatch' && github.repository == 'Areal-U/bare-runner-disk-probe' && (github.ref == 'refs/heads/bare-coexist-v2.0.4' || (github.ref == 'refs/heads/bare-r30-s1-restore-20261126' && github.event_name == 'workflow_dispatch' &&
+      fromJSON(toJSON(github.event.inputs)).mode == 'verify-r30-s1' && github.actor == 'Areal-U' && github.run_attempt == '1' &&
+      inputs.verify_frontier_only && inputs.segment_ordinal == 2 && inputs.parent_run == '45771045621' && inputs.backend == 'draft'))
       && github.actor == 'Areal-U' && github.run_attempt == '1' && inputs.probe == 'checkpoint-production' && inputs.segment_ordinal >= 1 && inputs.segment_ordinal <=
       13 }}
     runs-on: ubuntu-24.04

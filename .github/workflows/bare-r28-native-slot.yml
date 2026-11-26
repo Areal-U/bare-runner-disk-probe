@@ -101,6 +101,7 @@ jobs:
         R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
         REGISTRATION_ASSET_ID: ''
         REGISTRATION_SHA: ''
+        R30_RESUME_S1: ${{ github.event.inputs.mode == 'build-apk' && '1' || '0' }}
         R28_STORAGE_VERIFY_ONLY: ${{ inputs.verify_only && 'true' || 'false' }}
         REPLACEMENT: ${{ github.event.inputs.mode == 'recover-lost-slot' }}
       run: |
