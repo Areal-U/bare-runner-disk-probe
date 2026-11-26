@@ -179,7 +179,8 @@ def normal_binding(registration_dir, workflows):
         env["GITHUB_JOB"]="collection-lease" if verify_only else "bind-private-receiver"
         ticket["collector_ack_sha"]=hashlib.sha256(json.dumps(ack).encode()).hexdigest()
         env["REGISTRATION_SHA"]=hashlib.sha256(json.dumps(ticket).encode()).hexdigest()
-        with patch.object(gate,"FIRST_TICKET_SHA",hashlib.sha256(helper.values[54]).hexdigest()), \
+        with patch.object(gate.slot1_handoff,"validate_source",autospec=True), \
+             patch.object(gate,"FIRST_TICKET_SHA",hashlib.sha256(helper.values[54]).hexdigest()), \
              patch.object(gate,"PREVIOUS_TICKET_SHA",hashlib.sha256(helper.values[55]).hexdigest()):
             return gate.bind(helper,env,event,now,verify_only=verify_only)
 
