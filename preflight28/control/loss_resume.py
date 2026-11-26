@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 
 import admission
 from admission import BASE_REF, BASE_SHA, RELEASE_ID, REPO, REPO_ID, S2_SHA, PagedOwnerDraft, require
+import slot1_handoff as handoff
 import loss_marker
 import receipt_journal as journal
 import recover
@@ -245,6 +246,8 @@ def operation(helper, env, event, mode, now):
     initial, tid, tsha, _ = named(api,release,reg.TICKET_NAME,owner=True)
     fields(genesis,dict(ticket_asset_id=tid,ticket_sha=tsha,registration_id=initial["collector_registration_id"]))
     fields(initial,dict(**expected,initial_parent=S2_SHA))
+    handoff.check_reference(genesis)
+    handoff.validate_source(api,release,initial,initial=False)
     ticket, aid, digest, issued = named(api,release,f"{reg.CAMPAIGN}-loss-{origin}.json",owner=True)
     require((inputs.get("registration_asset_id",""),inputs.get("registration_sha","")) in
             (("",""),(str(aid),digest)), "Different replacement collection ticket")

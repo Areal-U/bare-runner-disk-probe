@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 import apk_seal
 import owner_witness as w
+from test_handoff_sample import sample
 
 
 class Docs:
@@ -17,9 +18,9 @@ class Docs:
         self.rows=[]
         self.data={}
 
-    def add(self,name,obj,owner=False):
+    def add(self,name,obj,owner=False,aid=None):
         raw=json.dumps(obj,sort_keys=True).encode() if isinstance(obj,dict) else obj
-        i=len(self.rows)+1
+        i=aid or len(self.rows)+1
         self.data[i]=raw
         row=dict(id=i,name=name,size=len(raw),state="uploaded",digest="sha256:"+hashlib.sha256(raw).hexdigest(),
                  uploader=w.OWNER if owner else {"login":"github-actions[bot]"})
@@ -48,11 +49,15 @@ class Witness(unittest.TestCase):
                          branch=w.BASE_REF,head=self.env["GITHUB_SHA"],recipient=apk_seal.RECIPIENT,release_id=w.RELEASE_ID)
         self.service="Automation_"+"1"*32
         self.dest="private-owner-destination-no-public"
-        self.ticket=self.docs.add(w.TICKET_NAME,dict(**self.common,
+        reservation=dict(**self.common,
                                   initial_parent=w.owner.S2_SHA,collector_registration_id=self.service,
-                                  owner_destination_id=self.dest),owner=True)
+                                  owner_destination_id=self.dest)
+        earlier, refs = sample(self,reservation)
+        for name, aid, data, owner in earlier:
+            self.docs.add(name,data,owner,aid)
+        self.ticket=self.docs.add(w.TICKET_NAME,reservation,owner=True)
         self.claim=self.docs.add(w.CLAIM,dict(**self.common,initial_parent=w.owner.S2_SHA,registration_id=self.service,
-                                 ticket_asset_id=self.ticket["id"],ticket_sha=self.ticket["digest"][7:],producer_attempt=1,run_id=77))
+                                 ticket_asset_id=self.ticket["id"],ticket_sha=self.ticket["digest"][7:],producer_attempt=1,run_id=77,**refs))
 
     def get_note(self):
         raw=(Path(self.tmp.name)/"witness.json").read_bytes()

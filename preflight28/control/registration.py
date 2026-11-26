@@ -8,18 +8,17 @@ from pathlib import Path
 import re
 import sys
 
+import slot1_handoff
+from slot1_handoff import CAMPAIGN, CLAIM, TICKET_NAME
 from admission import BASE_REF, REPO, REPO_ID, S2_SHA, RELEASE_ID, PagedOwnerDraft, admit, require
 
-CAMPAIGN = "bare-personal-204-r30"
 PREVIOUS_CAMPAIGN = "bare-personal-204-r29"
 PREVIOUS_HEAD = "5737dcb88171dea54566bf4202d3d17092a1d176"
 PREVIOUS_TICKET_SHA = "d6be078c59a3ab8c56ab928a8c0e183d76f39ddccba241586b676f2bfe49568a"
-TICKET_NAME = CAMPAIGN + "-preclaim-1-collection-registration.json"
 FIRST_TICKET_SHA = "c0a5b7fa88bc91bc616ac9c2f5fbf89054f5c34798206ed0ac744b6c0835d816"
 FIRST_HEAD = "172a2b3e608632cf1e9155d866427456cdb4197c"
 FIRST_RUN = 45763502309
 FIRST_JOBS = {139718818153: "success", 139718863397: "failure", 139718917585: "failure"}
-CLAIM = CAMPAIGN + "-production-run-claim.json"
 WORKFLOW = ".github/workflows/bare-checkpoint-transfer.yml"
 OWNER = {"id": 292261483, "login": "Areal-U"}
 RECIPIENT = "age1t69raxytlqula36e8w0tm6p3ezt49ztwnrtz8k57h6mvpwfguy7sjmr4yx"
@@ -186,6 +185,7 @@ def bind(helper, env, event, now, *, verify_only=False):
     require(all(ticket.get(k) == v for k,v in expected.items()),
             "Registration belongs to another campaign, owner, revision or initial parent")
     same_owner_as_previous(helper, release, ticket)
+    slot1_handoff.validate_source(helper, release, ticket, initial=not verify_only)
     if not verify_only:
         check_first_run(helper)
     service = ticket["collector_registration_id"]
@@ -203,9 +203,11 @@ def bind(helper, env, event, now, *, verify_only=False):
     storage_admission.admit(helper.metadata, settings, storage_admission.lease_size(settings), 1,
                             stage="lease", now=now.timestamp(), lead=350*60)
     holder = dict(expected, registration_id=service, ticket_asset_id=int(aid), ticket_sha=digest,
-                  run_id=run, producer_attempt=1)
+                  run_id=run, producer_attempt=1, source_run_id=slot1_handoff.SOURCE_RUN,
+                  source_claim_id=slot1_handoff.SOURCE_CLAIM_ID, source_claim_sha=slot1_handoff.SOURCE_CLAIM_SHA)
     if "collector_ack_asset_id" not in ticket:
         holder["collector_ack_asset_id"] = ack["collector_ack_asset_id"]
+    slot1_handoff.check_reference(holder)
     # Independent of ticket ID: two concurrent dispatches cannot bind this campaign twice.
     return admit("recover" if verify_only else "compute", holder, helper, name=CLAIM), service, latest, ceiling, until
 

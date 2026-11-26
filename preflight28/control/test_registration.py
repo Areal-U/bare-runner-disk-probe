@@ -63,6 +63,11 @@ class OwnerDraft:
 class TicketTests(unittest.TestCase):
     def setUp(self):
         self.d = OwnerDraft()
+        # Exercise the existing registration and atomic binding edge with its own
+        # synthetic owner. The fixed previous run is tested in SlotOneHandoffTests.
+        source = patch("registration.slot1_handoff.validate_source", autospec=True)
+        self.source_check = source.start()
+        self.addCleanup(source.stop)
         first = patch("registration.FIRST_TICKET_SHA", hashlib.sha256(self.d.data(701)).hexdigest())
         first.start()
         self.addCleanup(first.stop)
@@ -142,6 +147,14 @@ class TicketTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Immutable claim digest differs"):
             bind(self.d, self.env, self.event, self.now)
         self.assertEqual(self.d.posts,1)
+        self.assertEqual([call.kwargs["initial"] for call in self.source_check.call_args_list],
+                         [True,False,True])
+        import slot1_handoff as handoff
+        holder = json.loads(self.d.claim)
+        self.assertEqual(holder["source_run_id"], handoff.SOURCE_RUN)
+        self.assertEqual(holder["source_claim_id"], handoff.SOURCE_CLAIM_ID)
+        self.assertEqual(holder["source_claim_sha"], handoff.SOURCE_CLAIM_SHA)
+        self.assertNotEqual(CLAIM, handoff.SOURCE_CLAIM_NAME)
         self.assertGreaterEqual(self.d.pages.count(3),3)
     @patch("registration.admit")
     def test_nominal_ticket_cannot_reserve_a_legacy_or_alternate_build(self, claim):
@@ -273,3 +286,132 @@ class TicketTests(unittest.TestCase):
             with self.subTest(key=key), patch.dict(target,{key:bad}), self.assertRaises(ValueError):
                 self.enter()
         claim.assert_not_called()
+
+
+class SlotOneHandoffTests(unittest.TestCase):
+    """The one accepted claim is never replaced or reused for another manifest."""
+
+    def setUp(self):
+        import slot1_handoff as h
+        self.h = h
+        self.run = dict(id=h.SOURCE_RUN, run_attempt=1, head_sha=h.SOURCE_HEAD, status="completed",
+                        conclusion="failure", event="workflow_dispatch", path=WORKFLOW, actor=OWNER,
+                        head_branch=BASE_REF, repository={"id":REPO_ID}, head_repository={"id":REPO_ID})
+        jobs = [dict(id=i, conclusion=c) for i,c in h.SOURCE_JOBS.items()]
+        jobs.extend(dict(id=i, conclusion="skipped") for i in range(32))
+        for job in jobs:
+            job.update(run_id=h.SOURCE_RUN, run_attempt=1, head_sha=h.SOURCE_HEAD, status="completed")
+        self.jobs = dict(total_count=37, jobs=jobs)
+        witness = dict(id=h.SOURCE_WITNESS_ID, name=f"r28-{h.SOURCE_RUN}-a1-owner-claim",
+                       size_in_bytes=683, digest=h.SOURCE_WITNESS_DIGEST, expired=False,
+                       workflow_run={"id":h.SOURCE_RUN, "head_sha":h.SOURCE_HEAD})
+        self.artifacts = dict(total_count=1, artifacts=[witness])
+        base = f"test/actions/runs/{h.SOURCE_RUN}"
+        self.responses = {base:self.run, base+"/attempts/1/jobs?per_page=100":self.jobs,
+                          base+"/artifacts?per_page=100":self.artifacts}
+
+    BASE = "test"
+
+    def metadata(self, path):
+        return self.responses[path]
+
+    def test_requires_completed_unstarted_run_and_exactly_its_claim_witness(self):
+        self.h.check_unstarted(self)
+        changes = [
+            (self.run, {"run_attempt":2}), (self.run, {"status":"in_progress"}),
+            (self.jobs, {"total_count":36}), (self.jobs, {"jobs":self.jobs["jobs"][:-1]}),
+            (self.jobs["jobs"][-1], {"conclusion":"success"}), (self.jobs["jobs"][0], {"head_sha":"e"*40}),
+            (self.artifacts, {"artifacts":self.artifacts["artifacts"]+[{"name":"unsigned.apk"}],
+                              "total_count":2}),
+            (self.artifacts["artifacts"][0], {"digest":"sha256:"+"0"*64}),
+        ]
+        for target, mutation in changes:
+            with self.subTest(mutation=tuple(mutation)), patch.dict(target,mutation), self.assertRaises(ValueError):
+                self.h.check_unstarted(self)
+
+    def test_transfer_preserves_one_source_identity_destination_and_free_grant(self):
+        h = self.h
+        old = OwnerDraft().ticket.copy()
+        old.update(head=h.SOURCE_HEAD, collector_ack_sha=h.SOURCE_ACK_SHA)
+        new = dict(old, head="b"*40, registration_nonce="9"*32, collector_ack_sha="a"*64)
+        claim = {k:old[k] for k in ("schema","campaign","release_id","repository_id","branch","workflow",
+                                    "recipient","initial_parent","head")}
+        claim.update(run_id=h.SOURCE_RUN, producer_attempt=1, registration_id=old["collector_registration_id"],
+                     ticket_asset_id=h.SOURCE_TICKET_ID, ticket_sha=h.SOURCE_TICKET_SHA,
+                     collector_ack_asset_id=h.SOURCE_ACK_ID)
+        h.check_binding(claim,old,new)
+        for target, mutation in [
+            (claim, {"ticket_asset_id":999}), (claim, {"producer_attempt":2}),
+            (old, {"collector_ack_sha":"0"*64}), (new, {"initial_parent":"1"*64}),
+            (new, {"head":h.SOURCE_HEAD}), (new, {"registration_nonce":old["registration_nonce"]}),
+            (new, {"collector_registration_id":"Automation_"+"a"*32}),
+            (new, {"owner_destination_id":"different_owner_slot"}),
+            (new, {"artifact_ceiling_bytes":old["artifact_ceiling_bytes"]+1}),
+        ]:
+            with self.subTest(mutation=tuple(mutation)), patch.dict(target,mutation), self.assertRaises(ValueError):
+                h.check_binding(claim,old,new)
+
+    def test_competing_dispatches_can_consume_the_handoff_only_once(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier, Lock
+        from types import SimpleNamespace
+        from admission import admit, encode
+
+        h = self.h
+        source = b"the previously admitted compute right"
+        assets = {h.SOURCE_CLAIM_NAME:(h.SOURCE_CLAIM_ID,source)}
+        gate = Barrier(2)
+        lock = Lock()
+        statuses = []
+
+        class Release:
+            BASE = "test"
+            UPLOAD = "uploads.github.com"
+
+            def draft(self, release_id):
+                assert release_id == RELEASE_ID
+                with lock:
+                    snapshot = [{"id":aid,"name":name} for name,(aid,_) in assets.items()]
+                return {"assets":snapshot}
+
+            def request(self,host,method,path,**kwargs):
+                assert method == "POST" and host == self.UPLOAD
+                assert parse_qs(urlsplit(path).query)["name"] == [h.CLAIM]
+                gate.wait(timeout=5)  # Both physical runs have observed the successor name absent.
+                with lock:
+                    if h.CLAIM in assets:
+                        status = 422
+                    else:
+                        status = 201
+                        assets[h.CLAIM] = (902,kwargs["body"])
+                    statuses.append(status)
+                return SimpleNamespace(close=lambda:None),SimpleNamespace(status=status)
+
+            def asset_info(self,release,name,size,sha):
+                asset_id,raw = assets[name]
+                if len(raw) != size or hashlib.sha256(raw).hexdigest() != sha:
+                    raise ValueError("Conflicting handoff")
+                return {"id":asset_id}
+
+            def download(self,asset_id,size,sha,target):
+                ident,raw = assets[h.CLAIM]
+                assert asset_id == ident and len(raw) == size and hashlib.sha256(raw).hexdigest() == sha
+                target.write(raw)
+
+        release = Release()
+        holders = [dict(run_id=i, source_run_id=h.SOURCE_RUN,source_claim_id=h.SOURCE_CLAIM_ID,
+                        source_claim_sha=h.SOURCE_CLAIM_SHA) for i in (81,82)]
+        def compete(holder):
+            h.check_reference(holder)
+            try:
+                return admit("compute",holder,release,name=h.CLAIM)
+            except ValueError as exc:
+                self.assertEqual(str(exc),"Conflicting handoff")
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            results = list(workers.map(compete,holders))
+        self.assertCountEqual(results,[902,None])
+        self.assertCountEqual(statuses,[201,422])
+        self.assertEqual(assets[h.SOURCE_CLAIM_NAME],(h.SOURCE_CLAIM_ID,source))
+        self.assertEqual(assets[h.CLAIM][1],encode(holders[results.index(902)]))

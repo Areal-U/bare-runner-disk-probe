@@ -40,7 +40,9 @@ class Service(OwnerDraft):
         common = {key:self.ticket[key] for key in
                   ("schema","campaign","repository_id","workflow","branch","head","release_id","recipient")}
         self.add(loss.reg.CLAIM,dict(common,run_id=RUN,producer_attempt=1,initial_parent=loss.S2_SHA,
-                 ticket_asset_id=aid,ticket_sha=sha,registration_id=self.ticket["collector_registration_id"]),902,"prior")
+                 ticket_asset_id=aid,ticket_sha=sha,registration_id=self.ticket["collector_registration_id"],
+                 source_run_id=loss.handoff.SOURCE_RUN,source_claim_id=loss.handoff.SOURCE_CLAIM_ID,
+                 source_claim_sha=loss.handoff.SOURCE_CLAIM_SHA),902,"prior")
         previous = candidate(1)
         previous.update(manifest_id="991",manifest_sha="e"*64,archive_bytes="80")
         self.parent = previous
@@ -112,6 +114,7 @@ class Service(OwnerDraft):
 
 class PhysicalReplacement(TestCase):
     def setUp(self):
+        self.enterContext(patch.object(loss.handoff,"validate_source", autospec=True))
         self.now=datetime.now(timezone.utc)
         self.api=Service(self.now)
         self.env=dict(GITHUB_JOB="loss-admission",GITHUB_RUN_ID=str(self.api.other),GITHUB_RUN_ATTEMPT="1",
