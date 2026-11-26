@@ -9,9 +9,12 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import warnings
+import zipfile
 
 from graph import run
-from segment_graph import begin, finish, PROOF
+from retained import inventory
+from segment_graph import APK_CORE, APK_PATH, begin, finish, PROOF, verify_packaged_libchrome
 
 SISO = os.environ.get("SISO")
 GRAPH = """rule make
@@ -26,6 +29,38 @@ build obj/c.o: make ../../c.h
 build apk: make obj/a.o obj/b.o obj/c.o
 build chrome_public_apk: phony apk
 """
+
+
+class PackagedLibraryTest(unittest.TestCase):
+    def test_terminal_library_matches_one_retained_regular_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            out = Path(root)
+            stripped = out / "libchrome.so"
+            stripped.write_bytes(b"test ELF")
+            apk = out / APK_PATH
+            apk.parent.mkdir()
+            cases = (
+                ([(APK_CORE, b"test ELF")], None),
+                ([(APK_CORE, b"test XLF")], "SHA-256 differs"),
+                ([(APK_CORE, b"short")], "length differs"),
+                ([("lib/wrong/libchrome.so", b"test ELF")], "exactly one"),
+                ([(APK_CORE, b"test ELF")] * 2, "exactly one"),
+            )
+            for entries, expected in cases:
+                with self.subTest(expected=expected, members=len(entries)):
+                    with warnings.catch_warnings(), zipfile.ZipFile(apk, "w") as archive:
+                        warnings.filterwarnings("ignore", message="Duplicate name:", category=UserWarning)
+                        for name, content in entries:
+                            archive.writestr(name, content)
+                    if expected is None:
+                        verify_packaged_libchrome(out, inventory(out))
+                    else:
+                        with self.assertRaisesRegex(ValueError, expected):
+                            verify_packaged_libchrome(out, inventory(out))
+            stripped.unlink()
+            with self.assertRaisesRegex(ValueError, "missing or irregular"):
+                verify_packaged_libchrome(out, inventory(out))
+
 
 @unittest.skipUnless(SISO, "set SISO to the pinned Chromium Siso executable")
 class NormalSegmentTest(unittest.TestCase):
@@ -136,6 +171,23 @@ class NormalSegmentTest(unittest.TestCase):
         ninja.write_bytes(b''.join(row for row in original_ninja.splitlines(keepends=True) if b'\timplicit.dat\t' not in row))
         missing_log = rejected()
         self.assertEqual((missing_log['current_metric_rows']['exact_success'],missing_log['ninja_members']), (1,1))
+        # Both the general multiple-output edge and the single-output edge must
+        # belong to the measured invocation, even when every output still exists.
+        for label, names, field, value in (
+            ('mixed-duration', {'implicit.dat'}, 1, '999999'),
+            ('mixed-command', {'implicit.dat'}, 4, '0000000000000000'),
+            ('expired-multiple', {'obj/b.o', 'implicit.dat'}, 2, '1'),
+            ('expired-single', {'obj/c.o'}, 2, '1'),
+        ):
+            with self.subTest(label):
+                rewritten = []
+                for row in original_ninja.decode().splitlines():
+                    parts = row.split('\t')
+                    if len(parts) == 5 and parts[3] in names:
+                        parts[field] = value
+                    rewritten.append('\t'.join(parts))
+                ninja.write_text('\n'.join(rewritten)+'\n')
+                self.assertEqual(rejected()['current_metric_rows']['exact_success'], 1)
         ninja.write_bytes(original_ninja)
         clean = finish(self.out, self.baseline, self.report, self.command, private_intermediates=True)
         self.assertEqual((clean['frontier_status'],clean['advanced_edges']), ('candidate',2))
@@ -184,6 +236,19 @@ class NormalSegmentTest(unittest.TestCase):
     def test_complete_apk_content_gate_including_replaced_edge(self):
         # Existing, invalidated output can change if its actual successful edge
         # is in the fixed APK plan and completed during this build.
+        # Use a small native ELF for this architecture-independent content test.
+        readelf = shutil.which("readelf")
+        tool = self.out.parent.parent / "third_party/llvm-build/Release+Asserts/bin/llvm-readelf"
+        tool.parent.mkdir(parents=True)
+        tool.symlink_to(readelf)
+        original = Path(shutil.which("true")).read_bytes()
+        for name in ("libchrome.so", "lib.unstripped/libchrome.so"):
+            (self.out / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.out / name).write_bytes(original)
+        apk = self.out / APK_PATH
+        apk.parent.mkdir()
+        with zipfile.ZipFile(apk, "w") as archive:
+            archive.writestr(APK_CORE, original)
         self.corrupt("obj/a.o")
         Path("a.h").write_text("changed input")
         begin(self.out, self.baseline, self.parent, self.command, bootstrap=True)
