@@ -3,6 +3,13 @@ name: Bare runner disk probe
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Select a read-only probe on this branch
+        type: choice
+        default: measure
+        options:
+        - measure
+        - verify-r30-s1
       reclaim:
         description: Measure again after removing listed unused tools from the temporary runner
         type: boolean
@@ -12,7 +19,7 @@ permissions: {}
 
 jobs:
   measure:
-    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' }}
+    if: ${{ inputs.mode != 'verify-r30-s1' && toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -80,3 +87,50 @@ jobs:
             echo 'After reclaim'
             report_disk
           fi
+
+  restore:
+    name: Check resource regeneration from the fixed R30 S1
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/bare-r30-s1-label-20261127' && inputs.mode == 'verify-r30-s1' && github.run_attempt == '1' && github.actor == 'Areal-U' && github.event.repository.id == 1450926240 && github.event.sender.id == 292261483 && !github.event.repository.private && !github.event.repository.fork }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bare-arm64-probe.yml
+    with:
+      probe: checkpoint-production
+      backend: draft
+      segment_ordinal: 2
+      verify_frontier_only: true
+      parent_run: '45771045621'
+      parent_manifest_id: '795559195'
+      parent_manifest_sha: f48700364b590b28188715d565d564b1afba5d5d90df1e4b98efa5cef04971c8
+      expected_parent_producer: 9869f9af1ba14eeb943e6ef38af7dc77456f4ec3
+      expected_checkpoint_key: bare-coexist-204-45771045621-1-checkpoint-production-s1
+      expected_checkpoint_sha: fa44728d39b61c25d4116579e6da2c63ca7898cec24ada0e7ae453548bbd73bf
+      expected_checkpoint_identity: 8f6e0fc60ac76d6558ff3f7f593a8db5a3a5c2da523b251b3847fb594fa2e3be
+      expected_base_image: ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+      apk_output_gib: 18
+      apk_jobs: 2
+      compile_minutes: 0
+      apk_recipient: age1t69raxytlqula36e8w0tm6p3ezt49ztwnrtz8k57h6mvpwfguy7sjmr4yx
+      storage_ceiling: '51539607552'
+      storage_until: '1799053200'
+
+  certify:
+    name: Certify the fixed S1 resource-label test
+    needs: restore
+    if: ${{ always() && inputs.mode == 'verify-r30-s1' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    env:
+      RESULT: ${{ needs.restore.result }}
+      ACCEPTED: ${{ needs.restore.outputs.parent_frontier_verified }}
+      LABELS: ${{ needs.restore.outputs.label_trial_passed }}
+      ADVANCED: ${{ needs.restore.outputs.checkpoint_advanced }}
+    steps:
+    - name: Check the independent restore result
+      shell: bash
+      run: |
+        set -euo pipefail
+        [[ $RESULT == success && $ACCEPTED == true && $ADVANCED == false && $LABELS == true ]]
+        echo "Verified the old 1,911 remaining edge IDs, retained outputs, and corrected launcher labels after the targeted resource rebuild."

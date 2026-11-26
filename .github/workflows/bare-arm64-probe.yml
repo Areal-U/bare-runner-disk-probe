@@ -84,6 +84,8 @@ name: Bare Personal ARM64 checkpoint build
         value: ${{ jobs.draft-publisher.outputs.relay_no_receipt }}
       frontier_status:
         value: ${{ jobs.compile-probe.outputs.frontier_status }}
+      label_trial_passed:
+        value: ${{ jobs.compile-probe.outputs.label_trial_passed }}
       parent_frontier_verified:
         value: ${{ jobs.compile-probe.outputs.parent_frontier_verified }}
       checkpoint_ordinal:
@@ -143,7 +145,7 @@ jobs:
   compile-probe:
     permissions:
       actions: read
-    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' && (github.ref == 'refs/heads/bare-coexist-v2.0.4' || (github.ref == 'refs/heads/bare-r30-s1-restore-20261126' && github.event_name == 'workflow_dispatch' &&
+    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' && (github.ref == 'refs/heads/bare-coexist-v2.0.4' || (github.ref == 'refs/heads/bare-r30-s1-label-20261127' && github.event_name == 'workflow_dispatch' &&
       fromJSON(toJSON(github.event.inputs)).mode == 'verify-r30-s1' && github.actor == 'Areal-U' && github.run_attempt == '1' &&
       inputs.verify_frontier_only && inputs.segment_ordinal == 2 && inputs.parent_run == '45771045621' && inputs.backend == 'draft')) &&
       inputs.probe == 'checkpoint-production' && (github.run_attempt == '1' || inputs.verify_frontier_only) }}
@@ -156,6 +158,7 @@ jobs:
     outputs:
       relay_stop: ${{ steps.relay_final.outputs.stop }}
       frontier_status: ${{ steps.frontier_finish.outputs.status }}
+      label_trial_passed: ${{ steps.label_resources.outputs.passed }}
       parent_frontier_verified: ${{ steps.frontier.outputs.verified }}
       checkpoint_key: ${{ steps.identity.outputs.key }}
       checkpoint_ordinal: ${{ steps.identity.outputs.ordinal }}
@@ -244,7 +247,7 @@ jobs:
             [[ $R28_PARENT_MANIFEST == 795559195 && $R28_PARENT_MANIFEST_SHA == f48700364b590b28188715d565d564b1afba5d5d90df1e4b98efa5cef04971c8 ]]
             mode=$(jq -er '.inputs.mode' "$GITHUB_EVENT_PATH")
             case "$GITHUB_REF,$mode,$VERIFY_FRONTIER_ONLY" in
-              refs/heads/bare-r30-s1-restore-20261126,verify-r30-s1,true|refs/heads/bare-coexist-v2.0.4,build-apk,false) ;;
+              refs/heads/bare-r30-s1-label-20261127,verify-r30-s1,true|refs/heads/bare-coexist-v2.0.4,build-apk,false) ;;
               *) exit 1 ;;
             esac
           else
@@ -256,7 +259,7 @@ jobs:
         if [[ $CHECKPOINT_BACKEND == draft ]]; then
           [[ $GITHUB_RUN_ATTEMPT == 1 && $GITHUB_ACTOR == Areal-U ]]
           if [[ $GITHUB_REF != refs/heads/bare-coexist-v2.0.4 ]]; then
-            [[ $GITHUB_REF == refs/heads/bare-r30-s1-restore-20261126 && $R28_PARENT_RUN == 45771045621 && $SEGMENT_ORDINAL == 2 && $VERIFY_FRONTIER_ONLY == true ]]
+            [[ $GITHUB_REF == refs/heads/bare-r30-s1-label-20261127 && $R28_PARENT_RUN == 45771045621 && $SEGMENT_ORDINAL == 2 && $VERIFY_FRONTIER_ONLY == true ]]
           fi
           [[ $SEGMENT_ORDINAL =~ ^([1-9]|1[0-3])$ ]]
           if (( SEGMENT_ORDINAL == 1 )); then [[ -z $R28_PARENT_MANIFEST || $R28_PARENT_MANIFEST == 0 ]]; [[ -z $R28_PARENT_MANIFEST_SHA ]];
@@ -1180,7 +1183,7 @@ jobs:
         touch /exchange/checkpoint/reuse-verified
         CONTAINER
     - name: Reject changed inputs on the restored candidate
-      if: ${{ github.ref == 'refs/heads/bare-r30-s1-restore-20261126' && inputs.verify_frontier_only && inputs.parent_run == '45771045621' }}
+      if: ${{ github.ref == 'refs/heads/bare-r30-s1-label-20261127' && inputs.verify_frontier_only && inputs.parent_run == '45771045621' }}
       timeout-minutes: 4
       run: |
         set -euo pipefail
@@ -1225,6 +1228,21 @@ jobs:
           tail -n 1 exchange/checkpoint/frontier-before.log | jq -e '.parent_frontier_verified == true and .pending == 1911'
         fi
         echo "verified=$verified" >> "$GITHUB_OUTPUT"
+    - name: Rebuild the linked resource package and verify effective Personal launcher labels
+      id: label_resources
+      if: ${{ github.ref == 'refs/heads/bare-r30-s1-label-20261127' && inputs.verify_frontier_only && inputs.parent_run == '45771045621' && steps.frontier.outputs.verified == 'true' }}
+      timeout-minutes: 30
+      run: |
+        set -euo pipefail
+        cd "$RUNNER_TEMP/bare-official"
+        for source in preflight28/graph/label_resource_trial.py preflight28/graph/personal_label.py preflight28/signing/launcher_labels.py; do
+          install -m 0644 "$GITHUB_WORKSPACE/$source" "exchange/${source##*/}"
+        done
+        docker compose exec -T -e DEPOT_TOOLS_UPDATE=0 -e DEPOT_TOOLS_METRICS=0 chromium-builder bash -euc '
+          cd /work/chromium/src
+          python3 /exchange/label_resource_trial.py --out out/Bare --baseline /exchange/checkpoint/segment-before.json --mode trial
+        '
+        echo "passed=true" >> "$GITHUB_OUTPUT"
     - name: Run the real APK target within its time and output budgets
       id: trial
       if: ${{ startsWith(inputs.probe, 'checkpoint-') && !inputs.verify_frontier_only }}
@@ -2209,7 +2227,7 @@ jobs:
     name: Compile or verify authenticated APK slot ${{ inputs.segment_ordinal }}
   draft-publisher:
     name: Private checkpoint receipt for slot ${{ inputs.segment_ordinal }}
-    if: ${{ inputs.backend == 'draft' && github.event_name == 'workflow_dispatch' && github.repository == 'Areal-U/bare-runner-disk-probe' && (github.ref == 'refs/heads/bare-coexist-v2.0.4' || (github.ref == 'refs/heads/bare-r30-s1-restore-20261126' && github.event_name == 'workflow_dispatch' &&
+    if: ${{ inputs.backend == 'draft' && github.event_name == 'workflow_dispatch' && github.repository == 'Areal-U/bare-runner-disk-probe' && (github.ref == 'refs/heads/bare-coexist-v2.0.4' || (github.ref == 'refs/heads/bare-r30-s1-label-20261127' && github.event_name == 'workflow_dispatch' &&
       fromJSON(toJSON(github.event.inputs)).mode == 'verify-r30-s1' && github.actor == 'Areal-U' && github.run_attempt == '1' &&
       inputs.verify_frontier_only && inputs.segment_ordinal == 2 && inputs.parent_run == '45771045621' && inputs.backend == 'draft'))
       && github.actor == 'Areal-U' && github.run_attempt == '1' && inputs.probe == 'checkpoint-production' && inputs.segment_ordinal >= 1 && inputs.segment_ordinal <=
