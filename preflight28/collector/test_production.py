@@ -92,7 +92,7 @@ class Production(unittest.TestCase):
                       head=self.head,recipient=p.apk_seal.RECIPIENT,release_id=p.RELEASE_ID)
         service="Automation_"+"b"*32
         ticket = dict(**common,initial_parent=p.S2_SHA,owner_destination_id="owner-private-file",collector_registration_id=service)
-        t=api.write(p.CAMPAIGN+"-collection-registration.json",ticket,owner=True)
+        t=api.write(p.TICKET_NAME,ticket,owner=True)
         locator=dict(ticket_asset_id=t["id"],ticket_sha=t["digest"][7:],head=self.head,registration_id=service,owner_destination_id=ticket["owner_destination_id"])
         g=api.write(p.CLAIM,dict(**common,initial_parent=p.S2_SHA,run_id=9,producer_attempt=1,registration_id=service,ticket_asset_id=t["id"],ticket_sha=t["digest"][7:]))
         self.assertEqual(p.bind(api,api.rows,locator)[:3],(9,9,g["id"]))

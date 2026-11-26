@@ -242,7 +242,7 @@ def operation(helper, env, event, mode, now):
                     branch=BASE_REF,head=head,release_id=RELEASE_ID,recipient=reg.RECIPIENT)
     genesis, source_claim, _, _ = named(api,release,reg.CLAIM)
     fields(genesis,dict(**expected,run_id=origin,producer_attempt=1,initial_parent=S2_SHA))
-    initial, tid, tsha, _ = named(api,release,reg.CAMPAIGN+"-collection-registration.json",owner=True)
+    initial, tid, tsha, _ = named(api,release,reg.TICKET_NAME,owner=True)
     fields(genesis,dict(ticket_asset_id=tid,ticket_sha=tsha,registration_id=initial["collector_registration_id"]))
     fields(initial,dict(**expected,initial_parent=S2_SHA))
     ticket, aid, digest, issued = named(api,release,f"{reg.CAMPAIGN}-loss-{origin}.json",owner=True)

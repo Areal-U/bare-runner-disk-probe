@@ -36,7 +36,7 @@ class Service(OwnerDraft):
         aid, sha = self.add(loss.reg.CAMPAIGN+"-collector-ack-"+self.ack["registration_nonce"]+".json",
                             self.ack,812,"prior")
         self.ticket.update(collector_ack_asset_id=aid,collector_ack_sha=sha)
-        aid, sha = self.add(loss.reg.CAMPAIGN+"-collection-registration.json",self.ticket,901,"prior")
+        aid, sha = self.add(loss.reg.TICKET_NAME,self.ticket,901,"prior")
         common = {key:self.ticket[key] for key in
                   ("schema","campaign","repository_id","workflow","branch","head","release_id","recipient")}
         self.add(loss.reg.CLAIM,dict(common,run_id=RUN,producer_attempt=1,initial_parent=loss.S2_SHA,

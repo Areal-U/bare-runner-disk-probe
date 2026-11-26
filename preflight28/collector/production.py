@@ -19,7 +19,7 @@ import apk_seal
 from admission import BASE_REF, PagedOwnerDraft, RELEASE_ID, REPO, REPO_ID, S2_SHA, require
 import receipt_journal as journal
 import recover
-from registration import CAMPAIGN, CLAIM, OWNER, WORKFLOW
+from registration import CAMPAIGN, CLAIM, TICKET_NAME, OWNER, WORKFLOW
 
 REPLACEMENT = CAMPAIGN + "-loss-replacement-claim.json"
 DRAFT_JOB = "Deliver the verified cache-only terminal ciphertext to the original owner Draft"
@@ -111,7 +111,7 @@ def private_document(api, row, *, owner=False):
 
 
 def bind(api, rows, locator):
-    ticket_row = private_row(rows, CAMPAIGN + "-collection-registration.json")
+    ticket_row = private_row(rows, TICKET_NAME)
     require(ticket_row["id"] == locator["ticket_asset_id"] and
             ticket_row["digest"] == "sha256:" + locator["ticket_sha"], "Different registered ticket")
     ticket = private_document(api, ticket_row, owner=True)

@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
-from registration import BASE_REF, CAMPAIGN, CLAIM, OWNER, RECIPIENT, RELEASE_ID, REPO, REPO_ID, S2_SHA, WORKFLOW, bind
+from registration import BASE_REF, CAMPAIGN, CLAIM, FIRST_HEAD, FIRST_JOBS, FIRST_RUN, TICKET_NAME, OWNER, RECIPIENT, RELEASE_ID, REPO, REPO_ID, S2_SHA, WORKFLOW, bind
 
 
 class OwnerDraft:
@@ -26,20 +26,28 @@ class OwnerDraft:
                            collector_ack_asset_id=812,collector_ack_sha=hashlib.sha256(self.data(812)).hexdigest())
         self.ack_asset = dict(name=CAMPAIGN+"-collector-ack-"+self.ticket["registration_nonce"]+".json",id=812,
                               created_at="2026-11-25T00:59:00Z")
-        self.asset = dict(name=CAMPAIGN+"-collection-registration.json",id=901,uploader=OWNER,created_at="2026-11-25T01:00:00Z")
+        self.asset = dict(name=TICKET_NAME,id=901,uploader=OWNER,created_at="2026-11-25T01:00:00Z")
         from registration import PREVIOUS_CAMPAIGN, PREVIOUS_HEAD
         self.prior = dict(self.ticket, campaign=PREVIOUS_CAMPAIGN, head=PREVIOUS_HEAD,
             collector_registration_id="Automation_"+"2"*32, registration_nonce="3"*32)
+        self.first = dict(self.ticket,head=FIRST_HEAD,registration_nonce="6"*32,collector_ack_sha="7"*64)
+        self.first_jobs = [dict(id=i, run_id=FIRST_RUN, run_attempt=1, head_sha=FIRST_HEAD, status="completed", conclusion=c)
+                           for i,c in {**FIRST_JOBS,40:"skipped"}.items()]
         self.origin = dict(id=81,run_attempt=1,head_sha="a"*40,path=WORKFLOW,event="workflow_dispatch",
                            head_branch=BASE_REF,actor=OWNER,repository={"id":REPO_ID},head_repository={"id":REPO_ID},
                            created_at="2026-11-25T01:03:00Z")
-    def data(self,n=901): return json.dumps(self.prior if n==700 else self.ticket if n==901 else self.ack).encode()
+    def data(self,n=901): return json.dumps(self.prior if n==700 else self.first if n==701 else self.ticket if n==901 else self.ack).encode()
     def draft(self, rid):
         assert rid == RELEASE_ID
-        return {"assets":[dict(self.asset,size=len(self.data()),digest="sha256:"+hashlib.sha256(self.data()).hexdigest()),dict(self.ack_asset,size=len(self.data(812))), dict(name=self.prior["campaign"]+"-collection-registration.json",id=700,state="uploaded",uploader=OWNER,size=len(self.data(700)),digest="sha256:"+hashlib.sha256(self.data(700)).hexdigest())]}
+        return {"assets":[dict(self.asset,size=len(self.data()),digest="sha256:"+hashlib.sha256(self.data()).hexdigest()),dict(self.ack_asset,size=len(self.data(812))), dict(name=CAMPAIGN+"-collection-registration.json",id=701,state="uploaded",uploader=OWNER,size=len(self.data(701)),digest="sha256:"+hashlib.sha256(self.data(701)).hexdigest()), dict(name=self.prior["campaign"]+"-collection-registration.json",id=700,state="uploaded",uploader=OWNER,size=len(self.data(700)),digest="sha256:"+hashlib.sha256(self.data(700)).hexdigest())]}
     def asset_info(self, release, name, size, sha, aid):
-        assert len(self.data(aid)) == size and aid in (901,812,700)
+        assert len(self.data(aid)) == size and aid in (901,812,700,701)
     def metadata(self, path):
+        first = f"{self.BASE}/actions/runs/{FIRST_RUN}/attempts/1"
+        if path == first:
+            return dict(self.origin,id=FIRST_RUN,head_sha=FIRST_HEAD,conclusion="failure",status="completed")
+        if path == first+"/jobs?per_page=100":
+            return dict(total_count=len(self.first_jobs),jobs=self.first_jobs)
         if path == "/repos/"+REPO:
             return dict(id=REPO_ID,full_name=REPO,private=False,fork=False,visibility="public")
         if "/actions/runs?status=" in path:
@@ -55,6 +63,9 @@ class OwnerDraft:
 class TicketTests(unittest.TestCase):
     def setUp(self):
         self.d = OwnerDraft()
+        first = patch("registration.FIRST_TICKET_SHA", hashlib.sha256(self.d.data(701)).hexdigest())
+        first.start()
+        self.addCleanup(first.stop)
         prior = patch("registration.PREVIOUS_TICKET_SHA", hashlib.sha256(self.d.data(700)).hexdigest())
         prior.start()
         self.addCleanup(prior.stop)
@@ -73,8 +84,8 @@ class TicketTests(unittest.TestCase):
 
             def __init__(self):
                 super().__init__()
-                ticket, ack, prior = super().draft(RELEASE_ID)["assets"]
-                self.assets = [dict(id=i, name="old-"+str(i)) for i in range(1,101)] + [ticket, ack, prior]
+                ticket, ack, first, prior = super().draft(RELEASE_ID)["assets"]
+                self.assets = [dict(id=i, name="old-"+str(i)) for i in range(1,101)] + [ticket, ack, first, prior]
                 self.assets.extend(dict(id=i, name="old-"+str(i)) for i in range(101,199))
                 self.posts = 0
                 self.pages = []
@@ -205,6 +216,23 @@ class TicketTests(unittest.TestCase):
             with self.subTest(change=change), patch.dict(self.d.ticket,change), self.assertRaises(ValueError):
                 self.enter()
         with patch.dict(self.d.prior,campaign="foreign"), self.assertRaises(ValueError):
+            self.enter()
+        claim.assert_not_called()
+
+    @patch("registration.admit")
+    def test_reissue_keeps_original_collector_and_consumption_limits(self, claim):
+        for change in [dict(collector_registration_id="Automation_"+"8"*32), dict(registration_nonce="6"*32),
+                       dict(collector_ack_sha="7"*64), dict(artifact_ceiling_bytes=11*1024**3),
+                       dict(storage_valid_until="2028-01-01T00:00:00Z"), dict(expires_at="2028-01-01T00:00:00Z")]:
+            with self.subTest(change=change), patch.dict(self.d.ticket,change), self.assertRaises(ValueError):
+                self.enter()
+        claim.assert_not_called()
+
+    @patch("registration.admit")
+    def test_reissue_refuses_another_runnable_job_or_missing_failed_binder(self, claim):
+        with patch.dict(self.d.first_jobs[-1],conclusion="success"), self.assertRaisesRegex(ValueError, "closure"):
+            self.enter()
+        with patch.dict(self.d.first_jobs[1],conclusion="skipped"), self.assertRaisesRegex(ValueError, "closure"):
             self.enter()
         claim.assert_not_called()
 
