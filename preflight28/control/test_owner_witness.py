@@ -48,7 +48,7 @@ class Witness(unittest.TestCase):
                          branch=w.BASE_REF,head=self.env["GITHUB_SHA"],recipient=apk_seal.RECIPIENT,release_id=w.RELEASE_ID)
         self.service="Automation_"+"1"*32
         self.dest="private-owner-destination-no-public"
-        self.ticket=self.docs.add(w.CAMPAIGN+"-collection-registration.json",dict(**self.common,
+        self.ticket=self.docs.add(w.TICKET_NAME,dict(**self.common,
                                   initial_parent=w.owner.S2_SHA,collector_registration_id=self.service,
                                   owner_destination_id=self.dest),owner=True)
         self.claim=self.docs.add(w.CLAIM,dict(**self.common,initial_parent=w.owner.S2_SHA,registration_id=self.service,

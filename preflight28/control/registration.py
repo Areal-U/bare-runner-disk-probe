@@ -14,6 +14,11 @@ CAMPAIGN = "bare-personal-204-r30"
 PREVIOUS_CAMPAIGN = "bare-personal-204-r29"
 PREVIOUS_HEAD = "5737dcb88171dea54566bf4202d3d17092a1d176"
 PREVIOUS_TICKET_SHA = "d6be078c59a3ab8c56ab928a8c0e183d76f39ddccba241586b676f2bfe49568a"
+TICKET_NAME = CAMPAIGN + "-preclaim-1-collection-registration.json"
+FIRST_TICKET_SHA = "c0a5b7fa88bc91bc616ac9c2f5fbf89054f5c34798206ed0ac744b6c0835d816"
+FIRST_HEAD = "172a2b3e608632cf1e9155d866427456cdb4197c"
+FIRST_RUN = 45763502309
+FIRST_JOBS = {139718818153: "success", 139718863397: "failure", 139718917585: "failure"}
 CLAIM = CAMPAIGN + "-production-run-claim.json"
 WORKFLOW = ".github/workflows/bare-checkpoint-transfer.yml"
 OWNER = {"id": 292261483, "login": "Areal-U"}
@@ -26,21 +31,24 @@ def instant(value):
 
 
 
-def same_owner_as_previous(helper, release, ticket):
-    """Check the immutable earlier owner reservation before staging a new physical claim."""
-    earlier_name = PREVIOUS_CAMPAIGN + "-collection-registration.json"
+def read_prior_ticket(helper, release, earlier_name, digest):
     found = [row for row in release["assets"] if row["name"] == earlier_name]
     require(len(found) == 1, "Prior owner ticket missing or ambiguous")
     row = found[0]
     require(type(row["id"]) is int and row["id"] > 0 and row["state"] == "uploaded" and
-            0 < row["size"] <= 4096 and row["digest"] == "sha256:" + PREVIOUS_TICKET_SHA and
+            0 < row["size"] <= 4096 and row["digest"] == "sha256:" + digest and
             all(row["uploader"].get(k) == v for k, v in OWNER.items()), "Unconfirmed prior owner ticket")
-    helper.asset_info(release, earlier_name, row["size"], PREVIOUS_TICKET_SHA, row["id"])
+    helper.asset_info(release, earlier_name, row["size"], digest, row["id"])
     raw = io.BytesIO()
-    helper.download(row["id"], row["size"], PREVIOUS_TICKET_SHA, raw)
-    require(len(raw.getvalue()) == row["size"] and hashlib.sha256(raw.getvalue()).hexdigest() == PREVIOUS_TICKET_SHA,
+    helper.download(row["id"], row["size"], digest, raw)
+    require(len(raw.getvalue()) == row["size"] and hashlib.sha256(raw.getvalue()).hexdigest() == digest,
             "Prior owner ticket changed")
-    prior = json.loads(raw.getvalue())
+    return json.loads(raw.getvalue())
+
+
+def same_owner_as_previous(helper, release, ticket):
+    """Keep the prior campaign's owner binding and the same R30 collector on reissue."""
+    prior = read_prior_ticket(helper, release, PREVIOUS_CAMPAIGN + "-collection-registration.json", PREVIOUS_TICKET_SHA)
     fields = dict(schema=1, campaign=PREVIOUS_CAMPAIGN, head=PREVIOUS_HEAD,
                   initial_parent=S2_SHA, repository_id=REPO_ID, release_id=RELEASE_ID,
                   workflow=WORKFLOW, branch=BASE_REF, recipient=RECIPIENT)
@@ -49,6 +57,33 @@ def same_owner_as_previous(helper, release, ticket):
             prior["registration_nonce"] != ticket["registration_nonce"] and
             prior["collector_registration_id"] != ticket["collector_registration_id"] and
             prior["head"] != ticket["head"], "Changed destination or reused prior owner registration")
+
+    first = read_prior_ticket(helper, release, CAMPAIGN + "-collection-registration.json", FIRST_TICKET_SHA)
+    expected = dict(fields, campaign=CAMPAIGN, head=FIRST_HEAD)
+    same = ("collector_registration_id", "owner_destination_id", "storage_policy", "artifact_ceiling_bytes",
+            "storage_valid_until", "expires_at")
+    require(all(first.get(k) == v for k, v in expected.items()) and
+            all(first[k] == ticket.get(k) for k in same) and first["head"] != ticket["head"] and
+            first["registration_nonce"] != ticket["registration_nonce"] and
+            first["collector_ack_sha"] != ticket["collector_ack_sha"], "Invalid R30 pre-claim reissue or changed storage policy")
+
+
+def check_first_run(helper):
+    """The single earlier physical attempt failed in admission and performed no build work."""
+    base = f"{helper.BASE}/actions/runs/{FIRST_RUN}/attempts/1"
+    run = helper.metadata(base)
+    require(run["id"] == FIRST_RUN and run["run_attempt"] == 1 and run["head_sha"] == FIRST_HEAD and
+            run["repository"]["id"] == run["head_repository"]["id"] == REPO_ID and
+            run["event"] == "workflow_dispatch" and run["path"] == WORKFLOW and run["head_branch"] == BASE_REF and
+            all(run["actor"].get(k) == v for k, v in OWNER.items()) and
+            run["status"] == "completed" and run["conclusion"] == "failure", "Prior R30 attempt still open or foreign")
+    page = helper.metadata(base + "/jobs?per_page=100")
+    jobs = page["jobs"]
+    require(0 < len(jobs) == page["total_count"] <= 100 and len({j["id"] for j in jobs}) == len(jobs) and
+            all(j["run_id"] == FIRST_RUN and j["run_attempt"] == 1 and j["head_sha"] == FIRST_HEAD and
+                j["status"] == "completed" for j in jobs) and
+            {j["id"]: j["conclusion"] for j in jobs if j["conclusion"] != "skipped"} == FIRST_JOBS,
+            "Unconfirmed pre-claim closure or prior compute job")
 
 
 def checked_ack(helper, release, ticket, created, now):
@@ -129,7 +164,7 @@ def bind(helper, env, event, now, *, verify_only=False):
             and api["repository"]["id"] == api["head_repository"]["id"] == REPO_ID, "Unconfirmed physical run")
     helper = PagedOwnerDraft(helper)
     release = helper.draft(RELEASE_ID)
-    expected_name = CAMPAIGN + "-collection-registration.json"
+    expected_name = TICKET_NAME
     found = [x for x in release["assets"] if x.get("name") == expected_name]
     require(len(found) == 1, "Expected one owner collection ticket for this campaign")
     asset = found[0]
@@ -151,6 +186,8 @@ def bind(helper, env, event, now, *, verify_only=False):
     require(all(ticket.get(k) == v for k,v in expected.items()),
             "Registration belongs to another campaign, owner, revision or initial parent")
     same_owner_as_previous(helper, release, ticket)
+    if not verify_only:
+        check_first_run(helper)
     service = ticket["collector_registration_id"]
     require(re.fullmatch(r"Automation_[0-9a-f]{32}", service), "A separately registered collection target is required")
     created, issued, expires = instant(api["created_at"]), instant(ticket["issued_at"]), instant(ticket["expires_at"])

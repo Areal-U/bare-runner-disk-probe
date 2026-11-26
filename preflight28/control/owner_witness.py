@@ -10,7 +10,7 @@ import sys
 import time
 
 from admission import BASE_REF, PagedOwnerDraft, RELEASE_ID, REPO, require
-from registration import CAMPAIGN, CLAIM, OWNER
+from registration import CAMPAIGN, CLAIM, TICKET_NAME, OWNER
 import apk_seal
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "collector"))
@@ -30,7 +30,7 @@ def row_info(row, *, owner_issued):
 
 
 def claim_items(api, rows, run, head, job, expected_id):
-    initial = owner.private_row(rows,CAMPAIGN+"-collection-registration.json")
+    initial = owner.private_row(rows,TICKET_NAME)
     ticket = owner.private_document(api,initial,owner=True)
     locator = dict(head=head,ticket_asset_id=initial["id"],ticket_sha=initial["digest"][7:],
                    owner_destination_id=ticket["owner_destination_id"],registration_id=ticket["collector_registration_id"])
