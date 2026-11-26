@@ -107,33 +107,118 @@ def public_host(repository, runner):
             "Public non-fork R28 repository and the fixed standard hosted runner are required")
 
 
-def receipt_rows(get):
-    def listing():
-        rows = {}
-        total = None
-        for page in range(1, 52):
-            data = get(f"{BASE}/actions/artifacts?per_page=100&page={page}")
-            count, batch = data["total_count"], data["artifacts"]
-            require(type(count) is int and 0 <= count <= 5000 and isinstance(batch, list)
-                    and len(batch) <= 100 and (total is None or count == total),
-                    "Unstable or incomplete repository Artifact inventory")
-            total = count
-            for item in batch:
-                aid, size, expires = item["id"], item["size_in_bytes"], item["expires_at"]
-                integer(aid, "Artifact ID")
-                require(aid not in rows and type(size) is int and size >= 0
-                        and type(item["expired"]) is bool and isinstance(expires, str)
-                        and expires.endswith("Z") and isinstance(item.get("name"), str),
-                        "Ambiguous Artifact size, ID or expiration")
-                rows[aid] = (size, int(datetime.fromisoformat(expires[:-1]+"+00:00").timestamp()),
-                             item["expired"], item["name"])
-            if len(batch) < 100:
-                require(len(rows) == total, "Incomplete repository Artifact inventory")
+# Different legal layouts provide independent page responses when a cached
+# total_count lags expiry. Every accepted layout must be complete on its own.
+ARTIFACT_PAGE_SIZES = (100, 99, 50, 20, 97, 89)
+MAX_ARTIFACTS = 5000
+INVENTORY_SECONDS = 60
+
+
+def artifact_receipt(row):
+    require(isinstance(row, dict), "Invalid Artifact inventory row")
+    aid, size, expires = row.get("id"), row.get("size_in_bytes"), row.get("expires_at")
+    integer(aid, "Artifact ID")
+    require(type(size) is int and size >= 0 and type(row.get("expired")) is bool
+            and isinstance(expires, str) and expires.endswith("Z") and isinstance(row.get("name"), str),
+            f"Invalid Artifact size, expiration or name for ID {aid}")
+    expiry = int(datetime.fromisoformat(expires[:-1]+"+00:00").timestamp())
+    return aid, (size, expiry, row["expired"], row["name"])
+
+
+def artifact_view(get, per_page, observed):
+    rows = {}
+    initial = None
+    changed_total = False
+    count_changes = []
+    duplicate_ids = set()
+    for page in range(1, MAX_ARTIFACTS // per_page + 2):
+        data = get(f"{BASE}/actions/artifacts?per_page={per_page}&page={page}")
+        require(isinstance(data, dict), "Invalid Artifact inventory response")
+        total, batch = data.get("total_count"), data.get("artifacts")
+        require(type(total) is int and 0 <= total <= MAX_ARTIFACTS and
+                isinstance(batch, list) and len(batch) <= per_page,
+                f"Invalid Artifact pagination at per_page={per_page} page={page}")
+        if initial is None:
+            initial = total
+        changed_total |= initial != total
+        if initial != total and len(count_changes) < 5:
+            count_changes.append([page, total])
+        for row in batch:
+            aid, receipt = artifact_receipt(row)
+            if aid in rows:
+                duplicate_ids.add(aid)
+            if aid in observed and observed[aid] != row:
+                fields = sorted(key for key in observed[aid].keys() | row.keys() if
+                                key not in observed[aid] or key not in row or observed[aid][key] != row[key])
+                raise StorageUnconfirmed(f"Artifact inventory still settling: ID {aid} changed metadata "
+                                         f"{fields[:6]} at per_page={per_page} page={page}")
+            observed[aid] = row
+            rows[aid] = receipt
+        require(len(observed) <= MAX_ARTIFACTS, "Artifact observation exceeds the repository inventory bound")
+        if len(batch) < per_page:
+            complete = not changed_total and not duplicate_ids and len(rows) == total
+            print("R28_ARTIFACT_VIEW " + json.dumps(dict(per_page=per_page, pages=page, first_total=initial,
+                  last_total=total, unique=len(rows), last_page_rows=len(batch), count_changes=count_changes,
+                  duplicates=sorted(duplicate_ids)[:5], complete=complete)), flush=True)
+            return rows if complete else None
+    raise StorageUnconfirmed(f"Artifact inventory did not terminate within the bound at per_page={per_page}")
+
+
+def receipt_rows(get, *, run_id=None):
+    observed = {}
+    previous = None
+    consecutive = False
+    def expired(*_):
+        raise StorageUnconfirmed(f"Artifact inventory deadline {INVENTORY_SECONDS}s reached with "
+                                 f"{len(observed)} observed IDs")
+    # The caller's shorter alarm remains in force. Bound even a blocked GET.
+    old_timer = signal.getitimer(signal.ITIMER_REAL)
+    install_alarm = not old_timer[0] or old_timer[0] > INVENTORY_SECONDS
+    began = time.monotonic()
+    if install_alarm:
+        old_handler = signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, INVENTORY_SECONDS)
+    try:
+        for per_page in ARTIFACT_PAGE_SIZES:
+            if len(observed) > 100 and per_page < 80:
+                continue  # Keep full scans of large repositories near 100 rows per request.
+            rows = artifact_view(get, per_page, observed)
+            if rows is None:
+                consecutive = False
+                continue
+            if previous is not None and previous != rows:
+                missing = previous.keys() - rows.keys()
+                added = rows.keys() - previous.keys()
+                # Two workers of our own run can finish a control upload while
+                # reading. Count all its new rows and require a new full witness.
+                other = []
+                for aid in added:
+                    source = observed[aid].get("workflow_run")
+                    if (run_id is None or not isinstance(source, dict) or source.get("id") != run_id
+                            or source.get("repository_id") != REPO_ID or source.get("head_repository_id") != REPO_ID):
+                        other.append(aid)
+                if missing or other or not added:
+                    raise StorageUnconfirmed("Artifact inventory still settling between complete layouts: "
+                                             f"differing IDs, missing={sorted(missing)[:5]}, "
+                                             f"unbound additions={sorted(other)[:5]}")
+                print(f"Artifact inventory grew by {len(added)} bound rows from run {run_id}; "
+                      "requiring another complete view", flush=True)
+            elif previous is not None and consecutive:
+                missing = observed.keys() - rows.keys()
+                require(not missing, f"Complete Artifact layouts omit {len(missing)} previously observed "
+                                     f"IDs: {sorted(missing)[:5]}")
                 return rows
-        raise StorageUnconfirmed("Unbounded repository Artifact inventory")
-    first = listing()
-    require(first == listing(), "Repository Artifact inventory is still settling")
-    return first
+            previous = rows
+            consecutive = True
+        raise StorageUnconfirmed("Incomplete repository Artifact inventory: no two consecutive independent "
+                                 f"complete layouts agreed ({len(observed)} distinct observed IDs)")
+    finally:
+        if install_alarm:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_handler)
+            if old_timer[0]:
+                remaining = max(0.000001, old_timer[0] - (time.monotonic() - began))
+                signal.setitimer(signal.ITIMER_REAL, remaining, old_timer[1])
 
 
 ACTIVE_STATES = ("in_progress", "queued", "waiting", "pending", "requested")
@@ -201,7 +286,10 @@ def check_active_runs(get, env):
 
 def admit(get, env, size, days, *, stage, now=None, lead=0, exact_name=None):
     ceiling, until = config(env)
-    now = int(time.time() if now is None else now)
+    live_clock = now is None
+    started = time.monotonic()
+    initial_time = time.time() if live_clock else now
+    now = int(initial_time)
     integer(size, "incoming ZIP bytes")
     require(days in (1,3,JOURNAL_DAYS) and lead in (0,350*60), "Unrecognized Artifact lifetime")
     guarantee_days = max(days, JOURNAL_DAYS) if stage == "lease" else days
@@ -215,7 +303,13 @@ def admit(get, env, size, days, *, stage, now=None, lead=0, exact_name=None):
     # expired rows still exposed by GitHub. Do not spend today's space in
     # anticipation of an expiry or assume a second run's unfinished upload is 0.
     check_active_runs(get, env)
-    rows = receipt_rows(get)
+    rows = receipt_rows(get, run_id=int(env["GITHUB_RUN_ID"]))
+    # Inventory recovery can cross an eligibility boundary while reading. Check
+    # competing runs and the owner's retention grant again at the write decision.
+    check_active_runs(get, env)
+    now = int(time.time() if live_clock else initial_time + (time.monotonic() - started))
+    require(until >= now + lead + dispatch_margin + guarantee_days * DAY,
+            "Storage policy expired during the Artifact inventory check")
     visible = sum(row[0] for row in rows.values())
     expiring = sum(row[0] for row in rows.values() if row[2] or row[1] <= now)
     projected = visible + size + CONTROL_RESERVE
