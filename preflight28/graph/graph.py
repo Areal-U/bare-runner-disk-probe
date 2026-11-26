@@ -132,7 +132,7 @@ def dirty_target_details(logdir, edges):
     return report
 
 
-def run(out, command, targets, *, dry, noop=False, plan_rules=None):
+def run(out, command, targets, *, dry, noop=False, plan_rules=None, isolated_logs=False, timeout_seconds=600):
     start = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="bare28-plan-") as name:
         tmp = Path(name)
@@ -149,10 +149,14 @@ def run(out, command, targets, *, dry, noop=False, plan_rules=None):
                     shutil.copy2(path, state / basename)
             args.extend(["-n", "-state_dir", os.path.relpath(state, out),
                          "-log_dir", str(tmp / "logs")])
+        elif isolated_logs:
+            # Migration changes real build outputs and state, but its ephemeral
+            # Siso metrics/log rotation must not replace authenticated payload.
+            args.extend(["-log_dir", str(tmp / "logs")])
         with (tmp / "console").open("w+b") as console:
             with preserve_ninja_log(out) if (dry or noop) else contextlib.nullcontext():
                 process = subprocess.run([*args, *targets], stdout=console,
-                                         stderr=subprocess.STDOUT, timeout=600, check=False)
+                                         stderr=subprocess.STDOUT, timeout=timeout_seconds, check=False)
                 console.seek(max(0, console.tell() - 8192))
                 tail = console.read()
             counts = END.findall(tail)
