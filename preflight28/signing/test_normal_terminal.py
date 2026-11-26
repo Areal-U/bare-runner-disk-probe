@@ -122,9 +122,23 @@ def normal_binding(registration_dir, workflows):
         def __init__(self):
             self.values={}
             self.writes=0
+            self.values[54]=json.dumps(dict(ticket,head=gate.FIRST_HEAD,registration_nonce="a"*40,
+                                            collector_ack_sha="b"*64)).encode()
+            self.values[55]=json.dumps(dict(ticket,campaign=gate.PREVIOUS_CAMPAIGN,head=gate.PREVIOUS_HEAD,
+                                           collector_registration_id="Automation_"+"2"*32,
+                                           registration_nonce="e"*40)).encode()
             self.ticket_created="2026-11-25T00:00:00Z"
             self.ack_created="2026-11-24T23:50:00Z"
         def metadata(self,path):
+            first = f"{self.BASE}/actions/runs/{gate.FIRST_RUN}/attempts/1"
+            if path == first:
+                return dict(id=gate.FIRST_RUN,run_attempt=1,head_sha=gate.FIRST_HEAD,path=gate.WORKFLOW,
+                            event="workflow_dispatch",head_branch=gate.BASE_REF,actor=gate.OWNER,
+                            repository=dict(id=gate.REPO_ID),head_repository=dict(id=gate.REPO_ID),
+                            status="completed",conclusion="failure")
+            if path == first+"/jobs?per_page=100":
+                return dict(total_count=len(gate.FIRST_JOBS),jobs=[dict(id=k,run_id=gate.FIRST_RUN,run_attempt=1,
+                            head_sha=gate.FIRST_HEAD,status="completed",conclusion=v) for k,v in gate.FIRST_JOBS.items()])
             if path == "/repos/"+gate.REPO:
                 return dict(id=gate.REPO_ID,full_name=gate.REPO,private=False,fork=False,visibility="public")
             if "/actions/runs?status=" in path:
@@ -139,11 +153,12 @@ def normal_binding(registration_dir, workflows):
         def draft(self,_):
             self.values[51]=json.dumps(ticket).encode()
             self.values[53]=json.dumps(ack).encode()
-            names={51:gate.CAMPAIGN+"-collection-registration.json",52:gate.CLAIM,
+            names={54:gate.CAMPAIGN+"-collection-registration.json",55:gate.PREVIOUS_CAMPAIGN+"-collection-registration.json",
+                   51:gate.TICKET_NAME,52:gate.CLAIM,
                    53:gate.CAMPAIGN+"-collector-ack-"+ticket["registration_nonce"]+".json"}
             return dict(assets=[dict(id=k,size=len(v),name=names[k],digest="sha256:"+hashlib.sha256(v).hexdigest(),
                                      created_at=self.ack_created if k==53 else self.ticket_created,
-                                     uploader=gate.OWNER) for k,v in self.values.items()])
+                                     state="uploaded",uploader=gate.OWNER) for k,v in self.values.items()])
         def asset_info(self,release,name,length,digest,asset_id=None):
             found=[a for a in release["assets"] if a["name"]==name]
             assert len(found)==1
@@ -164,7 +179,9 @@ def normal_binding(registration_dir, workflows):
         env["GITHUB_JOB"]="collection-lease" if verify_only else "bind-private-receiver"
         ticket["collector_ack_sha"]=hashlib.sha256(json.dumps(ack).encode()).hexdigest()
         env["REGISTRATION_SHA"]=hashlib.sha256(json.dumps(ticket).encode()).hexdigest()
-        return gate.bind(helper,env,event,now,verify_only=verify_only)
+        with patch.object(gate,"FIRST_TICKET_SHA",hashlib.sha256(helper.values[54]).hexdigest()), \
+             patch.object(gate,"PREVIOUS_TICKET_SHA",hashlib.sha256(helper.values[55]).hexdigest()):
+            return gate.bind(helper,env,event,now,verify_only=verify_only)
 
     helper.ticket_created="2026-11-25T00:11:00Z"
     expect_reject(bind,"prepared after run")
@@ -179,7 +196,7 @@ def normal_binding(registration_dir, workflows):
     with patch.dict(ack,registration_nonce="0"*40):
         expect_reject(bind,"disagrees with owner ticket: registration_nonce")
     with patch.dict(ticket,collector_ack_asset_id=99):
-        expect_reject(bind,"acknowledgement is unavailable")
+        expect_reject(bind,"Different pinned collector ACK ID")
     expect_reject(lambda:bind(verify_only=True),"No first-attempt receipt to recover")
     assert helper.writes==0
     end=min(gate.instant(ack["valid_until"]),gate.instant(ticket["expires_at"]))
