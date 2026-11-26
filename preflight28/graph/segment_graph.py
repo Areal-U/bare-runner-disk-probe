@@ -205,7 +205,8 @@ def begin(out, baseline, parent_sha, command, *, bootstrap=False, verify_only=Fa
         verified = False
     else:
         raise ValueError("successor lacks an independent progress receipt")
-    if not verify_only:
+    # The fixed restart trial must verify the same pending contracts as its later compute run.
+    if not verify_only or parent_sha == angle_restore.S1_SHA:
         stage('pending-output-contract', parent_sha256=parent_sha, graph=graph)
         started = time.monotonic()
         checked = verify_pending_contract(out, observed, rules, parent_sha=parent_sha, graph=graph)
