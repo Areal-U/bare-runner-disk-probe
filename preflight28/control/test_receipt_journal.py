@@ -246,7 +246,8 @@ class JournalTests(unittest.TestCase):
         self.assertIn("receipt_journal.py",recovery["steps"][0]["run"])
         self.assertEqual(recovery["permissions"],{"actions":"read"})
         self.assertIn("verify-terminal",recovery["steps"][-1]["run"])
-        self.assertIn("needs.slot01.result == 'success'",caller["jobs"]["slot02"]["if"])
+        self.assertIn("needs.bind-private-receiver.result == 'success'",caller["jobs"]["slot02"]["if"])
+        self.assertIn("needs.slot02.result == 'success'",caller["jobs"]["slot03"]["if"])
 
 
 if __name__=="__main__":

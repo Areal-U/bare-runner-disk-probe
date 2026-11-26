@@ -10,7 +10,7 @@ import unittest
 import yaml
 
 from admission import S2_SHA
-from recover import follow, last_private_slot
+from recover import ChainStart, R30_S1_SHA, R30_S1_IDENTITY, follow, last_private_slot
 from recover_private import read_only, recovery_deadline, JOB_NAME, JOB_MINUTES, STEP_MINUTES, EXIT_MINUTES
 from datetime import datetime, timezone
 from unittest.mock import Mock
@@ -43,7 +43,7 @@ def inputs(n=1):
 
 
 def record(needs,n=1,verify=False,backend="cache"):
-    parent = S2_SHA if n == 1 else f"{n-1:064x}"
+    parent = S2_SHA if n == 1 else R30_S1_SHA if n == 2 else f"{n-1:064x}"
     return dispatch(WORKER["jobs"]["result"]["steps"][0]["run"], dict(SLOT_NEEDS=json.dumps(needs),
                     BACKEND=backend,PARENT_SHA=parent,ORDINAL=str(n), VERIFY_ONLY=str(verify).lower()))
 
@@ -52,7 +52,14 @@ class NativeTests(unittest.TestCase):
     def test_normal_action_entry_and_guard(self):
         self.assertEqual(CALLER["on"]["workflow_dispatch"]["inputs"]["build_segments"]["default"],"12")
         self.assertEqual(CALLER["on"]["workflow_dispatch"]["inputs"]["compile_minutes"]["default"],"0")
-        for n in range(1,14):
+        self.assertNotIn("slot01", CALLER["jobs"])
+        first = CALLER["jobs"]["slot02"]
+        self.assertEqual(first["with"]["parent_manifest_id"], "795559195")
+        self.assertEqual(first["with"]["parent_run"], "45771045621")
+        self.assertEqual(first["with"]["parent_sha"], R30_S1_SHA)
+        self.assertEqual(first["with"]["parent_identity"], R30_S1_IDENTITY)
+        self.assertEqual(first["needs"], "bind-private-receiver")
+        for n in range(2,14):
             call=CALLER["jobs"][f"slot{n:02}"]
             self.assertEqual(call["with"]["ordinal"],n)
             self.assertEqual(call["with"]["verify_only"],n==13)
@@ -79,7 +86,7 @@ class NativeTests(unittest.TestCase):
 
     def test_same_run_receipt_only_continuation(self):
         state="manifest_present_visibility_pending"
-        n=inputs();n["read"]["result"]="skipped";o=n["arm"]["outputs"]
+        n=inputs(2);n["read"]["result"]="skipped";o=n["arm"]["outputs"]
         o.update(private_status=state, private_readback_verified="false", checkpoint_saved="false",
                  checkpoint_manifest_id="716",checkpoint_manifest_sha="e"*64,checkpoint_bytes="1024")
         fields=("checkpoint_manifest_id","checkpoint_manifest_sha","checkpoint_sha","checkpoint_identity",
@@ -87,26 +94,26 @@ class NativeTests(unittest.TestCase):
         confirm={k:o[k] for k in fields}
         confirm.update(recovery_status=state,private_readback_verified="false")
         n["confirm-private"]={"result":"success","outputs":confirm}
-        p,ret=record(n,backend="draft")
+        p,ret=record(n,2,backend="draft")
         self.assertEqual(p.returncode,0,p.stderr)
         self.assertEqual((ret["status"],ret["manifest_id"],ret["sha"]),(state,"716",o["checkpoint_sha"]))
-        self.assertEqual(follow([dict(ret,ordinal=1)],77,REV)["status"],state)
+        self.assertEqual(follow([dict(ret,ordinal=2)],77,REV,ChainStart(2,R30_S1_SHA,R30_S1_IDENTITY))["status"],state)
         jobs={f"slot{j:02}":{"result":"skipped","outputs":{}} for j in range(1,14)}
-        jobs["slot01"]={"result":"success","outputs":ret}
+        jobs["slot02"]={"result":"success","outputs":ret}
         terminal=CALLER["jobs"]["terminal-12"]["steps"][0]["run"]
         resolved,_=dispatch(terminal, {"NEEDS":json.dumps(jobs)})
         self.assertNotEqual(resolved.returncode,0)
         self.assertIn("R28_TERMINAL_RECEIPT",resolved.stdout)
         confirm.update(recovery_status="verified",private_readback_verified="true")
-        self.assertEqual(record(n,backend="draft")[1]["status"],"candidate")
+        self.assertEqual(record(n,2,backend="draft")[1]["status"],"candidate")
         for k in fields:
             old=confirm[k]; confirm[k]="wrong"
-            self.assertNotEqual(record(n,backend="draft")[0].returncode,0)
+            self.assertNotEqual(record(n,2,backend="draft")[0].returncode,0)
             confirm[k]=old
         n["confirm-private"]["result"]="failure"
-        self.assertNotEqual(record(n,backend="draft")[0].returncode,0)
+        self.assertNotEqual(record(n,2,backend="draft")[0].returncode,0)
         del n["confirm-private"]
-        self.assertNotEqual(record(n,backend="draft")[0].returncode,0)
+        self.assertNotEqual(record(n,2,backend="draft")[0].returncode,0)
         job=WORKER["jobs"]["confirm-private"]
         self.assertIn(state,job["if"]);self.assertIn("github.run_attempt == '1'",job["if"])
         self.assertEqual(job['needs'],'arm')
@@ -158,7 +165,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual((first["with"]["overwrite"],first["with"]["compression-level"],first["with"]["retention-days"]),
                          (False,0,1))
         self.assertIn("steps.resolve_relay_1.outputs.decision == 'retry'",retry["if"])
-        self.assertIn("== 'candidate'",CALLER["jobs"]["slot02"]["if"])
+        self.assertIn("== 'candidate'",CALLER["jobs"]["slot03"]["if"])
         n=inputs(2); n["read"]["result"]="skipped"; o=n["arm"]["outputs"]
         for reason in ("relay-quota-denied","relay-capacity-exceeded","relay-deadline","relay-missing","relay-ambiguous"):
             o.update(relay_stop=reason,relay_no_receipt="true")
@@ -237,7 +244,7 @@ class NativeTests(unittest.TestCase):
                 self.assertEqual(job["permissions"], {"actions":"read","contents":"write"})
         self.assertEqual(ARM["jobs"]["compile-probe"]["permissions"], {"actions":"read"})
         self.assertEqual(ARM["jobs"]["draft-publisher"]["permissions"], {"actions":"read","contents":"write"})
-        for name in ("slot01", "production"):
+        for name in ("slot02", "production"):
             self.assertIn("bind-private-receiver",CALLER["jobs"][name]["needs"])
             self.assertIn("claim_asset_id",CALLER["jobs"][name]["if"])
 
@@ -282,27 +289,27 @@ class NativeTests(unittest.TestCase):
         self.assertIn("Anonymous visibility confirmation is pending",unresolved.stdout)
 
     def test_next_restore_failure_reports_true_verified_and_pending_parents(self):
-        _,accepted=record(inputs())
+        _,accepted=record(inputs(2),2)
         jobs={f"slot{n:02}":{"result":"skipped","outputs":{}} for n in range(1,14)}
-        jobs["slot01"]={"result":"success","outputs":accepted};jobs["slot02"]["result"]="failure"
+        jobs["slot02"]={"result":"success","outputs":accepted};jobs["slot03"]["result"]="failure"
         step=CALLER["jobs"]["terminal-12"]["steps"][0]["run"]
         proc,_=dispatch(step,{"NEEDS":json.dumps(jobs)})
         self.assertNotEqual(proc.returncode,0)
         receipt=json.loads(proc.stdout.split("R28_INTERRUPTED_RECEIPT ")[1])
-        self.assertEqual((receipt["verified_parent"],receipt["pending_parent"]),(S2_SHA,accepted["sha"]))
-        stop=inputs();stop["arm"]["outputs"]["apk_delivery_status"]="apk-size-exceeded"
+        self.assertEqual((receipt["verified_parent"],receipt["pending_parent"]),(R30_S1_SHA,accepted["sha"]))
+        stop=inputs(2);stop["arm"]["outputs"]["apk_delivery_status"]="apk-size-exceeded"
         stop["read"]["result"]="skipped"
-        payload=record(stop)[1]
-        jobs["slot01"]={"result":"success","outputs":payload};jobs["slot02"]["result"]="skipped"
+        payload=record(stop,2)[1]
+        jobs["slot02"]={"result":"success","outputs":payload};jobs["slot03"]["result"]="skipped"
         proc,_=dispatch(step,{"NEEDS":json.dumps(jobs)})
         self.assertNotEqual(proc.returncode,0)
         receipt=json.loads(proc.stdout.split("R28_TERMINAL_RECEIPT ")[1])
-        self.assertEqual((receipt["status"],receipt["verified_parent"]),("apk-size-exceeded",S2_SHA))
+        self.assertEqual((receipt["status"],receipt["verified_parent"]),("apk-size-exceeded",R30_S1_SHA))
 
     def test_all_slots_early_apk_late_duplicate_and_reread_only(self):
         receipts=[]
         jobs={}
-        for n in range(1,4):
+        for n in range(2,4):
             a=inputs(n)
             if n==3:
                 a["read"]["result"]="skipped";a["apk"]["result"]="success"
@@ -318,10 +325,12 @@ class NativeTests(unittest.TestCase):
         p,_=dispatch(body,{"NEEDS":json.dumps(jobs)})
         self.assertEqual(p.returncode,0,p.stderr)
         self.assertIn('"cipher_id":"2134"',p.stdout)
-        self.assertEqual(follow(receipts,77,REV)["cipher_id"],"2134")
+        scope = ChainStart.from_admission({"R28_REPLAY_MODE":"build-apk","R30_RESUME_S1":"1"})
+        self.assertEqual(scope,ChainStart(2,R30_S1_SHA,R30_S1_IDENTITY))
+        self.assertEqual(follow(receipts,77,REV,scope)["cipher_id"],"2134")
         with self.assertRaises(ValueError):
-            follow([*receipts,receipts[0]],77,REV)
-        jobs["slot04"]=jobs["slot01"]
+            follow([*receipts,receipts[0]],77,REV,scope)
+        jobs["slot04"]=jobs["slot02"]
         self.assertNotEqual(dispatch(body,{"NEEDS":json.dumps(jobs)})[0].returncode,0)
 
 

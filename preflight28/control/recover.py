@@ -30,6 +30,8 @@ def get(path):
                                    timeout=90).decode("utf-8-sig")
 
 
+R30_S1_SHA = "fa44728d39b61c25d4116579e6da2c63ca7898cec24ada0e7ae453548bbd73bf"
+R30_S1_IDENTITY = "8f6e0fc60ac76d6558ff3f7f593a8db5a3a5c2da523b251b3847fb594fa2e3be"
 S2_IDENTITY = "a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc"
 
 
@@ -50,6 +52,8 @@ class ChainStart:
         values = tuple(env.get(k,"") for k in ("R28_REPLAY_ORDINAL","R28_REPLAY_PARENT","R28_REPLAY_IDENTITY"))
         if mode == "build-apk":
             require(not any(values), "Unexpected replacement credentials for a normal run")
+            if env.get("R30_RESUME_S1") == "1":
+                return cls(2, R30_S1_SHA, R30_S1_IDENTITY)
             return cls()
         ordinal, parent, identity = values
         require(mode == "recover-lost-slot" and re.fullmatch("[1-9]|1[0-2]",ordinal) and
@@ -61,7 +65,7 @@ class ChainStart:
 def follow(receipts, run, sha, scope=ChainStart()):
     current = scope.sha
     confirmed = scope.sha
-    seen = {current}
+    seen = {current, S2_SHA}
     terminal = None
     for n, r in enumerate(sorted(receipts, key=lambda x: int(x["ordinal"])), scope.ordinal):
         require(terminal is None and r["ordinal"] == n and n <= scope.last and r["producer_sha"] == sha
@@ -352,6 +356,11 @@ def main():
     def metadata(aid):
         return json.loads(get(f"actions/artifacts/{aid}"))
     scope = ChainStart.from_admission(os.environ)
+    if scope.ordinal == 2 and scope.sha == R30_S1_SHA and not scope.replacement:
+        binder = [job for job in jobs if job["name"] == "Bind the prior private collection registration to this originating run"]
+        require(len(binder) == 1 and binder[0]["conclusion"] == "success" and binder[0]["run_id"] == run
+                and binder[0]["run_attempt"] == 1 and binder[0]["head_sha"] == sha,
+                "No successful first-attempt admission for the fixed S1 continuation")
     receipts = slot_chain(jobs, artifacts, run, sha, metadata, download_note, scope, terminal_salvage=True)
     outcome = terminal_source(receipts, jobs, artifacts, run, sha, metadata, download_note, current_caches, scope)
     if outcome["status"] in ("recovery-no-terminal","manifest_present_visibility_pending") or outcome["status"].startswith("relay-"):

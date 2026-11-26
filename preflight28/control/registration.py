@@ -9,6 +9,7 @@ import re
 import sys
 
 import slot1_handoff
+import s1_resume
 from slot1_handoff import CAMPAIGN, CLAIM, TICKET_NAME
 from admission import BASE_REF, REPO, REPO_ID, S2_SHA, RELEASE_ID, PagedOwnerDraft, admit, require
 
@@ -127,7 +128,7 @@ def checked_ack(helper, release, ticket, created, now):
     return int(latest.timestamp()), dict(ack, collector_ack_asset_id=aid)
 
 
-def checked_build_route(inputs):
+def checked_build_route(inputs, *, resume=False):
     """This campaign's sole physical claim authorizes the approved numbered Draft pipeline."""
     required = {"mode": "build-apk", "build_segments": "12", "checkpoint_backend": "draft",
                 "apk_recipient": RECIPIENT, "jobs": "2", "output_gib": "18"}
@@ -138,9 +139,13 @@ def checked_build_route(inputs):
             not inputs.get("loss_origin_run") and not inputs.get("encrypted_apk_bytes"),
             "Dispatch differs from the R28 numbered Draft build")
     parent = tuple(inputs.get(k, "") for k in ("checkpoint_key", "checkpoint_sha", "checkpoint_identity"))
-    require(parent in (("", "", ""), ("bare-coexist-204-45285202990-1-checkpoint-production-s2", S2_SHA,
-                   "a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc")),
-            "Only the complete fixed R27 S2 parent may be supplied")
+    if resume:
+        pinned = (f"bare-coexist-204-{s1_resume.SOURCE_RUN}-1-checkpoint-production-s1",
+                  s1_resume.PARENT_SHA, s1_resume.PARENT_IDENTITY)
+    else:
+        pinned = ("bare-coexist-204-45285202990-1-checkpoint-production-s2", S2_SHA,
+                  "a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc")
+    require(parent in (("", "", ""), pinned), "Only the complete fixed parent may be supplied")
 
 
 def bind(helper, env, event, now, *, verify_only=False):
@@ -155,7 +160,9 @@ def bind(helper, env, event, now, *, verify_only=False):
             "Only the approved physical originating job can bind a registration")
     require(event["repository"]["id"] == REPO_ID and event["inputs"].get("mode","build-apk") == "build-apk"
             and all(event["sender"].get(k) == v for k,v in OWNER.items()), "Unexpected dispatch")
-    checked_build_route(event["inputs"])
+    resume = env.get("R30_RESUME_S1") == "1"
+    checked_build_route(event["inputs"], resume=resume)
+    gate = s1_resume if resume else slot1_handoff
     api = helper.metadata(f"{helper.BASE}/actions/runs/{run}/attempts/1")
     require(api["id"] == run and api["run_attempt"] == 1 and api["head_sha"] == revision
             and api["path"] == WORKFLOW and api["event"] == "workflow_dispatch" and api["head_branch"] == BASE_REF
@@ -163,7 +170,7 @@ def bind(helper, env, event, now, *, verify_only=False):
             and api["repository"]["id"] == api["head_repository"]["id"] == REPO_ID, "Unconfirmed physical run")
     helper = PagedOwnerDraft(helper)
     release = helper.draft(RELEASE_ID)
-    expected_name = TICKET_NAME
+    expected_name = gate.TICKET_NAME
     found = [x for x in release["assets"] if x.get("name") == expected_name]
     require(len(found) == 1, "Expected one owner collection ticket for this campaign")
     asset = found[0]
@@ -181,19 +188,22 @@ def bind(helper, env, event, now, *, verify_only=False):
     require(hashlib.sha256(raw.getvalue()).hexdigest() == digest, "Wrong registration digest")
     ticket = json.loads(raw.getvalue())
     expected = dict(schema=1, campaign=CAMPAIGN, repository_id=REPO_ID, workflow=WORKFLOW, branch=BASE_REF,
-                    head=revision, initial_parent=S2_SHA, release_id=RELEASE_ID, recipient=RECIPIENT)
+                    head=revision, initial_parent=s1_resume.PARENT_SHA if resume else S2_SHA, release_id=RELEASE_ID, recipient=RECIPIENT)
     require(all(ticket.get(k) == v for k,v in expected.items()),
             "Registration belongs to another campaign, owner, revision or initial parent")
-    same_owner_as_previous(helper, release, ticket)
-    slot1_handoff.validate_source(helper, release, ticket, initial=not verify_only)
-    if not verify_only:
-        check_first_run(helper)
+    if not resume:
+        same_owner_as_previous(helper, release, ticket)
+        if not verify_only:
+            check_first_run(helper)
+    gate.validate_source(helper, release, ticket, initial=not verify_only)
     service = ticket["collector_registration_id"]
     require(re.fullmatch(r"Automation_[0-9a-f]{32}", service), "A separately registered collection target is required")
     created, issued, expires = instant(api["created_at"]), instant(ticket["issued_at"]), instant(ticket["expires_at"])
     require(instant(asset["created_at"]) <= created and issued <= created <= now < expires,
             "Ticket expired or prepared after run creation")
     latest, ack = checked_ack(helper, release, ticket, created, now)
+    if resume:
+        s1_resume.fields(ack, s1_resume.route(ticket), "Independent receiver did not accept this candidate and trial")
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]/"bridge"))
     import storage_admission
     ceiling, until = storage_admission.policy(ticket, ack)
@@ -203,13 +213,17 @@ def bind(helper, env, event, now, *, verify_only=False):
     storage_admission.admit(helper.metadata, settings, storage_admission.lease_size(settings), 1,
                             stage="lease", now=now.timestamp(), lead=350*60)
     holder = dict(expected, registration_id=service, ticket_asset_id=int(aid), ticket_sha=digest,
-                  run_id=run, producer_attempt=1, source_run_id=slot1_handoff.SOURCE_RUN,
-                  source_claim_id=slot1_handoff.SOURCE_CLAIM_ID, source_claim_sha=slot1_handoff.SOURCE_CLAIM_SHA)
+                  run_id=run, producer_attempt=1, source_run_id=gate.SOURCE_RUN,
+                  source_claim_id=gate.SOURCE_CLAIM_ID, source_claim_sha=gate.SOURCE_CLAIM_SHA)
     if "collector_ack_asset_id" not in ticket:
         holder["collector_ack_asset_id"] = ack["collector_ack_asset_id"]
-    slot1_handoff.check_reference(holder)
+    if resume:
+        holder.update(s1_resume.route(ticket))
+        s1_resume.check_reference(holder, ticket)
+    else:
+        slot1_handoff.check_reference(holder)
     # Independent of ticket ID: two concurrent dispatches cannot bind this campaign twice.
-    return admit("recover" if verify_only else "compute", holder, helper, name=CLAIM), service, latest, ceiling, until
+    return admit("recover" if verify_only else "compute", holder, helper, name=gate.CLAIM), service, latest, ceiling, until
 
 
 def main():
