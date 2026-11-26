@@ -141,6 +141,65 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(self.collect(),receipt)
         self.assertEqual((self.root/"accepted"/p.apk_seal.CIPHER_FILE).read_bytes(),self.cipher)
 
+    def test_owner_locator_distinguishes_current_and_historical_slot_two_tickets(self):
+        self.add_private(p.s1_resume.TICKET_NAME, b"old-registration")
+        self.add_private(p.s1_label_resume.TICKET_NAME, b"personal-label-registration")
+        self.write()
+        snapshot = o.OwnerSnapshot(self.root, self.helper)
+        snapshot.visible()
+        for data, gate in ((b"old-registration", p.s1_resume),
+                           (b"personal-label-registration", p.s1_label_resume)):
+            self.assertIs(snapshot.pickup_gate(dict(ticket_sha=hashed(data))), gate)
+        snapshot.listed[p.s1_label_resume.TICKET_NAME]["sha256"] = hashed(b"old-registration")
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            snapshot.pickup_gate(dict(ticket_sha=hashed(b"old-registration")))
+
+    def test_corrected_slot_two_cipher_retrieval_and_registered_final_signer(self):
+        gate = p.s1_label_resume
+        parent = p.s1_resume.PARENT_SHA
+        certificate = hashed(b"owner snapshot signing fixture")
+        self.enterContext(patch.object(gate, "OWNER_CERT_COMMITMENT", hashed(certificate.encode())))
+        common = dict(schema=1, campaign=p.CAMPAIGN, repository_id=p.REPO_ID, branch=p.BASE_REF,
+                      workflow=p.WORKFLOW, head=self.head, initial_parent=parent, release_id=p.RELEASE_ID,
+                      recipient=p.apk_seal.RECIPIENT)
+        ticket = dict(common, collector_registration_id=self.locator["registration_id"],
+                      owner_destination_id=self.locator["owner_destination_id"],
+                      final_certificate_sha256=certificate)
+        previous = raw({"run_id": 45841492691})
+        previous_ticket = raw({"v": "consumed"})
+        self.add_private(p.s1_resume.CLAIM, previous)
+        self.add_private(p.s1_resume.TICKET_NAME, previous_ticket)
+        source = [(p.s1_resume.CLAIM, 400, len(previous), hashed(previous), False),
+                  (p.s1_resume.TICKET_NAME, 401, len(previous_ticket), hashed(previous_ticket), True)]
+        data = raw(ticket)
+        current = dict(self.locator, ticket_asset_id=320, ticket_sha=hashed(data))
+        built = dict(common, run_id=self.run, producer_attempt=1, registration_id=current["registration_id"],
+                     ticket_asset_id=current["ticket_asset_id"], ticket_sha=current["ticket_sha"])
+        claim = raw(built)
+        self.add_private(gate.TICKET_NAME, data)
+        self.add_private(gate.CLAIM, claim)
+        # The fixture's controller now represents the distinct original job that made this binding.
+        self.artifacts.clear()
+        self.witness("claim", [(gate.TICKET_NAME, 320, data, True), (gate.CLAIM, 321, claim, False)])
+        seal = dict(self.seal, ordinal=2, accepted_parent=parent)
+        artifact = self.artifact(f"bare-personal-204-encrypted-{self.run}-1-s2",
+                                 [("seal.json", raw(seal)), (p.apk_seal.CIPHER_FILE, self.cipher)])
+        self.job("Bounded build segment 2 / Compute / Compile or verify authenticated APK slot 2",
+                 ["Upload the encrypted APK bundle"])
+        self.write()
+        snapshot = o.OwnerSnapshot(self.root, self.helper)
+        with patch.object(gate, "source_rows", return_value=source), \
+             patch.object(gate, "check_binding") as binding, patch.object(gate, "check_reference") as ref:
+            locator = snapshot.resolve_original_ticket({k: v for k, v in current.items() if k != "ticket_asset_id"})
+            self.assertEqual(locator, current)
+            result = p.collect(locator, self.root/"label", snapshot, actions=snapshot, draft_rows=snapshot.draft_rows)
+            self.assertEqual((result["artifact_id"], result["claim_asset_id"], result["final_certificate_sha256"]),
+                             (artifact["id"], 321, certificate))
+            self.assertEqual(result["owner_destination_id"], ticket["owner_destination_id"])
+            self.assertEqual((self.root/"label"/p.apk_seal.CIPHER_FILE).read_bytes(), self.cipher)
+            binding.assert_called_with(json.loads(previous), json.loads(previous_ticket), ticket)
+            ref.assert_called_with(built, ticket)
+
     def test_owner_capture_for_r30_rotation_uses_both_original_receipt_files(self):
         import r28_verified_draft as anchor
         self.delivery()

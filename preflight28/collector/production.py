@@ -21,6 +21,7 @@ import apk_seal
 from admission import BASE_REF, PagedOwnerDraft, RELEASE_ID, REPO, REPO_ID, S2_SHA, require
 import slot1_handoff as handoff
 import s1_resume
+import s1_label_resume
 import receipt_journal as journal
 import recover
 from registration import CAMPAIGN, CLAIM, TICKET_NAME, OWNER, WORKFLOW
@@ -68,6 +69,11 @@ def compare_signing_payload(clear_apk, clear_receipt, signed_apk, owner, apksign
     require(clear_apk.stat().st_size == clear_receipt["bytes"] and
             digest(clear_apk) == clear_receipt["sha256"],
             "Original signing input differs from the authenticated clear receipt")
+    if "final_certificate_sha256" in clear_receipt:
+        expected = s1_label_resume.checked_final_certificate(clear_receipt["final_certificate_sha256"])
+        require(owner["final_certificate_sha256"] == expected and
+                owner["owner_destination_id"] == clear_receipt["owner_destination_id"],
+                "Owner signing identity or destination differs from the registered pickup")
     with ZipFile(clear_apk) as before, ZipFile(signed_apk) as after:
         verify_signer(clear_apk, clear_receipt["signer_sha256"], apksigner)
         verify_signer(signed_apk, owner["final_certificate_sha256"], apksigner)
@@ -114,32 +120,41 @@ def private_document(api, row, *, owner=False):
     return json.loads(data)
 
 
-def checked_source_grant(api, rows, ticket, claim, *, resume=False):
-    """Read the two immutable documents behind the handoff in both API and owner snapshot modes."""
-    if resume:
-        s1_resume.check_reference(claim, ticket)
-    else:
+PICKUP_GATES = (handoff, s1_resume, s1_label_resume)
+
+
+def checked_source_grant(api, rows, ticket, claim, gate):
+    """Read and check the immutable source documents for the selected registration."""
+    if gate is handoff:
         handoff.check_reference(claim)
+    else:
+        gate.check_reference(claim, ticket)
     documents = []
-    for name, aid, size, sha, owner in source_grant_rows(resume):
+    for name, aid, size, sha, owner in source_grant_rows(gate):
         row = private_row(rows, name)
         require((row["id"], row["size"], row["digest"]) == (aid, size, "sha256:" + sha),
                 "Different original slot 1 grant or owner ticket")
         documents.append(private_document(api, row, owner=owner))
-    (s1_resume if resume else handoff).check_binding(*documents, ticket)
+    gate.check_binding(*documents, ticket)
 
 
-def source_grant_rows(resume=False):
-    if resume:
-        return s1_resume.source_rows()
+def source_grant_rows(gate):
+    if gate is not handoff:
+        return gate.source_rows()
     return ((handoff.SOURCE_CLAIM_NAME, handoff.SOURCE_CLAIM_ID, 649, handoff.SOURCE_CLAIM_SHA, False),
             (handoff.SOURCE_TICKET_NAME, handoff.SOURCE_TICKET_ID, 941, handoff.SOURCE_TICKET_SHA, True))
 
 
 def bind(api, rows, locator):
-    gate = s1_resume if any(r["name"] == s1_resume.TICKET_NAME and
-                            r["id"] == locator["ticket_asset_id"] for r in rows) else handoff
-    resume = gate is s1_resume
+    return bound_pickup(api, rows, locator)[:4]
+
+
+def bound_pickup(api, rows, locator):
+    matches = [gate for gate in PICKUP_GATES if any(r["name"] == gate.TICKET_NAME and
+               r["id"] == locator["ticket_asset_id"] for r in rows)]
+    require(len(matches) == 1, "Different registered ticket")
+    gate, = matches
+    resume = gate is not handoff
     parent = s1_resume.PARENT_SHA if resume else S2_SHA
     ticket_row = private_row(rows, gate.TICKET_NAME)
     require(ticket_row["id"] == locator["ticket_asset_id"] and
@@ -157,13 +172,16 @@ def bind(api, rows, locator):
             claim["registration_id"] == locator["registration_id"] and claim["release_id"] == RELEASE_ID and
             (claim["ticket_asset_id"], claim["ticket_sha"], claim["initial_parent"]) ==
             (ticket_row["id"], ticket_row["digest"][7:], parent), "Unbound original production claim")
-    checked_source_grant(api, rows, ticket, claim, resume=resume)
+    checked_source_grant(api, rows, ticket, claim, gate)
+    signing = {}
+    if gate is s1_label_resume:
+        signing["final_certificate_sha256"] = gate.checked_final_certificate(ticket["final_certificate_sha256"])
     origin = claim["run_id"]
     require(type(origin) is int and origin > 0, "Missing original run")
     replacement = private_row(rows, REPLACEMENT, optional=True)
     if resume:
         require(replacement is None, "Conflicting exceptional replacement")
-        return origin, origin, source["id"], recover.ChainStart(2, parent, s1_resume.PARENT_IDENTITY)
+        return origin, origin, source["id"], recover.ChainStart(2, parent, s1_resume.PARENT_IDENTITY), signing
     scope = recover.ChainStart()
     if replacement:
         claim = private_document(api, replacement)
@@ -199,7 +217,7 @@ def bind(api, rows, locator):
         # The journal chain checks the accepted SHA. No private sender state is consumed by the collector.
         scope = recover.ChainStart(claim["ordinal"], claim["initial_parent"], claim["parent_identity"], True)
         source = replacement
-    return origin, claim["run_id"], source["id"], scope
+    return origin, claim["run_id"], source["id"], scope, signing
 
 
 def physical_run(row, run, head):
@@ -304,7 +322,7 @@ def collect(locator, directory, api, *, actions=ActionsGET, draft_rows=None):
         rows = api.draft(RELEASE_ID)["assets"]
     else:
         rows = draft_rows(locator)
-    origin, run, claim_id, scope = bind(api, rows, locator)
+    origin, run, claim_id, scope, signing = bound_pickup(api, rows, locator)
     head = locator["head"]
     base = f"actions/runs/{run}/attempts/1"
     physical_run(actions.metadata(base), run, head)
@@ -350,7 +368,7 @@ def collect(locator, directory, api, *, actions=ActionsGET, draft_rows=None):
                 (receipt["cipher_sha"], int(receipt["cipher_bytes"])), "Outcome conflicts with terminal bytes")
         install(cipher, directory/apk_seal.CIPHER_FILE)
         return dict(schema=1, campaign=CAMPAIGN, origin_run=origin, source_run=run, claim_asset_id=claim_id,
-                    owner_destination_id=locator["owner_destination_id"], seal=seal, **locations)
+                    owner_destination_id=locator["owner_destination_id"], seal=seal, **signing, **locations)
 
 
 def verify_signer(file, expected, apksigner, *, v1_only=False):
@@ -414,6 +432,13 @@ def clear_bundle(bundle, pickup, directory, aapt2, apksigner):
                 "Generated APK hash or byte count differs")
         verify_signer(staged,CI_CERT,apksigner)
         verify_application(staged,aapt2)
+        # Receipt-only fields must never be supplied by the APK's metadata.
+        require("final_certificate_sha256" not in metadata and "owner_destination_id" not in metadata,
+                "Owner fields in producer metadata")
+        if "final_certificate_sha256" in pickup:
+            expected = s1_label_resume.checked_final_certificate(pickup["final_certificate_sha256"])
+            metadata.update(final_certificate_sha256=expected,
+                            owner_destination_id=pickup["owner_destination_id"])
         install(staged,directory/staged.name)
     return metadata
 

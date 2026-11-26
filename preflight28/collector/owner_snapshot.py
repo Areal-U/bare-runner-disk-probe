@@ -302,12 +302,14 @@ class OwnerSnapshot:
             self.by_id[r["id"]]=normalized
 
     def pickup_gate(self, locator):
-        row = self.listed.get(p.s1_resume.TICKET_NAME)
-        return p.s1_resume if row and row["sha256"] == locator["ticket_sha"] else p.handoff
+        matches = [gate for gate in p.PICKUP_GATES if gate.TICKET_NAME in self.listed and
+                   self.listed[gate.TICKET_NAME]["sha256"] == locator["ticket_sha"]]
+        require(len(matches) == 1, "Missing or ambiguous owner-pinned ticket")
+        return matches[0]
 
     def attach_source_grant(self, gate):
-        # These two service IDs and byte digests were fixed before the transfer.
-        for name, aid, size, sha, owner in p.source_grant_rows(gate is p.s1_resume):
+        # These service IDs and byte digests were fixed before the transfer.
+        for name, aid, size, sha, owner in p.source_grant_rows(gate):
             self.merge([dict(name=name, id=aid, bytes=size, sha256=sha, owner_issued=owner)],
                        [name], [name] if owner else [])
 
