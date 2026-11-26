@@ -23,7 +23,8 @@ class Provider:
         if path == s.BASE:
             return self.repo
         if "/actions/runs?status=" in path:
-            return dict(total_count=len(self.runs), workflow_runs=self.runs)
+            runs = self.runs if "status=in_progress&" in path else []
+            return dict(total_count=len(runs), workflow_runs=runs)
         if "/actions/artifacts?" in path:
             return dict(total_count=len(self.rows), artifacts=self.rows)
         if path.endswith("/actions/cache/storage-limit"):
@@ -202,6 +203,64 @@ class GuardTests(unittest.TestCase):
             s.receipt_rows(lambda p:seq.pop(0))
         with self.assertRaisesRegex(ValueError,"Incomplete"):
             s.receipt_rows(lambda p:dict(total_count=100,artifacts=[]))
+
+    def test_run_inventory_recheck_requires_two_matching_complete_views(self):
+        calls = []
+        def scripted(*views):
+            def get(path):
+                state = path.split("status=")[1].split("&")[0]
+                scan = len(calls) // len(s.ACTIVE_STATES)
+                self.assertEqual(state, s.ACTIVE_STATES[len(calls) % len(s.ACTIVE_STATES)])
+                calls.append(state)
+                return views[scan].get(state, dict(total_count=0, workflow_runs=[]))
+            return get
+
+        own = {"in_progress": dict(total_count=1, workflow_runs=[dict(id=81, status="in_progress")])}
+        foreign = {"pending": dict(total_count=4, workflow_runs=[{}, {"id": 82}])}
+        discrepant = {"queued": dict(total_count=1, workflow_runs=[])}
+        malformed = {"queued": dict(total_count=0)}
+        duplicate = own | {"queued": dict(total_count=1, workflow_runs=[dict(id=81)])}
+        with patch.object(s.time, "sleep") as pause, contextlib.redirect_stdout(io.StringIO()):
+            s.check_active_runs(scripted(own), self.env)
+            self.assertEqual(len(calls), 5)
+            pause.assert_not_called()
+            for views, error, expected_calls in (
+                ((discrepant, own, own), None, 15),
+                ((malformed, own, own), None, 15),
+                ((duplicate, own, own), None, 15),
+                ((discrepant, own, {}), "rechecks differ", 15),
+                ((malformed, malformed), "recheck incomplete: state=queued", 10),
+                ((discrepant, discrepant), "count=1 rows=0", 10),
+                ((foreign,), "Another run 82 in state=pending count=4 rows=2", 4),
+                ((discrepant, own, foreign), "Another run 82 in state=pending", 14)):
+                calls.clear()
+                with self.subTest(error=error):
+                    if error:
+                        with self.assertRaisesRegex(s.StorageUnconfirmed, error):
+                            s.check_active_runs(scripted(*views), self.env)
+                    else:
+                        s.check_active_runs(scripted(*views), self.env)
+                    self.assertEqual(len(calls), expected_calls)
+
+    def test_run_inventory_recheck_deadline_interrupts_a_blocked_read(self):
+        import select
+        first = 0
+        def get(_):
+            nonlocal first
+            first += 1
+            if first > len(s.ACTIVE_STATES):
+                select.select([], [], [], 2)
+            return dict(total_count=1, workflow_runs=[])
+
+        set_timer = s.signal.setitimer
+        def short_timer(which, seconds):
+            self.assertIn(seconds, (30, 0))
+            return set_timer(which, min(seconds, 0.02))
+        with patch.object(s.signal, "setitimer", side_effect=short_timer), patch.object(s.time, "sleep"):
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(s.StorageUnconfirmed, "exceeded 30 seconds"):
+                s.check_active_runs(get, self.env)
+        self.assertEqual(first, 6)
+        self.assertEqual(s.signal.getitimer(s.signal.ITIMER_REAL), (0, 0))
 
     def test_actual_five_cache_sizes_leave_fallback_and_128_mib(self):
         sizes = (2742685925,1495649356,2440554209,2318534667,849253635)

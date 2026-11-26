@@ -9,15 +9,16 @@ from unittest.mock import patch
 from zipfile import ZipFile
 
 import production as p
+from test_handoff_sample import sample
 
 
 class PrivateDocs:
     def __init__(self):
         self.files = {}
         self.rows = []
-    def write(self, name, obj, owner=False):
-        data = json.dumps(obj, sort_keys=True).encode()
-        i = len(self.rows) + 1
+    def write(self, name, obj, owner=False, aid=None):
+        data = obj if isinstance(obj,bytes) else json.dumps(obj, sort_keys=True).encode()
+        i = aid or len(self.rows) + 1
         row = dict(id=i, name=name, digest="sha256:"+hashlib.sha256(data).hexdigest(),
                    size=len(data), state="uploaded", uploader=p.OWNER if owner else {})
         self.rows.append(row)
@@ -92,10 +93,18 @@ class Production(unittest.TestCase):
                       head=self.head,recipient=p.apk_seal.RECIPIENT,release_id=p.RELEASE_ID)
         service="Automation_"+"b"*32
         ticket = dict(**common,initial_parent=p.S2_SHA,owner_destination_id="owner-private-file",collector_registration_id=service)
+        earlier, refs = sample(self,ticket)
+        for name, aid, data, owner in earlier:
+            api.write(name,data,owner,aid)
         t=api.write(p.TICKET_NAME,ticket,owner=True)
         locator=dict(ticket_asset_id=t["id"],ticket_sha=t["digest"][7:],head=self.head,registration_id=service,owner_destination_id=ticket["owner_destination_id"])
-        g=api.write(p.CLAIM,dict(**common,initial_parent=p.S2_SHA,run_id=9,producer_attempt=1,registration_id=service,ticket_asset_id=t["id"],ticket_sha=t["digest"][7:]))
+        g=api.write(p.CLAIM,dict(**common,initial_parent=p.S2_SHA,run_id=9,producer_attempt=1,registration_id=service,**refs,ticket_asset_id=t["id"],ticket_sha=t["digest"][7:]))
         self.assertEqual(p.bind(api,api.rows,locator)[:3],(9,9,g["id"]))
+        # Preserve the original receipt even after the handoff has its own ID.
+        for name, aid, data, _ in earlier:
+            api.files[aid]=b"X"+data[1:]
+            with self.assertRaises(ValueError): p.bind(api,api.rows,locator)
+            api.files[aid]=data
         key=dict(origin_run=9,ordinal=2,original_claim_id=g["id"],owner_destination_id=locator["owner_destination_id"])
         evidence=api.write(p.CAMPAIGN+"-loss-evidence-9.json",dict(**common,**key,parent_sha="c"*64,owner_copy="confirmed-absent",
                            pending_writes=0,state="ledger-closed-no-durable-output",collector_registration_id=service),owner=True)

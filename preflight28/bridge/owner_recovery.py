@@ -123,12 +123,21 @@ def read_claim(api, release, name):
 
 def collection_claim(api,release,ctx):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "control"))
-    from registration import CAMPAIGN, CLAIM
+    from registration import CAMPAIGN, CLAIM, TICKET_NAME
+    import slot1_handoff as handoff
 
     genesis = read_claim(api, release, CLAIM)
     if not genesis:
         return None
     original_id, original = genesis
+    handoff.check_reference(original)
+    rows = [r for r in release["assets"] if r["name"] == TICKET_NAME]
+    b.require(len(rows) == 1 and 0 < rows[0]["size"] <= 4096, "Missing or ambiguous handoff registration")
+    ticket = handoff.read_fixed(api, release, TICKET_NAME, original["ticket_asset_id"],
+                                rows[0]["size"], original["ticket_sha"], owner=True)
+    b.require(ticket["collector_registration_id"] == original["registration_id"] and
+              ticket["head"] == ctx["producer_sha"], "Different handoff recovery registration")
+    handoff.validate_source(api, release, ticket, initial=False)
     binding = {"schema":1,"campaign":CAMPAIGN,"repository_id":1450926240,
                "workflow":".github/workflows/bare-checkpoint-transfer.yml","branch":"bare-coexist-v2.0.4",
                "head":ctx["producer_sha"],"release_id":b.RELEASE,"recipient":RECIPIENT,"producer_attempt":1}
