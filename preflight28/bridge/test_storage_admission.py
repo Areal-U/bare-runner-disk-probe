@@ -153,7 +153,7 @@ class GuardTests(unittest.TestCase):
 
     def test_rescue_recovers_only_storage_policy_from_original_immutable_ack(self):
         start = "2026-11-25T01:03:00Z"
-        common = dict(campaign="bare-personal-204-r29", branch="bare-coexist-v2.0.4",
+        common = dict(campaign="bare-personal-204-r30", branch="bare-coexist-v2.0.4",
                       head="2"*40, collector_registration_id="Automation_"+"b"*32,
                       owner_destination_id="libfile_private_owner", registration_nonce="a"*32, recipient="test",
                       storage_policy=s.POLICY, artifact_ceiling_bytes=12345, storage_valid_until="2027-01-01T00:00:00Z")
@@ -163,7 +163,7 @@ class GuardTests(unittest.TestCase):
         data = json.dumps(ack).encode()
         digest = hashlib.sha256(data).hexdigest()
         ticket = dict(common, collector_ack_asset_id=102, collector_ack_sha=digest, expires_at=ack["valid_until"])
-        row = dict(id=102, name="bare-personal-204-r29-collector-ack-"+"a"*32+".json",
+        row = dict(id=102, name="bare-personal-204-r30-collector-ack-"+"a"*32+".json",
                    created_at="2026-11-25T00:56:00Z", size=len(data))
         class Draft:
             def asset_info(self, release, name, size, sha, aid):

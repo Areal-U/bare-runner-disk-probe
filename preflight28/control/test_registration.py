@@ -111,6 +111,8 @@ class TicketTests(unittest.TestCase):
                 assert len(matches) == 1
                 record = matches[0]
                 assert record["size"] == size and (aid is None or record["id"] == aid)
+                if aid is None and record["digest"] != "sha256:" + digest:
+                    raise ValueError("Immutable claim digest differs")
                 return record
 
             def download(self, aid, size, digest, target):
@@ -123,6 +125,11 @@ class TicketTests(unittest.TestCase):
         self.assertEqual(bind(self.d,self.env,self.event,self.now)[0],940)
         self.env["GITHUB_JOB"]="collection-lease"
         self.assertEqual(bind(self.d,self.env,self.event,self.now,verify_only=True)[0],940)
+        # A later run using the same approved ticket cannot replace the claim.
+        self.env.update(GITHUB_RUN_ID="82", GITHUB_JOB="bind-private-receiver")
+        self.d.origin["id"] = 82
+        with self.assertRaisesRegex(ValueError, "Immutable claim digest differs"):
+            bind(self.d, self.env, self.event, self.now)
         self.assertEqual(self.d.posts,1)
         self.assertGreaterEqual(self.d.pages.count(3),3)
     @patch("registration.admit")
@@ -176,6 +183,19 @@ class TicketTests(unittest.TestCase):
         self.d.ack["valid_until"]="2026-11-28T04:00:00Z"
         with self.assertRaisesRegex(ValueError,"ACK bytes"):
             bind(self.d,self.env,self.event,self.now,verify_only=True)
+
+    @patch("registration.admit")
+    def test_previous_ticket_and_previous_ack_cannot_activate_this_campaign(self, claim):
+        from registration import PREVIOUS_CAMPAIGN
+        with patch.dict(self.d.ticket, campaign=PREVIOUS_CAMPAIGN), self.assertRaisesRegex(
+                ValueError, "another campaign"):
+            self.enter()
+        with patch.dict(self.d.ack, campaign=PREVIOUS_CAMPAIGN):
+            pinned = hashlib.sha256(self.d.data(812)).hexdigest()
+            with patch.dict(self.d.ticket, collector_ack_sha=pinned), self.assertRaisesRegex(
+                    ValueError, "ACK disagrees with owner ticket: campaign"):
+                self.enter()
+        claim.assert_not_called()
 
     @patch("registration.admit")
     def test_conflicting_predecessor_reservation_cannot_claim(self, claim):

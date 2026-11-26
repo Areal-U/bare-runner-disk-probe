@@ -331,11 +331,11 @@ jobs:
       timeout-minutes: 5
       run: |
         mkdir -p "$RUNNER_TEMP/bare-ci"
-        for file in checkpoint.py build_trial.py coexist_inputs.py guard.py check_archive.py graph.py retained.py metrics_evidence.py migration_graph.py segment_graph.py android_outputs.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+        for file in checkpoint.py build_trial.py coexist_inputs.py guard.py check_archive.py graph.py retained.py metrics_evidence.py migration_graph.py segment_graph.py android_outputs.py contract_gate.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
           source=$file
           [[ $file != guard.py ]] || source=preflight28/limits/guard.py
           [[ $file != check_archive.py ]] || source=preflight28/bridge/check_archive.py
-          [[ $file != graph.py && $file != retained.py && $file != metrics_evidence.py && $file != migration_graph.py && $file != segment_graph.py && $file != android_outputs.py ]] || source=preflight28/graph/$file
+          [[ $file != graph.py && $file != retained.py && $file != metrics_evidence.py && $file != migration_graph.py && $file != segment_graph.py && $file != android_outputs.py && $file != contract_gate.py ]] || source=preflight28/graph/$file
           [[ $file != *.yml ]] || source=".github/workflows/$file"
           curl --fail --location --retry 2 --max-time 60 \
             "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/$source" \
@@ -1168,7 +1168,11 @@ jobs:
               args+=(--parent-sha cold --bootstrap)
             else
               args+=(--parent-sha "$PARENT_ARCHIVE_SHA")
-              [[ -z $COEXIST_PREDECESSOR_REV ]] || args+=(--bootstrap)
+              if [[ -n $COEXIST_PREDECESSOR_REV ]]; then
+                args+=(--bootstrap)
+              else
+                args+=(--require-current-proof)
+              fi
             fi
             [[ $VERIFY_FRONTIER_ONLY == false ]] || args+=(--verify-only)
             set -o pipefail

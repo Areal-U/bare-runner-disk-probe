@@ -55,6 +55,45 @@ class LocalDraft:
 
 
 class TestTransport(unittest.TestCase):
+    def test_recovery_reads_only_the_new_campaign_claim(self):
+        api = LocalDraft()
+        ctx = {"producer_sha": "d" * 40, "run": 81}
+        original = dict(schema=1, campaign="bare-personal-204-r29", repository_id=1450926240,
+                        workflow=".github/workflows/bare-checkpoint-transfer.yml", branch="bare-coexist-v2.0.4",
+                        head=ctx["producer_sha"], release_id=b.RELEASE, recipient=n.owner_recovery.RECIPIENT,
+                        producer_attempt=1, initial_parent=b.PARENT_SHA, run_id=ctx["run"], registration_id="Automation_fixture")
+
+        def add(asset_id, name, claim):
+            raw = json.dumps(claim).encode()
+            api.assets.append(dict(id=asset_id, name=name, size=len(raw),
+                                   digest="sha256:" + hashlib.sha256(raw).hexdigest()))
+            api.data[asset_id] = raw
+
+        add(101, "bare-personal-204-r29-production-run-claim.json", original)
+        self.assertIsNone(n.owner_recovery.collection_claim(api, api.draft(b.RELEASE), ctx))
+        add(102, "bare-personal-204-r30-production-run-claim.json", original)
+        with self.assertRaisesRegex(ValueError, "Wrong original collection claim"):
+            n.owner_recovery.collection_claim(api, api.draft(b.RELEASE), ctx)
+        api.assets.pop()
+        add(103, "bare-personal-204-r30-production-run-claim.json", dict(original, campaign="bare-personal-204-r30"))
+        self.assertEqual(n.owner_recovery.collection_claim(api, api.draft(b.RELEASE), ctx), 103)
+        replacement = dict(ctx, run=82, ordinal=2, parent_sha="e" * 64, parent_identity="a" * 64)
+        claim = dict(original, campaign="bare-personal-204-r30", run_id=82, original_claim_id=103,
+                     origin_run=81, ordinal=2, initial_parent=replacement["parent_sha"],
+                     parent_sha=replacement["parent_sha"], parent_identity=replacement["parent_identity"])
+        event = dict(inputs={"mode": "recover-lost-slot", "loss_origin_run": "81"},
+                     sender={"id": 292261483}, repository={"id": 1450926240})
+        with tempfile.TemporaryDirectory() as work:
+            event_path = Path(work) / "event.json"
+            event_path.write_text(json.dumps(event))
+            with patch.dict(os.environ, GITHUB_EVENT_PATH=str(event_path)):
+                add(104, "bare-personal-204-r29-loss-replacement-claim.json", claim)
+                with self.assertRaisesRegex(ValueError, "No immutable replacement collection claim"):
+                    n.owner_recovery.collection_claim(api, api.draft(b.RELEASE), replacement)
+                add(105, "bare-personal-204-r30-loss-replacement-claim.json", claim)
+                self.assertEqual(n.owner_recovery.collection_claim(api, api.draft(b.RELEASE), replacement), 105)
+
+
     def test_generation_and_recovery(self):
         with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,
              GITHUB_REPOSITORY=b.REPO,GITHUB_RUN_ID="1234",GITHUB_RUN_ATTEMPT="1",R28_SLOT="1",
@@ -99,7 +138,9 @@ class TestTransport(unittest.TestCase):
                 ih=checkpoint.canonical_hash(identity)
                 (out/"checkpoint-provenance.json").write_text(json.dumps({"format":checkpoint.PROVENANCE_FORMAT,
                            "version":checkpoint.CHECKPOINT_VERSION,"identity":identity,"identity_sha256":ih}))
-                proof={"format":"bare-apk-segment-frontier-v3","target":"chrome_public_apk","parent_sha256":n.PARENT["sha"],
+                complete=b"# ninja log v5\n1\t2\t3000000\tkernel.o\t123\n"
+                (out/".ninja_log").write_bytes(complete)
+                proof={"format":"bare-apk-segment-frontier-v4", "ninja_log":[len(complete),hashlib.sha256(complete).hexdigest()],"target":"chrome_public_apk","parent_sha256":n.PARENT["sha"],
                        "before":["b"*64,checkpoint.canonical_hash(["kernel.o"])],"after":["b"*64],"closed_groups":[["kernel.o"]],"witnesses":[{"kernel.o":os.urandom(16).hex()}]}
                 pf=out/"checkpoint-segment-frontier.json";pf.write_text(json.dumps(proof))
                 psha=hashlib.sha256(pf.read_bytes()).hexdigest()
@@ -184,12 +225,12 @@ class TestTransport(unittest.TestCase):
                 # The limited VM was lost before an intent or manifest. On a read-only
                 # retry the signed-in service can identify the original owner artifact.
                 c=n.context()
-                claim={"schema":1,"campaign":"bare-personal-204-r29","repository_id":1450926240,
+                claim={"schema":1,"campaign":"bare-personal-204-r30","repository_id":1450926240,
                        "workflow":".github/workflows/bare-checkpoint-transfer.yml","branch":"bare-coexist-v2.0.4",
                        "head":c["producer_sha"],"initial_parent":b.PARENT_SHA,"registration_id":"Automation_fixture","release_id":b.RELEASE,
                        "recipient":recipient,"run_id":c["run"],"producer_attempt":1}
                 raw=json.dumps(claim).encode()
-                row={"id":123,"name":"bare-personal-204-r29-production-run-claim.json","size":len(raw),
+                row={"id":123,"name":"bare-personal-204-r30-production-run-claim.json","size":len(raw),
                      "digest":"sha256:"+hashlib.sha256(raw).hexdigest(),"state":"uploaded"}
                 api.assets.append(row);api.data[123]=raw
                 artifact={"id":321,"name":"r28-1234-a1-s02-outcome","digest":"sha256:"+"7"*64,
@@ -246,7 +287,7 @@ class TestTransport(unittest.TestCase):
                                              initial_parent=rec["checkpoint_sha"],parent_sha=rec["checkpoint_sha"],
                                              parent_identity=rec["checkpoint_identity"])
                     raw=json.dumps(replacement_claim).encode()
-                    api.assets.append(dict(row,id=124,name="bare-personal-204-r29-loss-replacement-claim.json",
+                    api.assets.append(dict(row,id=124,name="bare-personal-204-r30-loss-replacement-claim.json",
                                            size=len(raw),digest="sha256:"+hashlib.sha256(raw).hexdigest()))
                     api.data[124]=raw
                     # The new input wrapper is also bound to the replacement claim.

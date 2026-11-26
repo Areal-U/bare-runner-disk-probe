@@ -396,7 +396,7 @@ def read_step_metrics(metrics_path, source_root):
     return metrics, list(failed_steps.values())
 
 
-def completed_outputs(metrics_path, ninja_path, source_root, metrics=None):
+def completed_outputs(metrics_path, ninja_path, source_root, metrics=None, *, production=False):
     """A ninja record alone can describe a failure; join successful metrics."""
     if metrics is None:
         metrics, _ = read_step_metrics(metrics_path, source_root)
@@ -407,8 +407,13 @@ def completed_outputs(metrics_path, ninja_path, source_root, metrics=None):
             continue
         path = source_root / BUILD_DIR / name
         try:
-            if not stat.S_ISREG(path.lstat().st_mode):
-                continue
+            mode = path.lstat().st_mode
+            if not stat.S_ISREG(mode):
+                # This one declared APK dependency is created by symlink.py.
+                # Its referent and the link itself are checked before receipt.
+                if not (production and name == "devil_util_host" and stat.S_ISLNK(mode)
+                        and os.readlink(path) == "clang_x64/devil_util_bin"):
+                    continue
         except FileNotFoundError:
             continue
         result.append({**records[name], **metric, "success_source": SUCCESS_SOURCE})
@@ -787,7 +792,7 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             if failed and result["reason"] != "oom-kill":
                 result["stop_reason"] = result["reason"]
                 result["reason"] = "compile-error"
-            result["completed_outputs"] = completed_outputs(metrics_path, output / ".ninja_log", source_root, metrics)
+            result["completed_outputs"] = completed_outputs(metrics_path, output / ".ninja_log", source_root, metrics, production=production)
             result["new_completed_outputs"] = [item for item in result["completed_outputs"]
                                                 if item["path"] not in baseline]
         if result["reason"] == "completed":

@@ -38,6 +38,33 @@ class Production(unittest.TestCase):
                          accepted_parent=p.S2_SHA, recipient=p.apk_seal.RECIPIENT,
                          sha=hashlib.sha256(self.data).hexdigest(), bytes=len(self.data))
 
+    def test_ordinary_meta_inf_is_part_of_signed_payload(self):
+        receipt = {"signer_sha256": "a" * 64}
+        owner = {"final_certificate_sha256": "b" * 64}
+        original, alternate = self.path / "original.apk", self.path / "alternate.apk"
+        for path, data in ((original, b"one"), (alternate, b"two")):
+            with ZipFile(path, "w") as archive:
+                archive.writestr("META-INF/MANIFEST.MF", b"ordinary application manifest")
+                archive.writestr("META-INF/service-provider", data)
+        receipt.update(bytes=original.stat().st_size, sha256=p.digest(original))
+        with patch.object(p, "verify_signer"):
+            self.assertEqual(p.compare_signing_payload(original, receipt, original, owner, None)["matched_entries"], 2)
+            with self.assertRaisesRegex(ValueError, "APK entry bytes changed: META-INF/service-provider"):
+                p.compare_signing_payload(original, receipt, alternate, owner, None)
+
+    def test_jar_signature_exception_rejects_ambiguous_or_custom_manifest(self):
+        for block, manifest, reason in (
+            ("SECOND.RSA", b"Manifest-Version: 1.0", "Unexpected JAR signer"),
+            ("FIRST.RSA", b"Manifest-Version: 1.0\nCustom: app data", "outside the signing-only format"),
+        ):
+            with self.subTest(reason=reason):
+                path = self.path / "jar-envelope.apk"
+                with ZipFile(path, "w") as archive:
+                    for name, content in (("FIRST.SF", b"fixture"), (block, b"fixture"), ("MANIFEST.MF", manifest)):
+                        archive.writestr("META-INF/" + name, content)
+                with ZipFile(path) as archive, self.assertRaisesRegex(ValueError, reason):
+                    p.signing_entries(archive, "a" * 64, None)
+
     def test_archive_and_exclusive_idempotent_retrieval(self):
         with ZipFile(self.path/"a.zip", "w") as z:
             z.writestr("seal.json", json.dumps(self.seal))

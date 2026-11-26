@@ -46,11 +46,34 @@ class RuntimePayloadTest(unittest.TestCase):
                           proof_sha=hashlib.sha256(evidence).hexdigest())
             archive = root / 'next.tar.zst'
 
-            def check():
+            def check(*, require_current=False):
                 subprocess.run(['tar', '--zstd', '-cf', str(archive), '-C', str(root), 'out/Bare'], check=True)
-                verify_payload.check(archive, sealed)
+                verify_payload.check(archive, sealed, require_current=require_current)
 
+            # Historical v3 checkpoints are still readable; new transfers must use v4.
             check()
+            with self.assertRaisesRegex(ValueError, 'proof format'):
+                check(require_current=True)
+            log = out / '.ninja_log'
+            contents = b'# ninja log v5\n1\t2\t3000000\tobj/ordinary.o\t12345\n'
+            log.write_bytes(contents)
+            proof['format'] = 'bare-apk-segment-frontier-v4'
+
+            def write_proof():
+                data = json.dumps(proof, sort_keys=True, separators=(',', ':')).encode()
+                (out / 'checkpoint-segment-frontier.json').write_bytes(data)
+                sealed['proof_sha'] = hashlib.sha256(data).hexdigest()
+
+            write_proof()
+            with self.assertRaisesRegex(ValueError, 'completion log'):
+                check(require_current=True)
+            proof['ninja_log'] = [len(contents), hashlib.sha256(contents).hexdigest()]
+            write_proof()
+            check(require_current=True)
+            log.write_bytes(contents.replace(b'3000000', b'2000000'))
+            with self.assertRaisesRegex(ValueError, 'completion log'):
+                check(require_current=True)
+            log.write_bytes(contents)
             (out / dynamic).write_bytes(b'bad')
             with self.assertRaisesRegex(ValueError, 'stamp absent or changed'):
                 check()

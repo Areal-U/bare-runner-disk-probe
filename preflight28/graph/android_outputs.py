@@ -7,7 +7,40 @@ import shlex
 import subprocess
 
 from graph import output_name, sha
-from retained import ANDROID_RULES_SHA256, FILEARG_RULES
+from retained import ANDROID_RULES_SHA256, FILEARG_RULES, NOMINAL_GROUPS, NOMINAL_RULES
+
+
+# SHA-256 of the expanded command from Siso query graph on fixed 800628ad.
+_NOMINAL_COMMANDS = {
+    'obj/chrome/browser/tabmodel/internal/java.kotlinc.jar': 'e6719de07644afe9911802995c142f5b37fb18d7380840138f01e2c70696b88e',
+    'obj/chrome/browser/ui/android/bricks/internal/java.kotlinc.jar': 'ed4e28ba0df0394bee74e2a67b4f5332a1143d781bde57793283dd4db719821b',
+    'obj/chrome/browser/xsurface/java__errorprone.stamp': '86b0ad62ba41527661750b2e2c8e6e7cc6ccb7b5549e185cde3e0e9d5727ed37',
+    'obj/third_party/androidx/compose_ui_overrides_java.kotlinc.jar': 'bea5c182fbda50956a19ce3b5048dd638d17bc4b688b6dcda906550076ecf1fa',
+}
+_GENERATORS = {
+    'compile_kt.py': '2c1c8eb98bd32561ca8239aed3a1fa1819ceb6a201d87fb9eab22763976e5eea',
+    'compile_java.py': '452cf6530742523d3c33c33f4572701fb9df3f44bb0acdcba97cb066e90ba7d8',
+    'errorprone.py': 'd9b87542a21438192bbf8f6866d9029b410ae239f33d2a4c92023c6cf5eab83c',
+}
+
+
+def verify_nominal_sources(src, rules):
+    rules = set(rules) & NOMINAL_RULES
+    scripts = {'compile_java.py'} if rules else set()
+    if 'android/compile_kt' in rules:
+        scripts.add('compile_kt.py')
+    if 'android/errorprone' in rules:
+        scripts.add('errorprone.py')
+    for name in scripts:
+        if sha(src / 'build/android/gyp' / name) != _GENERATORS[name]:
+            raise ValueError('Pinned Android output generator changed: ' + name)
+
+
+def verify_nominal_command(src, rule, primary, names, command, action, graph_action):
+    if (NOMINAL_GROUPS.get(primary) != (rule, tuple(sorted(names))) or
+            hashlib.sha256(command.encode()).hexdigest() != _NOMINAL_COMMANDS.get(primary) or
+            graph_action != action):
+        raise ValueError('Unrecognized generated command or GN group for a report-only Android output')
 
 
 def configured_outputs(out, rule, command):
@@ -73,6 +106,7 @@ def runtime_groups(out, rules, planned):
         raise ValueError('Android runtime output policy differs from the verified handler')
     # A fresh, immutable GN graph supplies both command arguments and all static owners,
     # even implicitly declared outputs of clean, unrelated targets. Never execute commands.
+    verify_nominal_sources(src, (row[0] for row in rules.values()))
     by_primary = {row[1]: edge for edge, row in rules.items()}
     if len(by_primary) != len(rules):
         raise ValueError('Two Android edges have the same first output')
@@ -120,6 +154,8 @@ def runtime_groups(out, rules, planned):
                 if sorted(names) != planned[edge] or edge in dynamic:
                     raise ValueError('Static edge does not match the planned Android output group')
                 kind = rules[edge][0]
+                if kind in NOMINAL_RULES or primary in NOMINAL_GROUPS:
+                    verify_nominal_command(src, kind, primary, names, command, rules[edge][2], row.get('rule'))
                 extras = {primary + '.md5.stamp'}
                 bindings[edge] = {}
                 if kind in FILEARG_RULES:

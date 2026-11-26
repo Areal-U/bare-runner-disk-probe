@@ -15,6 +15,8 @@ import stat
 import tempfile
 import subprocess
 import tarfile
+import zipfile
+import zlib
 
 MAX_ENTRIES = 550_000
 MAX_RAW = 21 * 1024**3
@@ -55,6 +57,26 @@ def record(mode, size, digest):
 
 def link_record(target):
     return "l:" + hashlib.sha256(os.fsencode(target)).hexdigest()
+
+
+# The fixed ARM64 graph names a Linux symbolic link as an APK dependency.
+# Its producer depends on the host executable before it can retire.
+DEVIL_LINK = "devil_util_host"
+DEVIL_TARGET = "clang_x64/devil_util_bin"
+
+
+def check_devil_link(text, target_is_executable):
+    if text != DEVIL_TARGET or not target_is_executable:
+        raise ValueError("Invalid devil_util_host link or missing regular executable target")
+
+
+def devil_link_record(out):
+    link = out / DEVIL_LINK
+    target = out / DEVIL_TARGET
+    info = target.lstat() if target.parent.resolve() == target.parent and target.exists() else None
+    check_devil_link(os.readlink(link) if link.is_symlink() else None,
+                     info and stat.S_ISREG(info.st_mode) and info.st_mode & 0o111 and info.st_size > 0)
+    return ["symlink", DEVIL_TARGET]
 
 
 def inventory(out, exclude=None):
@@ -503,6 +525,298 @@ STAMP_RULES = {'android/compile_java', 'android/compile_kt', 'android/errorprone
 ANDROID_RULES_SHA256 = 'ebfbb8b3524aff976c0f9336d53f2efe4eb45ca2874ecf06226a75b0c225b18c'
 
 
+# The only four S2-pending groups for which this pinned handler reports a
+# checksum row although its actual generator deliberately writes no checksum.
+_KOTLIN_STEMS = (
+    'obj/chrome/browser/tabmodel/internal/java',
+    'obj/chrome/browser/ui/android/bricks/internal/java',
+    'obj/third_party/androidx/compose_ui_overrides_java',
+)
+NOMINAL_GROUPS = {
+    stem + '.kotlinc.jar': ('android/compile_kt', tuple(sorted(
+        (stem + '.kotlinc.jar', stem + '.kt-jvm-abi.jar')))) for stem in _KOTLIN_STEMS
+}
+ERRORPRONE = 'obj/chrome/browser/xsurface/java__errorprone.stamp'
+NOMINAL_GROUPS[ERRORPRONE] = ('android/errorprone', (ERRORPRONE,))
+EMPTY_SHA256 = hashlib.sha256(b'').hexdigest()
+NOMINAL_RULES = {rule for rule, _ in NOMINAL_GROUPS.values()}
+NOMINAL_MATERIAL = {name for _, group in NOMINAL_GROUPS.values() for name in group}
+NOMINAL_REPORTED = {name + '.md5.stamp' for name in NOMINAL_GROUPS}
+
+
+def valid_completion(action_start, action_end, ninja, began_ns, checked_ns):
+    if (type(action_start) is not int or type(action_end) is not int or
+            type(began_ns) is not int or type(checked_ns) is not int or
+            not isinstance(ninja, (list, tuple)) or len(ninja) != 4 or
+            not all(isinstance(field, str) for field in ninja)):
+        return False
+    start, end, end_ns, command_hash = ninja
+    if not (re.fullmatch('[0-9]{1,19}', end_ns) and re.fullmatch('[0-9a-f]{16}', command_hash) and
+            0 < began_ns <= int(end_ns) <= checked_ns and 0 < action_start <= action_end):
+        return False
+    start_ms = action_start // 1_000_000
+    return (start, end) == (str(start_ms), str(max(start_ms + 1, action_end // 1_000_000)))
+
+
+FRONTIER_V3 = "bare-apk-segment-frontier-v3"
+FRONTIER_FORMAT = "bare-apk-segment-frontier-v4"
+
+
+def check_frontier_log(proof, actual, *, require_current=False):
+    """An immutable historical v3 receipt predates the whole-log commitment."""
+    profile = proof.get("format")
+    if profile == FRONTIER_V3 and not require_current and "ninja_log" not in proof:
+        return
+    if profile != FRONTIER_FORMAT:
+        raise ValueError("Unexpected APK frontier proof format")
+    expected = proof.get("ninja_log")
+    if (not isinstance(expected, list) or len(expected) != 2 or
+            type(expected[0]) is not int or expected[0] <= 0 or
+            not isinstance(expected[1], str) or not re.fullmatch(r"[0-9a-f]{64}", expected[1]) or
+            expected != actual):
+        raise ValueError("Ninja completion log absent or stale: differs from the quiescent producer proof")
+
+
+def scan_ninja_log(stream):
+    """Read the exact log and the last rows for the four nominal Android groups in one pass."""
+    header = stream.readline(128)
+    if header != b'# ninja log v5\n':
+        return {}, None
+    digest = hashlib.sha256(header)
+    size = len(header)
+    wanted = NOMINAL_REPORTED | NOMINAL_MATERIAL
+    rows = {}
+    for raw in iter(lambda: stream.readline(64 * 1024 + 1), b''):
+        if len(raw) > 64 * 1024:
+            raise ValueError('Oversized Ninja completion row')
+        digest.update(raw)
+        size += len(raw)
+        fields = raw.rstrip(b'\n').split(b'\t')
+        if len(fields) == 5:
+            name = fields[3].decode('utf-8', errors='replace').removeprefix('out/Bare/')
+            if name in wanted:
+                rows[name] = [x.decode('ascii', errors='replace') for x in (*fields[:3], fields[4])]
+    return rows, [size, digest.hexdigest()]
+
+
+def nominal_rows(stream):
+    return scan_ninja_log(stream)[0]
+
+
+def check_nominal_state(proof, exists, latest):
+    """Reconcile authenticated producer claims with independently read state."""
+    for row in proof.get('runtime_stamps', {}).values():
+        primary = row['primary']
+        if primary not in NOMINAL_GROUPS:
+            continue
+        reported = primary + '.md5.stamp'
+        if exists(reported):
+            raise ValueError('Unexpected physical file at a report-only Android output: ' + reported)
+        for name in (*NOMINAL_GROUPS[primary][1], reported):
+            if latest.get(name) != row['observation']['ninja']:
+                raise ValueError('Restored Ninja completion is absent or stale for ' + name)
+
+
+# The six S2-pending Kotlin products, built with the reviewed fixed commands.
+# Check member names/roles independently of ZIP entry order, timestamps and compression.
+_KOTLIN_CLASSES = {
+    'obj/chrome/browser/tabmodel/internal/java': (
+        'org/chromium/chrome/browser/tabmodel/',
+        (
+            'AsyncTabParamsManagerImpl',
+            'AsyncTabParamsManagerImpl$AsyncTabsIncognitoTabHost',
+            'AsyncTabParamsManagerImplKt',
+        ),
+        (),
+    ),
+    'obj/chrome/browser/ui/android/bricks/internal/java': (
+        'org/chromium/chrome/browser/bricks/',
+        (
+            'BricksCoordinator',
+            'ComposableSingletons$BricksCoordinatorKt',
+            'progress/ProgressBarKt',
+            'progress/ProgressCoordinator',
+            'progress/ProgressMediator',
+            'progress/ProgressProvider',
+            'progress/ProgressProvider$Observer',
+            'progress/ProgressUiState',
+            'progress/VibesProgressProvider',
+            'switches/ComposeMaterialSwitchWithText',
+            'switches/ComposeMaterialSwitchWithTitleAndSummary',
+            'switches/ComposeSwitchComponentKt',
+            'theme/ChromeColorTokens',
+            'theme/ChromeDesignTokensKt',
+            'theme/ChromeDimens',
+            'theme/ChromeTypography',
+        ),
+        ('BricksCoordinator$BricksContent$1$1$1$1$1', 'progress/VibesProgressProvider$triggerProgress$1'),
+    ),
+    'obj/third_party/androidx/compose_ui_overrides_java': (
+        'androidx/compose/ui/graphics/vector/compat/',
+        (
+            'AndroidVectorParser',
+            'AndroidVectorResources',
+            'XmlVectorParser_androidKt',
+        ),
+        (),
+    ),
+}
+KOTLIN_JARS = {}
+for _stem, (_package, _shared_classes, _implementation_classes) in _KOTLIN_CLASSES.items():
+    _common = {_package + n + '.class' for n in _shared_classes} | {'META-INF/main.kotlin_module'}
+    KOTLIN_JARS[_stem + '.kotlinc.jar'] = _common | {_package + n + '.class' for n in _implementation_classes}
+    KOTLIN_JARS[_stem + '.kt-jvm-abi.jar'] = _common | {'META-INF/MANIFEST.MF'}
+
+# Observed fixed files are < 141 kB on disk and < 137 kB expanded.
+KOTLIN_JAR_LIMIT = 8 * 1024**2
+_KOTLIN_EXPANDED_LIMIT = 32 * 1024**2
+
+
+def verify_class_entry(name, data):
+    """Check the JVM constant pool, this_class name and all top-level member boundaries."""
+    pos = 0
+    def take(n):
+        nonlocal pos
+        if n < 0 or pos + n > len(data):
+            raise ValueError('Truncated JVM class')
+        pos += n
+        return data[pos - n:pos]
+    def u2():
+        return int.from_bytes(take(2), 'big')
+    if take(4) != b'\xca\xfe\xba\xbe':
+        raise ValueError('Invalid JVM class magic')
+    take(4)  # minor and major versions
+    pool = [None] * u2()
+    index = 1
+    sizes = {3: 4, 4: 4, 5: 8, 6: 8, 8: 2, 9: 4, 10: 4, 11: 4, 12: 4,
+             15: 3, 16: 2, 17: 4, 18: 4, 19: 2, 20: 2}
+    while index < len(pool):
+        tag = take(1)[0]
+        if tag == 1:
+            pool[index] = take(u2())
+        elif tag == 7:
+            pool[index] = u2()
+        else:
+            if tag not in sizes:
+                raise ValueError('Unknown JVM constant pool entry')
+            take(sizes[tag])
+        index += 2 if tag in (5, 6) else 1
+    take(2)  # access flags
+    cls = u2()
+    if (not 0 < cls < len(pool) or type(pool[cls]) is not int or
+            not 0 < pool[cls] < len(pool) or pool[pool[cls]] != name.removesuffix('.class').encode()):
+        raise ValueError('JVM class identity differs from its JAR entry')
+    take(2)  # super class
+    take(2 * u2())  # interfaces
+
+    def attributes():
+        for _ in range(u2()):
+            take(2)  # attribute name index
+            take(int.from_bytes(take(4), 'big'))
+    for _ in range(2):  # fields, methods
+        for _ in range(u2()):
+            take(6)
+            attributes()
+    attributes()
+    if pos != len(data):
+        raise ValueError('Trailing bytes in JVM class')
+
+
+def verify_kotlin_jar(name, file, size):
+    if not 0 < size <= KOTLIN_JAR_LIMIT:
+        raise ValueError('Invalid fixed Kotlin JAR size: ' + name)
+    try:
+        with zipfile.ZipFile(file) as jar:
+            jar.fp.seek(0)
+            if jar.fp.read(4) != b'PK\x03\x04':
+                raise ValueError('Missing initial ZIP member header')
+            infos = jar.infolist()
+            expected = KOTLIN_JARS[name]
+            if len(infos) != len(expected) or set(jar.namelist()) != expected:
+                raise ValueError('Fixed Kotlin JAR member set or role differs')
+            if sum(x.file_size for x in infos) > _KOTLIN_EXPANDED_LIMIT:
+                raise ValueError('Expanded Kotlin JAR exceeds its bound')
+            classes = {}
+            for item in infos:
+                with jar.open(item) as stream:
+                    # Bound decompression and check every CRC, including metadata.
+                    data = stream.read(item.file_size + 1)
+                if len(data) != item.file_size:
+                    raise ValueError('Truncated fixed Kotlin JAR member')
+                if item.filename.endswith('.class'):
+                    verify_class_entry(item.filename, data)
+                    classes[item.filename] = hashlib.sha256(data).digest()
+                elif item.filename.endswith('.kotlin_module'):
+                    # Fixed compiler's big-endian metadata version array: 2.4.0.
+                    if len(data) <= 20 or not data.startswith(bytes.fromhex('00000003000000020000000400000000')):
+                        raise ValueError('Invalid fixed Kotlin module metadata')
+                elif not data.startswith(b'Manifest-Version: 1.0'):
+                    raise ValueError('Invalid Kotlin ABI JAR manifest')
+            return classes
+    except (ValueError, OSError, EOFError, zipfile.BadZipFile, RuntimeError, zlib.error) as exc:
+        raise ValueError('Invalid fixed Kotlin JAR ' + name + ': ' + str(exc)) from exc
+
+
+def verify_kotlin_roles(primary, jar_classes):
+    if primary not in KOTLIN_JARS:
+        return
+    abi = primary.removesuffix('.kotlinc.jar') + '.kt-jvm-abi.jar'
+    if primary not in jar_classes or abi not in jar_classes:
+        raise ValueError('Missing fixed Kotlin implementation/ABI pair: ' + primary)
+    main_classes, abi_classes = jar_classes[primary], jar_classes[abi]
+    # All 3+3+16 common classes of the six fixed products had different
+    # implementation/ABI bytes. A genuine, same-named class from the opposite
+    # role is not a replacement for the required output.
+    for name in main_classes.keys() & abi_classes.keys():
+        if main_classes[name] == abi_classes[name]:
+            raise ValueError('Kotlin implementation and ABI class are identical: ' + primary + ' ' + name)
+
+
+def verify_kotlin_disk_pair(out, primary):
+    if primary in KOTLIN_JARS:
+        group = NOMINAL_GROUPS[primary][1]
+        classes = {name: verify_kotlin_jar(name, out / name, (out / name).stat().st_size) for name in group}
+        verify_kotlin_roles(primary, classes)
+
+
+def check_errorprone_marker(primary, material):
+    if primary == ERRORPRONE and material.get(primary) != [0, EMPTY_SHA256]:
+        raise ValueError('Fixed Error Prone completion marker must be an empty file')
+
+
+def nominal_records(row, group):
+    primary = row['primary']
+    expected = NOMINAL_GROUPS.get(primary)
+    if not expected or expected != (row['rule'], tuple(group)) or row['fileargs'] or row['files']:
+        raise ValueError('Unrecognized report-only Android group')
+    suffix = '.kotlinc.jar' if row['rule'] == 'android/compile_kt' else '.stamp'
+    label = primary.removeprefix('obj/').removesuffix(suffix).replace('/', '_')
+    if row['rule'] == 'android/compile_kt':
+        label += '__compile_kt'
+    if row['action'] != '__' + label + '___build_toolchain_android_android_clang_arm64__rule':
+        raise ValueError('Unbound Android action name')
+    obs = row['observation']
+    keys = {'basis', 'material', 'reported_only', 'ninja', 'action_ns', 'window_ns'}
+    if (not isinstance(obs, dict) or set(obs) != keys or obs['basis'] != 'executed'
+            or obs['reported_only'] != [primary + '.md5.stamp']):
+        raise ValueError('Missing current report-only Android output evidence')
+    act, win = obs['action_ns'], obs['window_ns']
+    if (not isinstance(act, list) or len(act) != 2 or not isinstance(win, list) or len(win) != 2
+            or not valid_completion(*act, obs['ninja'], *win)):
+        raise ValueError('Stale or incomplete Android action completion')
+    material = obs['material']
+    if not isinstance(material, dict) or set(material) != set(group):
+        raise ValueError('Missing required material Android output evidence')
+    for rec in material.values():
+        if (not isinstance(rec, list) or len(rec) != 2 or type(rec[0]) is not int or rec[0] < 0
+                or not isinstance(rec[1], str) or not re.fullmatch('[0-9a-f]{64}', rec[1])):
+            raise ValueError('Invalid required material Android output digest')
+    if any(n in KOTLIN_JARS and not 0 < rec[0] <= KOTLIN_JAR_LIMIT for n, rec in material.items()):
+        raise ValueError('Invalid fixed Kotlin JAR size in receipt')
+    check_errorprone_marker(primary, material)
+    return material
+
+
 def stamp_metadata(proof, canonical):
     """Map each evidenced auxiliary output to its ordinary-file size and digest."""
     records = proof.get('runtime_stamps', {})
@@ -510,13 +824,25 @@ def stamp_metadata(proof, canonical):
         raise ValueError('Invalid runtime output records')
     closed = {canonical(g): g for g in proof['closed_groups']}
     declared = {name for group in closed.values() for name in group}
+    required = {canonical(list(group)): primary for primary, (_, group) in NOMINAL_GROUPS.items()
+                if canonical(list(group)) in closed}
+    if required.keys() - records.keys():
+        raise ValueError('Missing fixed Android output evidence for a completed group')
     result = {}
     for edge, row in records.items():
-        if not isinstance(row, dict) or set(row) != {'rule', 'primary', 'action', 'files', 'fileargs'}:
+        keys = {'rule', 'primary', 'action', 'files', 'fileargs'}
+        if edge in required:
+            keys.add('observation')
+        if not isinstance(row, dict) or set(row) != keys:
             raise ValueError('Incomplete runtime output record')
         primary = row['primary']
         if not isinstance(row['action'], str) or not 0 < len(row['action']) <= 512 or row['rule'] not in STAMP_RULES or edge not in closed or primary not in closed[edge]:
             raise ValueError('Unbound runtime output record')
+        if edge in required or row['rule'] in NOMINAL_RULES:
+            if primary != required.get(edge):
+                raise ValueError('Unbound report-only Android output record')
+            result.update(nominal_records(row, closed[edge]))
+            continue
         fileargs = row['fileargs']
         if not isinstance(fileargs, dict) or (fileargs and row['rule'] not in FILEARG_RULES) or len(fileargs) > 64:
             raise ValueError('Unexpected runtime output bindings')
