@@ -10,6 +10,7 @@ import sys
 
 import slot1_handoff
 import s1_resume
+import s1_label_resume
 from slot1_handoff import CAMPAIGN, CLAIM, TICKET_NAME
 from admission import BASE_REF, REPO, REPO_ID, S2_SHA, RELEASE_ID, PagedOwnerDraft, admit, require
 
@@ -162,7 +163,7 @@ def bind(helper, env, event, now, *, verify_only=False):
             and all(event["sender"].get(k) == v for k,v in OWNER.items()), "Unexpected dispatch")
     resume = env.get("R30_RESUME_S1") == "1"
     checked_build_route(event["inputs"], resume=resume)
-    gate = s1_resume if resume else slot1_handoff
+    gate = s1_label_resume if resume else slot1_handoff
     api = helper.metadata(f"{helper.BASE}/actions/runs/{run}/attempts/1")
     require(api["id"] == run and api["run_attempt"] == 1 and api["head_sha"] == revision
             and api["path"] == WORKFLOW and api["event"] == "workflow_dispatch" and api["head_branch"] == BASE_REF
@@ -203,7 +204,7 @@ def bind(helper, env, event, now, *, verify_only=False):
             "Ticket expired or prepared after run creation")
     latest, ack = checked_ack(helper, release, ticket, created, now)
     if resume:
-        s1_resume.fields(ack, s1_resume.route(ticket), "Independent receiver did not accept this candidate and trial")
+        s1_resume.fields(ack, gate.route(ticket), "Independent receiver did not accept this candidate and trial")
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]/"bridge"))
     import storage_admission
     ceiling, until = storage_admission.policy(ticket, ack)
@@ -218,8 +219,8 @@ def bind(helper, env, event, now, *, verify_only=False):
     if "collector_ack_asset_id" not in ticket:
         holder["collector_ack_asset_id"] = ack["collector_ack_asset_id"]
     if resume:
-        holder.update(s1_resume.route(ticket))
-        s1_resume.check_reference(holder, ticket)
+        holder.update(gate.route(ticket))
+        gate.check_reference(holder, ticket)
     else:
         slot1_handoff.check_reference(holder)
     # Independent of ticket ID: two concurrent dispatches cannot bind this campaign twice.
