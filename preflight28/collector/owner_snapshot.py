@@ -108,7 +108,7 @@ class OwnerSnapshot:
         require(gui["form_id"]==f"edit_release_{p.RELEASE_ID}" and
                 gui["release_url"]==WEB+"tag/"+tag and gui["label"]=="Draft" and
                 gui["title"]==h.DRAFT_TITLE and gui["viewer"]==h.OWNER and gui["author"]==h.OWNER and gui["target"] in h.DRAFT_TARGETS and
-                alias in (h.DRAFT_TAG_SHA256,anchor.TAG_SHA), "Different owner, release, alias, target or visibility")
+                (alias == h.DRAFT_TAG_SHA256 or anchor.is_observed_rotation(alias)), "Different owner, release, alias, target or visibility")
         rows=gui["assets"]
         require(type(gui["asset_count"]) is int and len(rows)==gui["asset_count"]<=1000 and
                 len({r["name"] for r in rows})==len(rows),"Incomplete or ambiguous owner Draft list")
@@ -122,7 +122,7 @@ class OwnerSnapshot:
             p.journal.timestamp(row["created_at"])
             self.listed[name]=row
         probes=[(h.SAMPLE,h.PROBE_BYTES,h.PROBE_SHA)]
-        if alias==anchor.TAG_SHA:
+        if anchor.is_observed_rotation(alias):
             probes.extend((name,size,sha) for name,_,size,sha in anchor.CLAIMS)
         for name,length,sha in probes:
             require(self.listed[name]["sha256"]==sha and self.listed[name]["state"]=="uploaded" and
@@ -304,7 +304,7 @@ class OwnerSnapshot:
     def resolve_original_ticket(self, intent):
         """Complete an owner-pinned locator only from the original binder's evidence."""
         self.visible()
-        ticket = p.CAMPAIGN + "-collection-registration.json"
+        ticket = p.TICKET_NAME
         self.private_file(ticket, 4096, intent["ticket_sha"])
         origin = self.private_hint(p.CLAIM)["run_id"]
         names, owners = [ticket,p.CLAIM], [ticket]
@@ -322,7 +322,7 @@ class OwnerSnapshot:
 
     def draft_rows(self,locator):
         self.visible()
-        ticket=p.CAMPAIGN+"-collection-registration.json"
+        ticket=p.TICKET_NAME
         require(self.listed[ticket]["sha256"]==locator["ticket_sha"],"Reservation differs from personal locator")
         origin=self.private_hint(p.CLAIM)["run_id"]
         head=locator["head"]

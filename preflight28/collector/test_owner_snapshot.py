@@ -61,7 +61,7 @@ class SnapshotTest(unittest.TestCase):
         common=dict(schema=1,campaign=p.CAMPAIGN,repository_id=p.REPO_ID,workflow=p.WORKFLOW,branch=p.BASE_REF,head=self.head,
                     release_id=p.RELEASE_ID,recipient=p.apk_seal.RECIPIENT,initial_parent=p.S2_SHA)
         service="Automation_"+"a"*32
-        name=p.CAMPAIGN+"-collection-registration.json"
+        name=p.TICKET_NAME
         t=raw(dict(common,collector_registration_id=service,owner_destination_id="owner-private-file-id"))
         self.add_private(name,t)
         self.locator=dict(ticket_asset_id=200,ticket_sha=hashed(t),head=self.head,registration_id=service,owner_destination_id="owner-private-file-id")
@@ -135,6 +135,30 @@ class SnapshotTest(unittest.TestCase):
         receipt=self.collect();self.assertEqual(receipt["artifact_id"],self.cipher_asset["id"])
         self.assertEqual(self.collect(),receipt)
         self.assertEqual((self.root/"accepted"/p.apk_seal.CIPHER_FILE).read_bytes(),self.cipher)
+
+    def test_owner_capture_for_r30_rotation_uses_both_original_receipt_files(self):
+        import r28_verified_draft as anchor
+        self.delivery()
+        current = "untagged-" + "a" * 20
+        for row in self.rows:
+            row["href"] = row["href"].replace("/" + self.tag + "/", "/" + current + "/")
+        self.tag = current
+        self.gui.update(tag=current, release_url=o.WEB + "tag/" + current)
+        fixtures = Path(__file__).resolve().parents[1] / "transport" / "fixtures"
+        for name, aid, _, _ in anchor.CLAIMS:
+            self.add_private(name, (fixtures / f"claim-{aid}.json").read_bytes())
+        self.write()
+        with patch.object(anchor, "R30_TAG_SHA", hashed(current.encode())):
+            self.assertEqual(self.collect()["artifact_id"], self.cipher_asset["id"])
+            for name, _, _, _ in anchor.CLAIMS:
+                file = self.root / "private" / name
+                original = file.read_bytes()
+                file.write_bytes(b"wrong")
+                with self.assertRaises(ValueError):
+                    self.collect()
+                file.write_bytes(original)
+        with self.assertRaises(ValueError):
+            self.collect()
 
     def test_owner_intent_recovers_ticket_id_only_from_original_job(self):
         self.delivery(); self.write()
