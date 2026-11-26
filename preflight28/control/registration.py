@@ -10,10 +10,10 @@ import sys
 
 from admission import BASE_REF, REPO, REPO_ID, S2_SHA, RELEASE_ID, PagedOwnerDraft, admit, require
 
-CAMPAIGN = "bare-personal-204-r29"
-PREVIOUS_CAMPAIGN = "bare-personal-204-r28"
-PREVIOUS_HEAD = "f3ed4479912a30959859d81328af3fd4dc6d8d00"
-PREVIOUS_TICKET_SHA = "f1d71505eecef0fc11af50dc5d411e17031fb903e6b85613a5aec559546e505b"
+CAMPAIGN = "bare-personal-204-r30"
+PREVIOUS_CAMPAIGN = "bare-personal-204-r29"
+PREVIOUS_HEAD = "5737dcb88171dea54566bf4202d3d17092a1d176"
+PREVIOUS_TICKET_SHA = "d6be078c59a3ab8c56ab928a8c0e183d76f39ddccba241586b676f2bfe49568a"
 CLAIM = CAMPAIGN + "-production-run-claim.json"
 WORKFLOW = ".github/workflows/bare-checkpoint-transfer.yml"
 OWNER = {"id": 292261483, "login": "Areal-U"}
