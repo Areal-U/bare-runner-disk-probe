@@ -126,22 +126,32 @@ def collection_claim(api,release,ctx):
     from registration import CAMPAIGN, CLAIM, TICKET_NAME
     import slot1_handoff as handoff
 
-    genesis = read_claim(api, release, CLAIM)
+    import s1_resume
+    successor = read_claim(api,release,s1_resume.CLAIM)
+    resumed = successor is not None and successor[1].get("run_id") == ctx["run"]
+    gate = s1_resume if resumed else handoff
+    genesis = successor if resumed else read_claim(api, release, CLAIM)
     if not genesis:
         return None
     original_id, original = genesis
-    handoff.check_reference(original)
-    rows = [r for r in release["assets"] if r["name"] == TICKET_NAME]
+    if not resumed:
+        gate.check_reference(original)
+    rows = [r for r in release["assets"] if r["name"] == gate.TICKET_NAME]
     b.require(len(rows) == 1 and 0 < rows[0]["size"] <= 4096, "Missing or ambiguous handoff registration")
-    ticket = handoff.read_fixed(api, release, TICKET_NAME, original["ticket_asset_id"],
+    ticket = handoff.read_fixed(api, release, gate.TICKET_NAME, original["ticket_asset_id"],
                                 rows[0]["size"], original["ticket_sha"], owner=True)
     b.require(ticket["collector_registration_id"] == original["registration_id"] and
               ticket["head"] == ctx["producer_sha"], "Different handoff recovery registration")
-    handoff.validate_source(api, release, ticket, initial=False)
+    if resumed:
+        gate.check_reference(original,ticket)
+        b.require(ctx["ordinal"] >= 2 and (ctx["ordinal"] != 2 or
+                  (ctx["parent_sha"],ctx["parent_identity"])==(gate.PARENT_SHA,gate.PARENT_IDENTITY)),
+                  "Different authenticated slot-2 parent")
+    gate.validate_source(api, release, ticket, initial=False)
     binding = {"schema":1,"campaign":CAMPAIGN,"repository_id":1450926240,
                "workflow":".github/workflows/bare-checkpoint-transfer.yml","branch":"bare-coexist-v2.0.4",
                "head":ctx["producer_sha"],"release_id":b.RELEASE,"recipient":RECIPIENT,"producer_attempt":1}
-    b.require(original.get("initial_parent") == b.PARENT_SHA and
+    b.require(original.get("initial_parent") == (s1_resume.PARENT_SHA if resumed else b.PARENT_SHA) and
               all(original.get(k) == v for k,v in binding.items()), "Wrong original collection claim")
     if original["run_id"] == ctx["run"]:
         return original_id
