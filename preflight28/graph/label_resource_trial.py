@@ -2,6 +2,7 @@
 
 import argparse
 from collections import defaultdict
+import hashlib
 import json
 from pathlib import Path
 import time
@@ -162,6 +163,42 @@ def relink(out, command, target, permitted, old, *, labels=None):
     return executed
 
 
+def inventory_mismatch(parent, current, authorized):
+    # Commit every discrepancy in path order, but keep only three sample paths
+    # per class in the public log. A symlink record stores no length.
+    counts = {"missing": 0, "changed": 0, "added": 0}
+    samples = {kind: [] for kind in counts}
+    digest = hashlib.sha256()
+    for name in sorted(parent.keys() | current.keys()):
+        before, after = parent.get(name), current.get(name)
+        if before == after or (after is not None and name in authorized):
+            continue
+        kind = "missing" if after is None else "added" if before is None else "changed"
+        counts[kind] += 1
+        row = json.dumps([kind, name, before, after], ensure_ascii=True, separators=(",", ":"))
+        digest.update(row.encode("ascii") + b"\n")
+        if len(samples[kind]) < 3:
+            display = name if len(name) <= 240 else name[:118] + "..." + name[-118:]
+            # f:<execute bits>:<bytes>:<SHA256>, l:<target SHA256>, or null.
+            samples[kind].append(dict(path=display, old=before, new=after))
+    return dict(counts=counts, sha256=digest.hexdigest(), samples=samples)
+
+
+def verify_resource_inventory(parent, current, authorized):
+    try:
+        replacements = compare_payload(parent, current, authorized)
+        if RAW not in replacements or OPTIMIZED not in replacements:
+            raise ValueError("Resource APK did not change")
+        added_files = current.keys() - parent.keys()
+        if not added_files <= authorized:
+            raise ValueError("Unattributed new resource files: " + str(sorted(added_files - authorized)[:8]))
+    except ValueError:
+        print("BARE_LABEL_INVENTORY_MISMATCH " + json.dumps(inventory_mismatch(parent, current, authorized),
+                                                          sort_keys=True), flush=True)
+        raise
+    return replacements, added_files
+
+
 def migrate(out, baseline, mode):
     from personal_label import prepare, UPSTREAM_SHA, PERSONAL_SHA
     from contract_gate import verify_pending_contract
@@ -208,12 +245,7 @@ def migrate(out, baseline, mode):
     authorized = {name for group in executed for name in group}
     authorized.update(name + ".md5.stamp" for name in tuple(authorized) if name.endswith(".resources.zip"))
     current = inventory(out)
-    replacements = compare_payload(original["files"], current, authorized)
-    if RAW not in replacements or OPTIMIZED not in replacements:
-        raise ValueError("Resource APK did not change")
-    added_files = current.keys() - original["files"].keys()
-    if not added_files <= authorized:
-        raise ValueError("Unattributed new resource files: " + str(sorted(added_files - authorized)[:8]))
+    replacements, added_files = verify_resource_inventory(original["files"], current, authorized)
 
     verify_pending_contract(out, remaining, rules, parent_sha=S1_SHA, graph=GRAPH)
     report = {"mode": mode, "parent_sha256": S1_SHA, "old_pending": len(old),

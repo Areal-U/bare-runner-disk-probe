@@ -103,3 +103,63 @@ class AuthenticatedRuntimeStampTest(unittest.TestCase):
                 relink(Path("/work/src/out/Bare"), [], RAW, {canonical(target)}, set(), labels=evidence)
         self.assertEqual(evidence, {RAW: observed})
         verifier.assert_called_once()
+
+
+class ResourceInventoryEvidenceTest(unittest.TestCase):
+    def setUp(self):
+        from label_resource_trial import RAW, OPTIMIZED
+        self.before = "f:0:1:" + "1"*64
+        self.after = "f:0:2:" + "2"*64
+        self.parent = {RAW:self.before, OPTIMIZED:self.before}
+        self.current = {RAW:self.after, OPTIMIZED:self.after}
+        self.allowed = {RAW, OPTIMIZED, "permitted"}
+
+    def check_failure(self, message):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        import json
+        from label_resource_trial import verify_resource_inventory
+        stream = StringIO()
+        with redirect_stdout(stream), self.assertRaisesRegex(ValueError,message):
+            verify_resource_inventory(self.parent,self.current,self.allowed)
+        lines = stream.getvalue().splitlines()
+        self.assertEqual(len(lines),1)
+        self.assertTrue(lines[0].startswith("BARE_LABEL_INVENTORY_MISMATCH "))
+        return json.loads(lines[0].split(" ",1)[1])
+
+    def test_failing_gate_reports_all_classes_and_binds_unsampled_rows(self):
+        from label_resource_trial import inventory_mismatch
+        for i in range(6):
+            self.parent[f"changed/{i}"] = self.before
+            self.current[f"changed/{i}"] = self.after
+        self.parent["permitted"] = self.before  # Old files, including authorized ones, cannot vanish.
+        self.current["new/link"] = "l:" + "a"*64
+        result = self.check_failure("Previously present payload disappeared: permitted")
+        self.assertEqual(result["counts"], {"missing":1, "changed":6, "added":1})
+        self.assertEqual(len(result["samples"]["changed"]),3)
+        self.assertEqual(result["samples"]["changed"][0],dict(path="changed/0",old=self.before,new=self.after))
+        self.assertEqual(result["samples"]["added"],[dict(path="new/link",old=None,new=self.current["new/link"])])
+        self.assertEqual(inventory_mismatch(dict(reversed(list(self.parent.items()))),
+                        self.current,self.allowed)["sha256"],result["sha256"])
+        self.current["changed/5"] = "f:0:3:" + "3"*64
+        self.assertNotEqual(self.check_failure("Previously present payload disappeared")["sha256"],result["sha256"])
+
+    def test_existing_error_order_and_success_without_diagnostic(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from label_resource_trial import verify_resource_inventory, RAW, OPTIMIZED
+        self.parent["bad"] = self.before
+        self.current.update(bad=self.after, extra=self.after)
+        self.check_failure("Unaccounted retained output replacement: bad")
+        self.current["bad"] = self.before
+        self.check_failure("Unattributed new resource files")
+        self.allowed.add("extra")
+        self.current[RAW] = self.before
+        self.check_failure("Resource APK did not change")
+        self.current[RAW] = self.after
+        stream = StringIO()
+        with redirect_stdout(stream):
+            changed, added = verify_resource_inventory(self.parent,self.current,self.allowed)
+        self.assertEqual(set(changed),{RAW,OPTIMIZED})
+        self.assertEqual(added,{"extra"})
+        self.assertEqual(stream.getvalue(),"")
