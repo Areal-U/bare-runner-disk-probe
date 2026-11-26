@@ -15,6 +15,8 @@ import tempfile
 from zipfile import ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "control"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "signing"))
+from launcher_labels import verify_labels
 import apk_seal
 from admission import BASE_REF, PagedOwnerDraft, RELEASE_ID, REPO, REPO_ID, S2_SHA, require
 import slot1_handoff as handoff
@@ -363,6 +365,7 @@ def verify_signer(file, expected, apksigner, *, v1_only=False):
 
 def verify_application(file, aapt2):
     binding = subprocess.check_output([str(aapt2), "dump", "badging", str(file)], text=True, timeout=120)
+    verify_labels(aapt2, file, binding)
     lines = binding.splitlines()
     packages = [line for line in lines if line.startswith("package:")]
     require(len(packages) == 1, "Expected one package")
