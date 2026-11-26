@@ -794,6 +794,56 @@ def verify_reuse_markers(markers, source_root=ROOTS["src"]):
     return observed
 
 
+# Enabled only by the private zstd reader. The three persistent object markers
+# remain regular, nonempty files in every format.
+PRIVATE_ANDROID_SAMPLES = False
+HOST_ALIAS = "out/Bare/devil_util_host"
+HOST_LINK_TEXT = "clang_x64/devil_util_bin"
+HOST_PROGRAM = "out/Bare/" + HOST_LINK_TEXT
+ERRORPRONE_MARKER = "out/Bare/obj/chrome/browser/xsurface/java__errorprone.stamp"
+
+
+SEGMENT_FRONTIER = "out/Bare/checkpoint-segment-frontier.json"
+FRONTIER_LIMIT = 64 * 1024**2
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+
+
+def zero_witnesses(payload, edges, ninja_record):
+    """Return actual zero material from whole, currently successful GN witnesses."""
+    proof = json.loads(payload)
+    if (proof.get("format") != "bare-apk-segment-frontier-v4" or proof.get("target") != "chrome_public_apk"
+            or not re.fullmatch(r"[0-9a-f]{64}", str(proof.get("graph", "")))):
+        raise ValueError("Empty continuation sample lacks the current fixed-graph proof")
+    if not ninja_record or proof.get("ninja_log") != ninja_record:
+        raise ValueError("Current Ninja completion log differs from the empty-output proof")
+    before, after = set(proof["before"]), set(proof["after"])
+    closed = {canonical_hash(group): group for group in proof["closed_groups"]}
+    if (not after < before or set(closed) != before - after
+            or len(closed) != len(proof["closed_groups"]) or len(before) != len(proof["before"])
+            or len(after) != len(proof["after"])):
+        raise ValueError("Empty sample has an inconsistent APK frontier")
+    steps = proof.get("zero_witness_steps", {})
+    witnesses = proof.get("witnesses")
+    if not isinstance(witnesses, list) or not 1 <= len(witnesses) <= 3 or not isinstance(steps, dict):
+        raise ValueError("Invalid current zero-output witness set")
+    result = {}
+    for files in witnesses:
+        group = sorted(files)
+        edge = canonical_hash(group)
+        if not group or group != closed.get(edge):
+            raise ValueError("Empty sample did not come from a complete retired GN group")
+        step = steps.get(edge)
+        if not isinstance(step, str) or not step:
+            continue
+        material = {"out/Bare/" + safe_relative(n).as_posix(): rec for n, rec in files.items()}
+        if any(edges.get(n) != step for n in material):
+            continue
+        for name, rec in material.items():
+            if rec == [0, EMPTY_SHA256] and type(rec[0]) is int:
+                result[name] = (edge, material)
+    return result
+
+
 def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *,
                         scale=False, large=False, production=False):
     trial_limit = continuation_trial_limit(scale, large, production)
@@ -806,6 +856,7 @@ def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *,
     bootstrap = production and trial["phase"] == "seed"
     if bootstrap and os.path.lexists(record_path):
         raise ValueError("A production seed requires a new continuation record")
+    private = production and not bootstrap and PRIVATE_ANDROID_SAMPLES
     new_paths = {"out/Bare/" + item["path"] for item in trial["new_completed_outputs"]}
 
     def output_priority(name):
@@ -814,6 +865,7 @@ def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *,
         return (production and name not in new_paths, not target_object, not is_object, name)
 
     outputs = []
+    zero_candidates = []
     for name in sorted(edges, key=output_priority):
         relative = PurePosixPath(name)
         if bootstrap and (relative.parts[:3] != ("out", "Bare", "obj")
@@ -828,16 +880,62 @@ def record_continuation(trial_path, record_path, source_root=ROOTS["src"], *,
             continue
         # The readback checks regular archive members directly. GNU tar can
         # represent multiply linked filesystem files as hardlink members.
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not info.st_size:
+        link_sample = private and name == HOST_ALIAS
+        if link_sample:
+            if not stat.S_ISLNK(info.st_mode) or os.readlink(path) != HOST_LINK_TEXT:
+                raise ValueError("Unexpected fixed host utility link")
+            path = path_without_symlink_parents(source_root, PurePosixPath(HOST_PROGRAM))
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or not info.st_size or not info.st_mode & 0o111:
+                raise ValueError("Missing fixed executable for host utility link")
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            continue
+        if private and name == ERRORPRONE_MARKER and info.st_size:
+            raise ValueError("Unexpected contents in fixed Error Prone completion marker")
+        if not info.st_size:
+            if private:
+                zero_candidates.append(name)
             continue
         if ((production and info.st_size > PRODUCTION_UNPACKED_BYTES)
                 or ((bootstrap or large) and info.st_size > 2 * 1024 ** 3)):
             continue
         metadata = object_metadata(path, source_root)
-        outputs.append({"path": name, "step_id": edges[name], "size": metadata["size"],
-                        "sha256": metadata["sha256"]})
+        sample = {"path": name, "step_id": edges[name], "size": metadata["size"], "sha256": metadata["sha256"]}
+        if link_sample:
+            sample["link_target"] = HOST_LINK_TEXT
+        outputs.append(sample)
         if len(outputs) == 3:
             break
+    if not outputs and zero_candidates:
+        frontier_path = path_without_symlink_parents(source_root, PurePosixPath(SEGMENT_FRONTIER))
+        try:
+            info = frontier_path.lstat()
+        except FileNotFoundError:
+            raise ValueError("No current frontier proof for an empty continuation sample") from None
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= FRONTIER_LIMIT:
+            raise ValueError("Invalid private continuation frontier")
+        payload_bytes = frontier_path.read_bytes()
+        ninja = object_metadata(source_root / "out/Bare/.ninja_log", source_root)
+        eligible = zero_witnesses(payload_bytes, edges, [ninja["size"], ninja["sha256"]])
+        checked_groups = set()
+        frontier_sha = hashlib.sha256(payload_bytes).hexdigest()
+        for name in zero_candidates:
+            if name in eligible:
+                edge, material = eligible[name]
+                if edge not in checked_groups:
+                    for member, rec in material.items():
+                        candidate = path_without_symlink_parents(source_root, PurePosixPath(member))
+                        info = candidate.lstat()
+                        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                            raise ValueError("Missing or irregular material in empty-output GN group")
+                        actual = object_metadata(candidate, source_root)
+                        if rec != [actual["size"], actual["sha256"]]:
+                            raise ValueError("Current material differs from empty-output GN group")
+                    checked_groups.add(edge)
+                outputs.append(dict(path=name, step_id=edges[name], size=0, sha256=EMPTY_SHA256,
+                                    witness_edge=edge, frontier_sha256=frontier_sha))
+                if len(outputs) == 3:
+                    break
     if not outputs:
         raise ValueError("The continuation produced no verifiable new regular output")
     record = {"format": CONTINUATION_FORMAT, "version": 2 if production else 1,
@@ -899,6 +997,7 @@ def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=F
             or not isinstance(record.get("outputs"), list) or not 1 <= len(record["outputs"]) <= 3):
         raise ValueError("Invalid continuation evidence or trial binding")
     expected = {}
+    private = production and trial["phase"] == "restore" and PRIVATE_ANDROID_SAMPLES
     max_output_bytes = PRODUCTION_UNPACKED_BYTES if production else 2 * 1024 ** 3
     for item in record["outputs"]:
         if not isinstance(item, dict):
@@ -907,13 +1006,35 @@ def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=F
         name = path.as_posix()
         if (name in expected or name not in edges or item.get("step_id") != edges[name]
                 or (production and is_android_packaging(path))
-                or type(item.get("size")) is not int or not 0 < item["size"] <= max_output_bytes
+                or type(item.get("size")) is not int or not 0 <= item["size"] <= max_output_bytes
+                or (private and name == ERRORPRONE_MARKER and item["size"] != 0)
+                or (item["size"] == 0 and
+                    (not private or item.get("sha256") != EMPTY_SHA256
+                     or not re.fullmatch(r"[0-9a-f]{64}", str(item.get("witness_edge", "")))
+                     or not re.fullmatch(r"[0-9a-f]{64}", str(item.get("frontier_sha256", "")))))
+                or (item["size"] != 0 and ("witness_edge" in item or "frontier_sha256" in item))
+                or ("link_target" in item and not (private and name == HOST_ALIAS))
+                or (private and name == HOST_ALIAS and item.get("link_target") != HOST_LINK_TEXT)
                 or not isinstance(item.get("sha256"), str)
                 or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])):
             raise ValueError("Invalid continuation output evidence")
         expected[name] = item
 
     sample_paths = sorted(expected)
+    zero_samples = {n: v for n, v in expected.items() if v["size"] == 0}
+    if zero_samples and len(zero_samples) != len(sample_paths):
+        raise ValueError("Zero continuation samples are only a fallback")
+    zero_steps = {v["step_id"] for v in zero_samples.values()}
+    witness_paths = {n for n, step in edges.items() if step in zero_steps} if zero_samples else set()
+    if zero_samples:
+        witness_paths.add("out/Bare/.ninja_log")
+    zero_payload = None
+    witness_bytes = {}
+    alias = expected.get(HOST_ALIAS) if private else None
+    if alias:
+        if HOST_PROGRAM in expected and any(expected[HOST_PROGRAM][k] != alias[k] for k in ("size", "sha256")):
+            raise ValueError("Host utility link and executable sample differ")
+        expected[HOST_PROGRAM] = alias
     if production:
         markers = reuse_markers(record)
         if trial["phase"] == "seed" and (markers.keys() != expected.keys()
@@ -945,18 +1066,46 @@ def verify_continuation(archive_path, expected_identity, ci_revision, *, scale=F
             name = member.name
             if production and is_android_packaging(archive_relative(name)):
                 raise ValueError("Public checkpoint contains Android packaging output: " + ascii(name)[:200])
-            if name not in expected:
+            if zero_samples and name == SEGMENT_FRONTIER:
+                if zero_payload is not None or not member.isfile() or not 0 < member.size <= FRONTIER_LIMIT:
+                    raise ValueError("Invalid archived private continuation frontier")
+                with archive.extractfile(member) as stream:
+                    zero_payload = stream.read(member.size)
+            if name not in expected and name not in witness_paths:
                 continue
-            item = expected[name]
-            if name in verified or not member.isfile() or member.size != item["size"]:
+            item = expected.get(name)
+            if alias and name == HOST_ALIAS:
+                if name in verified or not member.issym() or member.linkname != HOST_LINK_TEXT:
+                    raise ValueError("Wrong archived host utility link")
+                verified.add(name)
+                continue
+            if alias and name == HOST_PROGRAM and not member.mode & 0o111:
+                raise ValueError("Archived host utility lost executable mode")
+            if item is None and not member.isfile():
+                continue
+            if name in verified or name in witness_bytes or not member.isfile() or (item and member.size != item["size"]):
                 raise ValueError("Invalid archived continuation output: " + name)
             digest = hashlib.sha256()
             with archive.extractfile(member) as stream:
                 for block in iter(lambda: stream.read(4 * 1024 ** 2), b""):
                     digest.update(block)
-            if digest.hexdigest() != item["sha256"]:
-                raise ValueError("Archived continuation output content differs: " + name)
-            verified.add(name)
+            actual_digest = digest.hexdigest()
+            if name in witness_paths:
+                witness_bytes[name] = [member.size, actual_digest]
+            if item is not None:
+                if actual_digest != item["sha256"]:
+                    raise ValueError("Archived continuation output content differs: " + name)
+                verified.add(name)
+    if zero_samples:
+        if zero_payload is None:
+            raise ValueError("Missing archived witness for zero material")
+        actual_sha = hashlib.sha256(zero_payload).hexdigest()
+        eligible = zero_witnesses(zero_payload, edges, witness_bytes.get("out/Bare/.ninja_log"))
+        for name, item in zero_samples.items():
+            if item["frontier_sha256"] != actual_sha or name not in eligible or eligible[name][0] != item["witness_edge"]:
+                raise ValueError("Unbound archived zero continuation sample")
+            if any(witness_bytes.get(n) != rec for n, rec in eligible[name][1].items()):
+                raise ValueError("Incomplete archived material group for zero sample")
     if verified != expected.keys():
         raise ValueError("Missing archived continuation output: " + ", ".join(sorted(expected.keys() - verified)))
     result = {"verified": len(sample_paths), "paths": sample_paths}
