@@ -6,8 +6,8 @@ import json
 from pathlib import Path
 import time
 
-from graph import canonical, run, sha
-from retained import commitment, compare_payload, inventory
+from graph import canonical, file_record, run, sha
+from retained import ANDROID_RULES_SHA256, commitment, compare_payload, inventory
 from segment_graph import load, plan, write_record
 from angle_restore import GRAPH, S1_PROOF_SHA, S1_SHA
 
@@ -17,6 +17,15 @@ APK = "apks/ChromePublic.apk"
 OPTIMIZED_SHA = "a01ff002507636f864c6fc62b4b153f5fec8e8fa3436af79a012098b659420db"
 SOURCE = "../../chrome/android/java/res_chromium_base/values/bare_launcher_label.xml"
 RAW_SHA = "b319b80fae9723d99a5d3441a4e6bcb778ea35e32b63f203cb3a289aa8baa40e"
+PERSONAL_RESOURCE_SHA = {
+    RAW: "a664cc5b6e46e862d247e3aaf97e4a2784b8d5a2c74555c4a609d0bb4086498d",
+    OPTIMIZED: "23041a04f9719bd42727b4c7a4f9c15cc011c81f5ccddb5aabc21881fa56953f",
+}
+JAVAC = "obj/chrome/android/chrome_public_apk.javac.jar"
+JAVAC_GROUP = (JAVAC, JAVAC + ".info")
+JAVAC_STAMP = JAVAC + ".md5.stamp"
+JAVAC_ACTION = "__chrome_android_chrome_public_apk__compile_java___build_toolchain_android_android_clang_arm64__rule"
+JAVAC_RULE = "android/compile_java"
 MANIFESTS = {
     "toolchain.ninja": "02f0e819a46bd2b601d5dbb3bd15c98cf12244b6e55fe41f37c9ac0d0b4f9896",
     "build.ninja": "34759cff04ca63a00da8891250cde7aee91dcefc11bcf407c41b69d74539192e",
@@ -84,7 +93,30 @@ def check_plan(old, current, allowed):
                          f"{len(foreign)} unrelated groups: {sorted(missing | foreign)[:8]}")
 
 
-def relink(out, command, target, permitted, old):
+def verify_s1_javac_stamp(out, proof):
+    # The incoming proof was authenticated before this call. It binds the
+    # sidecar to this GN group, command and exact original bytes.
+    claim = proof["runtime_stamps"][canonical(JAVAC_GROUP)]
+    if (claim != dict(primary=JAVAC, rule=JAVAC_RULE, action=JAVAC_ACTION,
+                      fileargs={}, files={JAVAC_STAMP: file_record(out, JAVAC_STAMP)}) or
+            sha(out.parent.parent / "build/config/siso/android.star") != ANDROID_RULES_SHA256):
+        raise ValueError("Missing or changed authenticated Java compiler stamp or Siso handler")
+
+
+def declared_groups(executed, details):
+    groups = set()
+    for names, action in executed.items():
+        declared = names
+        if JAVAC in names or JAVAC_STAMP in names:
+            if (names != (*JAVAC_GROUP, JAVAC_STAMP) or action != JAVAC_ACTION or
+                    details.get(canonical(names)) != [JAVAC_RULE, JAVAC, JAVAC_ACTION]):
+                raise ValueError(f"Unexpected Java compiler metric: {action}, {names!r}")
+            declared = JAVAC_GROUP
+        groups.add(declared)
+    return groups
+
+
+def relink(out, command, target, permitted, old, *, labels=None):
     expected = run(out, command, [target], dry=True)
     ids = {canonical(group) for group in expected}
     if not ids or not ids <= permitted or ids & old:
@@ -92,20 +124,45 @@ def relink(out, command, target, permitted, old):
     # Real old S1 timings: raw link 42.229s, R8 329.013s and optimization 5.321s.
     # Both commands are also bounded by the outer 30-minute step timeout.
     print("BARE_LABEL_RELINK " + json.dumps({"target": target, "planned": len(ids)}), flush=True)
+    old_sha = sha(out / target) if target in PERSONAL_RESOURCE_SHA else None
+    details = {}
     executed = run(out, command, [target], dry=False, isolated_logs=True,
-                   timeout_seconds=1080 if target == OPTIMIZED else 600)
-    actual = {canonical(group) for group in executed}
+                   plan_rules=({JAVAC_RULE}, details), timeout_seconds=1080 if target == OPTIMIZED else 600)
+    new_sha = sha(out / target) if target in PERSONAL_RESOURCE_SHA else None
+    examples = list(executed) if target == OPTIMIZED else list(executed)[:2]
+    print("BARE_LABEL_EXECUTION " + json.dumps(dict(target=target, before=old_sha, after=new_sha,
+          steps=len(executed), metrics=[{"action": executed[g], "outputs": g} for g in examples[:8]])), flush=True)
+    if target in PERSONAL_RESOURCE_SHA:
+        from launcher_labels import verify_labels
+        aapt2 = out.parent.parent / "third_party/android_sdk/public/build-tools/37.0.0/aapt2"
+        observed_labels = verify_labels(aapt2, out / target)
+        print("BARE_LABEL_VERIFIED " + json.dumps(dict(target=target, labels=observed_labels)), flush=True)
+        if labels is not None:
+            labels[target] = observed_labels
+        if new_sha != PERSONAL_RESOURCE_SHA[target]:
+            raise ValueError(f"{target}: expected Personal SHA {PERSONAL_RESOURCE_SHA[target]}, got {new_sha}")
+    declared = declared_groups(executed, details)
+    actual = {canonical(group) for group in declared}
     # Siso -n cannot foresee a restat producer changing one of several outputs.
     # A downstream action may run only after that producer has actually finished.
-    if not actual or not actual <= permitted or actual & old or not any(target in group for group in executed):
-        raise ValueError(f"{target} execution escaped its fixed GN dependency scope or did not relink")
+    outside = actual - permitted
+    overlap = actual & old
+    linked = any(target in group for group in declared)
+    if not actual or outside or overlap or not linked:
+        samples = [group for group in sorted(declared) if canonical(group) in outside | overlap][:5]
+        raise ValueError(f"{target}: executed={len(actual)}, outside={len(outside)}, "
+                         f"original_pending={len(overlap)}, linked={linked}, unexpected={samples!r}")
+    if any(JAVAC_STAMP in group for group in executed):
+        stamp = file_record(out, JAVAC_STAMP)
+        if not stamp[0]:
+            raise ValueError("Java compiler reported an empty stamp")
+        print("BARE_LABEL_JAVAC_STAMP " + json.dumps(dict(bytes=stamp[0], sha256=stamp[1])), flush=True)
     if run(out, command, [target], dry=True):
         raise ValueError(f"{target} remained dirty after execution")
     return executed
 
 
 def migrate(out, baseline, mode):
-    from launcher_labels import verify_labels
     from personal_label import prepare, UPSTREAM_SHA, PERSONAL_SHA
     from contract_gate import verify_pending_contract
 
@@ -121,6 +178,7 @@ def migrate(out, baseline, mode):
             commitment(original["files"]) != proof["child_content"] or sha(out / RAW) != RAW_SHA
             or sha(out / OPTIMIZED) != OPTIMIZED_SHA):
         raise ValueError("The R30 S1 baseline or its linked resources differ")
+    verify_s1_javac_stamp(out, proof)
     raw_scope, optimized_scope, apk_scope = permitted_actions(out)
     command = ["autoninja"]
     if run(out, command, [RAW, OPTIMIZED], dry=True):
@@ -131,15 +189,10 @@ def migrate(out, baseline, mode):
 
     changed_plan = set(plan(out, command))
     check_plan(old, changed_plan, apk_scope)
-    aapt2 = src / "third_party/android_sdk/public/build-tools/37.0.0/aapt2"
-    executed = relink(out, command, RAW, raw_scope, old)
-    raw_labels = verify_labels(aapt2, out / RAW)
-    # The final apkbuilder consumes optimized.ap_, not the just-verified raw file.
-    # On this fixed old S1 the original optimized bytes were observed to say Bare.
-    optimized_work = relink(out, command, OPTIMIZED, optimized_scope, old)
-    optimized_labels = verify_labels(aapt2, out / OPTIMIZED)
-    if sha(out / OPTIMIZED) == OPTIMIZED_SHA:
-        raise ValueError("Retained upstream-branded final resource package")
+    labels = {}
+    executed = relink(out, command, RAW, raw_scope, old, labels=labels)
+    # The final apkbuilder consumes optimized.ap_, not the intermediate raw file.
+    optimized_work = relink(out, command, OPTIMIZED, optimized_scope, old, labels=labels)
     if set(executed) & set(optimized_work):
         raise ValueError("Optimizing resources repeated a previously finished raw action")
     executed.update(optimized_work)
@@ -166,8 +219,8 @@ def migrate(out, baseline, mode):
     report = {"mode": mode, "parent_sha256": S1_SHA, "old_pending": len(old),
               "before_resource_rebuild": len(changed_plan), "remaining": len(remaining),
               "resource_executed": len(executed), "replacements": replacements, "new_files": sorted(added_files),
-              "source": transition, "resource_sha256": sha(out / RAW), "raw_labels": raw_labels,
-              "optimized_sha256": sha(out / OPTIMIZED), "optimized_labels": optimized_labels,
+              "source": transition, "resource_sha256": sha(out / RAW), "raw_labels": labels[RAW],
+              "optimized_sha256": sha(out / OPTIMIZED), "optimized_labels": labels[OPTIMIZED],
               "additional_pending": sorted(set(remaining) - old), "retained": commitment(current)}
     write_record(baseline.with_name("label-resource-migration.json"), report)
     if mode == "prepare":
