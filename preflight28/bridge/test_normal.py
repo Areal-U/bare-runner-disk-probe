@@ -55,6 +55,29 @@ class LocalDraft:
 
 
 class TestTransport(unittest.TestCase):
+    def add_handoff(self, api, claim, aid):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "control"))
+        import registration
+        import slot1_handoff as h
+        from test_handoff_sample import sample
+
+        def publish(name, ident, data, owner=False):
+            sha = hashlib.sha256(data).hexdigest()
+            api.assets.append(dict(name=name,id=ident,size=len(data),state="uploaded",
+                                   digest="sha256:"+sha,uploader=registration.OWNER if owner else {}))
+            api.data[ident] = data
+            return sha
+
+        self.enterContext(patch.object(registration, "RECIPIENT",claim["recipient"]))
+        ticket = {k:claim[k] for k in ("schema","campaign","head","repository_id","release_id","branch",
+                                      "workflow","recipient","initial_parent")}
+        ticket.update(owner_destination_id="private-fixture",collector_registration_id=claim["registration_id"])
+        source, refs = sample(self,ticket)
+        for name, ident, data, owner in source:
+            publish(name,ident,data,owner)
+        sha = publish(h.TICKET_NAME,500,json.dumps(ticket).encode(),owner=True)
+        publish(h.CLAIM,aid,json.dumps(dict(claim,ticket_asset_id=500,ticket_sha=sha,**refs)).encode())
+
     def test_recovery_reads_only_the_new_campaign_claim(self):
         api = LocalDraft()
         ctx = {"producer_sha": "d" * 40, "run": 81}
@@ -72,10 +95,14 @@ class TestTransport(unittest.TestCase):
         add(101, "bare-personal-204-r29-production-run-claim.json", original)
         self.assertIsNone(n.owner_recovery.collection_claim(api, api.draft(b.RELEASE), ctx))
         add(102, "bare-personal-204-r30-production-run-claim.json", original)
-        with self.assertRaisesRegex(ValueError, "Wrong original collection claim"):
+        self.assertIsNone(n.owner_recovery.collection_claim(api, api.draft(b.RELEASE), ctx))
+        api.assets.pop()
+        from slot1_handoff import CLAIM as handoff_name
+        add(102, handoff_name, original)
+        with self.assertRaisesRegex(ValueError, "Unbound or circular"):
             n.owner_recovery.collection_claim(api, api.draft(b.RELEASE), ctx)
         api.assets.pop()
-        add(103, "bare-personal-204-r30-production-run-claim.json", dict(original, campaign="bare-personal-204-r30"))
+        self.add_handoff(api, dict(original, campaign="bare-personal-204-r30"), 103)
         self.assertEqual(n.owner_recovery.collection_claim(api, api.draft(b.RELEASE), ctx), 103)
         replacement = dict(ctx, run=82, ordinal=2, parent_sha="e" * 64, parent_identity="a" * 64)
         claim = dict(original, campaign="bare-personal-204-r30", run_id=82, original_claim_id=103,
@@ -229,10 +256,7 @@ class TestTransport(unittest.TestCase):
                        "workflow":".github/workflows/bare-checkpoint-transfer.yml","branch":"bare-coexist-v2.0.4",
                        "head":c["producer_sha"],"initial_parent":b.PARENT_SHA,"registration_id":"Automation_fixture","release_id":b.RELEASE,
                        "recipient":recipient,"run_id":c["run"],"producer_attempt":1}
-                raw=json.dumps(claim).encode()
-                row={"id":123,"name":"bare-personal-204-r30-production-run-claim.json","size":len(raw),
-                     "digest":"sha256:"+hashlib.sha256(raw).hexdigest(),"state":"uploaded"}
-                api.assets.append(row);api.data[123]=raw
+                self.add_handoff(api,claim,123)
                 artifact={"id":321,"name":"r28-1234-a1-s02-outcome","digest":"sha256:"+"7"*64,
                           "size_in_bytes":2048,"expired":False,"expires_at":"2099-12-01T00:00:00Z",
                           "workflow_run":{"id":1234,"head_sha":c["producer_sha"]}}
@@ -287,7 +311,7 @@ class TestTransport(unittest.TestCase):
                                              initial_parent=rec["checkpoint_sha"],parent_sha=rec["checkpoint_sha"],
                                              parent_identity=rec["checkpoint_identity"])
                     raw=json.dumps(replacement_claim).encode()
-                    api.assets.append(dict(row,id=124,name="bare-personal-204-r30-loss-replacement-claim.json",
+                    api.assets.append(dict(state="uploaded",id=124,name="bare-personal-204-r30-loss-replacement-claim.json",
                                            size=len(raw),digest="sha256:"+hashlib.sha256(raw).hexdigest()))
                     api.data[124]=raw
                     # The new input wrapper is also bound to the replacement claim.
