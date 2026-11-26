@@ -12,7 +12,7 @@ KEY = f"bare-coexist-204-{RUN}-1-checkpoint-production-s1"
 PROOF = "27b52991ec81306daf99437ba9c0488a5a510180e75bc3d3e3be9cfa32cc482a"
 SIZE = 2308658666
 S2 = "4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf"
-TRIAL_REF = "refs/heads/bare-r30-s1-restore-20261126"
+TRIAL_REF = "refs/heads/bare-r30-s1-label-20261127"
 PRODUCTION_REF = "refs/heads/bare-coexist-v2.0.4"
 
 
