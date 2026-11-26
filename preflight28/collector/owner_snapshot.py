@@ -301,22 +301,27 @@ class OwnerSnapshot:
             require(r["id"] not in self.by_id or self.by_id[r["id"]]==normalized,"Conflicting private immutable ID")
             self.by_id[r["id"]]=normalized
 
-    def attach_source_grant(self):
+    def pickup_gate(self, locator):
+        row = self.listed.get(p.s1_resume.TICKET_NAME)
+        return p.s1_resume if row and row["sha256"] == locator["ticket_sha"] else p.handoff
+
+    def attach_source_grant(self, gate):
         # These two service IDs and byte digests were fixed before the transfer.
-        for name, aid, size, sha, owner in p.source_grant_rows():
+        for name, aid, size, sha, owner in p.source_grant_rows(gate is p.s1_resume):
             self.merge([dict(name=name, id=aid, bytes=size, sha256=sha, owner_issued=owner)],
                        [name], [name] if owner else [])
 
     def resolve_original_ticket(self, intent):
         """Complete an owner-pinned locator only from the original binder's evidence."""
         self.visible()
-        ticket = p.TICKET_NAME
+        gate = self.pickup_gate(intent)
+        ticket = gate.TICKET_NAME
         self.private_file(ticket, 4096, intent["ticket_sha"])
-        origin = self.private_hint(p.CLAIM)["run_id"]
-        names, owners = [ticket,p.CLAIM], [ticket]
+        origin = self.private_hint(gate.CLAIM)["run_id"]
+        names, owners = [ticket,gate.CLAIM], [ticket]
         records = self.witness(origin,intent["head"],"claim",CLAIM_JOB,names=names,owners=owners)
         self.merge(records,names,owners)
-        self.attach_source_grant()
+        self.attach_source_grant(gate)
         rows = list(self.by_id.values())
         aid = p.private_row(rows,ticket)["id"]
         if "ticket_asset_id" in intent:
@@ -329,13 +334,14 @@ class OwnerSnapshot:
 
     def draft_rows(self,locator):
         self.visible()
-        self.attach_source_grant()
-        ticket=p.TICKET_NAME
+        gate=self.pickup_gate(locator)
+        self.attach_source_grant(gate)
+        ticket=gate.TICKET_NAME
         require(self.listed[ticket]["sha256"]==locator["ticket_sha"],"Reservation differs from personal locator")
-        origin=self.private_hint(p.CLAIM)["run_id"]
+        origin=self.private_hint(gate.CLAIM)["run_id"]
         head=locator["head"]
         run=origin
-        names=[ticket,p.CLAIM]
+        names=[ticket,gate.CLAIM]
         owners=[ticket]
         if p.REPLACEMENT in self.listed:
             claim=self.private_hint(p.REPLACEMENT)

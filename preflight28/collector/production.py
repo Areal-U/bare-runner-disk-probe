@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "control"))
 import apk_seal
 from admission import BASE_REF, PagedOwnerDraft, RELEASE_ID, REPO, REPO_ID, S2_SHA, require
 import slot1_handoff as handoff
+import s1_resume
 import receipt_journal as journal
 import recover
 from registration import CAMPAIGN, CLAIM, TICKET_NAME, OWNER, WORKFLOW
@@ -111,44 +112,56 @@ def private_document(api, row, *, owner=False):
     return json.loads(data)
 
 
-def checked_source_grant(api, rows, ticket, claim):
+def checked_source_grant(api, rows, ticket, claim, *, resume=False):
     """Read the two immutable documents behind the handoff in both API and owner snapshot modes."""
-    handoff.check_reference(claim)
+    if resume:
+        s1_resume.check_reference(claim, ticket)
+    else:
+        handoff.check_reference(claim)
     documents = []
-    for name, aid, size, sha, owner in source_grant_rows():
+    for name, aid, size, sha, owner in source_grant_rows(resume):
         row = private_row(rows, name)
         require((row["id"], row["size"], row["digest"]) == (aid, size, "sha256:" + sha),
                 "Different original slot 1 grant or owner ticket")
         documents.append(private_document(api, row, owner=owner))
-    handoff.check_binding(*documents, ticket)
+    (s1_resume if resume else handoff).check_binding(*documents, ticket)
 
 
-def source_grant_rows():
+def source_grant_rows(resume=False):
+    if resume:
+        return s1_resume.source_rows()
     return ((handoff.SOURCE_CLAIM_NAME, handoff.SOURCE_CLAIM_ID, 649, handoff.SOURCE_CLAIM_SHA, False),
             (handoff.SOURCE_TICKET_NAME, handoff.SOURCE_TICKET_ID, 941, handoff.SOURCE_TICKET_SHA, True))
 
 
 def bind(api, rows, locator):
-    ticket_row = private_row(rows, TICKET_NAME)
+    gate = s1_resume if any(r["name"] == s1_resume.TICKET_NAME and
+                            r["id"] == locator["ticket_asset_id"] for r in rows) else handoff
+    resume = gate is s1_resume
+    parent = s1_resume.PARENT_SHA if resume else S2_SHA
+    ticket_row = private_row(rows, gate.TICKET_NAME)
     require(ticket_row["id"] == locator["ticket_asset_id"] and
             ticket_row["digest"] == "sha256:" + locator["ticket_sha"], "Different registered ticket")
     ticket = private_document(api, ticket_row, owner=True)
     common = dict(schema=1, campaign=CAMPAIGN, repository_id=REPO_ID, workflow=WORKFLOW,
                   branch=BASE_REF, head=locator["head"], recipient=apk_seal.RECIPIENT)
     require(all(ticket.get(k) == v for k, v in common.items()) and
-            ticket["initial_parent"] == S2_SHA and ticket["release_id"] == RELEASE_ID and
+            ticket["initial_parent"] == parent and ticket["release_id"] == RELEASE_ID and
             ticket["owner_destination_id"] == locator["owner_destination_id"] and
             ticket["collector_registration_id"] == locator["registration_id"], "Foreign reservation or destination")
-    source = private_row(rows, CLAIM)
+    source = private_row(rows, gate.CLAIM)
     claim = private_document(api, source)
     require(all(claim.get(k) == v for k, v in common.items()) and claim["producer_attempt"] == 1 and
             claim["registration_id"] == locator["registration_id"] and claim["release_id"] == RELEASE_ID and
             (claim["ticket_asset_id"], claim["ticket_sha"], claim["initial_parent"]) ==
-            (ticket_row["id"], ticket_row["digest"][7:], S2_SHA), "Unbound original production claim")
-    checked_source_grant(api, rows, ticket, claim)
+            (ticket_row["id"], ticket_row["digest"][7:], parent), "Unbound original production claim")
+    checked_source_grant(api, rows, ticket, claim, resume=resume)
     origin = claim["run_id"]
     require(type(origin) is int and origin > 0, "Missing original run")
     replacement = private_row(rows, REPLACEMENT, optional=True)
+    if resume:
+        require(replacement is None, "Conflicting exceptional replacement")
+        return origin, origin, source["id"], recover.ChainStart(2, parent, s1_resume.PARENT_IDENTITY)
     scope = recover.ChainStart()
     if replacement:
         claim = private_document(api, replacement)
