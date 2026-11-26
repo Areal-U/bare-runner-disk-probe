@@ -71,5 +71,6 @@ if __name__ == '__main__':
     validate_gn = checkpoint.gn_packaging_dependencies
     checkpoint.gn_packaging_dependencies = FunctionType(validate_gn.__code__, dict(validate_gn.__globals__))
     checkpoint.is_android_packaging = lambda member: member.name.casefold() == 'chromepublic.apk'
+    checkpoint.PRIVATE_ANDROID_SAMPLES = True
     checkpoint.tarfile = StreamingTar()
     sys.exit(checkpoint.main())

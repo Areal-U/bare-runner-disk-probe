@@ -11,6 +11,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import zipfile
@@ -121,11 +122,14 @@ def read_claim(api, release, name):
 
 
 def collection_claim(api,release,ctx):
-    genesis = read_claim(api,release,"bare-personal-204-r29-production-run-claim.json")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "control"))
+    from registration import CAMPAIGN, CLAIM
+
+    genesis = read_claim(api, release, CLAIM)
     if not genesis:
         return None
     original_id, original = genesis
-    binding = {"schema":1,"campaign":"bare-personal-204-r29","repository_id":1450926240,
+    binding = {"schema":1,"campaign":CAMPAIGN,"repository_id":1450926240,
                "workflow":".github/workflows/bare-checkpoint-transfer.yml","branch":"bare-coexist-v2.0.4",
                "head":ctx["producer_sha"],"release_id":b.RELEASE,"recipient":RECIPIENT,"producer_attempt":1}
     b.require(original.get("initial_parent") == b.PARENT_SHA and
@@ -139,7 +143,7 @@ def collection_claim(api,release,ctx):
               (event.get("sender") or {}).get("id") == 292261483 and
               (event.get("repository") or {}).get("id") == binding["repository_id"],
               "Owner collection claim is for a different operation")
-    replacement = read_claim(api,release,"bare-personal-204-r29-loss-replacement-claim.json")
+    replacement = read_claim(api, release, CAMPAIGN + "-loss-replacement-claim.json")
     b.require(replacement is not None, "No immutable replacement collection claim")
     claim_id, claim = replacement
     expected = dict(binding,run_id=ctx["run"],original_claim_id=original_id,origin_run=original["run_id"],

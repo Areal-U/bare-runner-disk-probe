@@ -569,7 +569,7 @@ def publish():
     b.disk("before-private-writer-decryption",r["bytes"]+144*1024**2)
     frames.receive(file,plain,r["bytes"],r["sha256"])
     b.require(plain.stat().st_size==r["bytes"] and b.digest(plain)==r["sha256"],"Checkpoint content changed")
-    verify_payload(plain,r)
+    verify_payload(plain,r,require_current=True)
     m={**context(),**{k:r[k] for k in ("bytes","sha256","identity","proof_sha")},"format":"tar.zst","parts":[]}
     # A small immutable intent permits GET-only recovery of all or some already
     # uploaded plaintext parts, even if the final manifest write never ran.
