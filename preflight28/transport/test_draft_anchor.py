@@ -61,6 +61,28 @@ class AliasTests(unittest.TestCase):
         self.release["assets"]=self.assets[:2];self.lookup()
         self.assets[-1]["digest"]="sha256:"+"1"*64
         with self.assertRaises(self.helper.Invalid):self.lookup()
+    def test_r30_rotation_rechecks_both_receipts_and_rejects_unobserved_alias(self):
+        self.url(NEW)
+        self.lookup()
+        current = "untagged-" + "a" * 20
+        with patch.object(self.anchor, "R30_TAG_SHA", hashlib.sha256(current.encode()).hexdigest()):
+            self.url(current)
+            aid = self.anchor.CLAIMS[0][1]
+            with patch.dict(self.claim_bytes, {aid: b"unrelated"}), self.assertRaises(ValueError):
+                self.lookup()
+            for tag in (None, "", current):
+                self.release["tag_name"] = tag
+                self.lookup()
+            self.assertEqual(self.get.call_count, 5)
+            for overrides in ({"tag_name": NEW}, {"html_url": self.release["html_url"] + "?other"},
+                              {"html_url": self.release["html_url"].replace("github.com", "elsewhere.invalid")},
+                              {"draft": False}, {"id": self.helper.RELEASE_ID + 1}):
+                with patch.dict(self.release, overrides), self.assertRaises((ValueError, self.helper.Invalid)):
+                    self.lookup()
+            self.url("untagged-" + "b" * 20)
+            with self.assertRaises(ValueError):
+                self.lookup()
+
     def test_wrong_bytes_id_delete_moved_title_retarget_publication_owner_or_unobserved_url(self):
         self.url(NEW)
         original=self.claim_bytes[self.anchor.CLAIMS[0][1]]
