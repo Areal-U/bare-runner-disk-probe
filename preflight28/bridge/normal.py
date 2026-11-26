@@ -14,6 +14,7 @@ import artifact_poll
 import bridge as b
 import frames
 import storage_admission as storage
+import r30_parent
 import owner_recovery
 from verify_payload import check as verify_payload
 
@@ -55,6 +56,8 @@ def parent_read_run():
     origin = os.environ.get("R28_PARENT_RUN", "")
     if not origin:
         return current
+    if r30_parent.authorized(os.environ):
+        return r30_parent.RUN
     b.require(re.fullmatch("[1-9][0-9]{0,18}", origin) and int(origin) != current and
               2 <= slot() <= 12 and os.environ.get("R28_PARENT_BACKEND") == "draft" and
               os.environ.get("R28_PARENT_READBACK_ONLY") == "false" and
@@ -239,6 +242,7 @@ def list_private(api):
 def get_manifest(mid, expected_sha, number, *, run_id=None):
     run = b.env_int("GITHUB_RUN_ID") if run_id is None else run_id
     expected_key = logical(number, run_id=run)
+    migrated = run_id == r30_parent.RUN and number == 1 and r30_parent.authorized(os.environ)
     api=b.auth_api()
     rel=list_private(api)
     row,=[r for r in rel["assets"] if r["id"]==mid]
@@ -250,10 +254,15 @@ def get_manifest(mid, expected_sha, number, *, run_id=None):
     m=json.loads(buf.getvalue())
     b.require(m["schema"]==SCHEMA and m["key"]==expected_key and m["ordinal"]==number
               and m["run"]==run and m["attempt"]==1 and
-              m["producer_sha"]==os.environ["R28_HEAD_SHA"] and sha_check(m["sha256"]) and
+              m["producer_sha"]==(r30_parent.PRODUCER if migrated else os.environ["R28_HEAD_SHA"]) and sha_check(m["sha256"]) and
               sha_check(m["identity"]) and sha_check(m["proof_sha"]) and 0<m["bytes"]<=b.CAP
               and 0<len(m["parts"])<=2 and sum(p["bytes"] for p in m["parts"])==m["bytes"],
               "Invalid generation receipt")
+    if migrated:
+        b.require(mid == r30_parent.MANIFEST and expected_sha == r30_parent.MANIFEST_SHA and
+                  (m["sha256"], m["identity"], m["proof_sha"], m["bytes"], m["parent_sha"]) ==
+                  (r30_parent.SHA, r30_parent.IDENTITY, r30_parent.PROOF, r30_parent.SIZE, r30_parent.S2),
+                  "Pinned S1 manifest disagrees with the validated checkpoint")
     for i,p in enumerate(m["parts"]):
         name=stem(number, run_id=run)+f"-p{i:02}"
         b.require(p["name"] in (name,name+"-retry1") and p["bytes"]==min(PART,m["bytes"]-i*PART)
@@ -283,8 +292,9 @@ def issue():
             "lease_ends":int(time.time())+20*60,"source":None,"endpoints":[]}
     # Registration checked this recipient and its claim against the owner ticket
     # and the independent collector ACK before starting this physical slot.
-    record["owner_recovery"] = owner_recovery.wrap(ROOT,context(),os.environ["R28_OWNER_RECIPIENT"],
-                                                   b.env_int("R28_COLLECTION_CLAIM"))
+    if not (r30_parent.authorized(os.environ) and os.environ["R28_PARENT_READBACK_ONLY"] == "true"):
+        record["owner_recovery"] = owner_recovery.wrap(ROOT,context(),os.environ["R28_OWNER_RECIPIENT"],
+                                                       b.env_int("R28_COLLECTION_CLAIM"))
     if slot()>1:
         mid=b.env_int("R28_PARENT_MANIFEST")
         digest=os.environ["R28_PARENT_MANIFEST_SHA"]
@@ -321,7 +331,8 @@ def acquire():
         b.require(m is None and not rec["endpoints"],"First slot can use only pinned S2")
         return
     b.require(m["run"]==parent_run and m["attempt"]==1 and m["ordinal"]==slot()-1 and
-              m["key"]==logical(slot()-1,run_id=parent_run) and m["producer_sha"]==os.environ["R28_HEAD_SHA"] and
+              m["key"]==logical(slot()-1,run_id=parent_run) and
+              m["producer_sha"]==(r30_parent.PRODUCER if r30_parent.authorized(os.environ) else os.environ["R28_HEAD_SHA"]) and
               m["sha256"]==rec["parent_sha"] and m["identity"]==rec["parent_identity"] and
               rec["source_manifest_id"]==b.env_int("R28_PARENT_MANIFEST") and
               rec["source_manifest_sha"]==os.environ["R28_PARENT_MANIFEST_SHA"] and
@@ -554,6 +565,8 @@ def publish():
     deadline = min(physical_deadline, time.time() + PUBLISH_MINUTES * 60)
     r=json.loads((ROOT/"incoming/outcome.json").read_text())
     b.require(same(r),"Stale user, version, segment or candidate")
+    if r30_parent.authorized(os.environ) and os.environ["R28_PARENT_READBACK_ONLY"] == "true":
+        b.require(r["status"] in {"verify-only", "failed", "cancelled"}, "Read-only restore cannot publish")
     if r["status"]!="candidate":
         b.require(r["status"] in STOPS,"Unknown result")
         b.output(private_readback_verified="false",checkpoint_advanced="false")
