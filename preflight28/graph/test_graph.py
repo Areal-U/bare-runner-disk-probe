@@ -1,5 +1,8 @@
 """Exercise the application verifier with Chromium's own pinned Siso executable."""
 import os
+import io
+import json
+from contextlib import redirect_stdout
 from pathlib import Path
 import shutil
 import sys
@@ -85,6 +88,18 @@ class FrontierTest(unittest.TestCase):
         os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
         with self.assertRaisesRegex(ValueError, "retained output contents"):
             receive(self.out, self.proof, self.command)
+
+    def test_stale_dependency_reported_by_actual_planner(self):
+        original_log = sha(self.out / ".ninja_log")
+        # No source content change: only this dependency's clock moves.
+        src = self.out.parent.parent / "a.in"
+        os.utime(src, None)
+        capture = io.StringIO()
+        with redirect_stdout(capture):
+            self.assertEqual(len(run(self.out, self.command, ["obj/a.o"], dry=True)), 1)
+        report = json.loads(capture.getvalue())
+        self.assertEqual(report["dirty_targets"]["mtime_reasons"][0]["dependency"], "../../a.in")
+        self.assertEqual(sha(self.out / ".ninja_log"), original_log)
 
     def test_depfile_changes_without_output_change(self):
         produce(self.out, self.proof, self.command)

@@ -12,6 +12,7 @@ import zipfile
 
 from graph import TARGET, canonical, compare, file_record, fixed_graph, output_name, run
 
+import angle_restore
 from contract_gate import verify_pending_contract
 from retained import (DEVIL_LINK, FRONTIER_FORMAT, FRONTIER_V3, check_frontier_log, devil_link_record,
                       scan_ninja_log)
@@ -169,9 +170,13 @@ def verify_subset(out, command, evidence, expected_graph, rules, *, require_curr
     for row in claims.values():
         verify_kotlin_disk_pair(out, row['primary'])
     observed = plan(out, command, rules)
-    compare(parent, set(observed), witness_ids)
     if set(observed) != recorded:
+        extra = sorted(set(observed) - recorded)
+        missing = sorted(recorded - set(observed))
+        stage('restored-plan-diff', extra=len(extra), missing=len(missing),
+              extra_examples=[(k, list(observed[k])[:8]) for k in extra[:3]], missing_examples=missing[:3])
         raise ValueError("restored APK has a different full pending-edge set")
+    compare(parent, set(observed), witness_ids)
     return observed
 
 
@@ -185,6 +190,12 @@ def begin(out, baseline, parent_sha, command, *, bootstrap=False, verify_only=Fa
     rules = {}
     if proof.exists():
         data = load(proof)
+        if parent_sha == angle_restore.S1_SHA:
+            with proof.open("rb") as stream:
+                if graph != angle_restore.GRAPH or digest_stream(stream) != angle_restore.S1_PROOF_SHA:
+                    raise ValueError("Fixed first-segment graph or proof differs")
+        if graph == angle_restore.GRAPH and data.get("graph") == graph and data.get("format") == FORMAT:
+            angle_restore.restore_git_clock(out)
         observed = verify_subset(out, command, data, graph, rules, require_current=require_current)
         verified = True
     elif bootstrap and not verify_only:

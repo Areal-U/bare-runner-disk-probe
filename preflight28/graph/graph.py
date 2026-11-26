@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+from itertools import islice
 import os
 from pathlib import Path
 import re
@@ -109,6 +110,28 @@ def preserve_ninja_log(out):
                 src.unlink(missing_ok=True)
 
 
+def dirty_target_details(logdir, edges):
+    # Keep bounded, path-only evidence. Siso's full console may contain commands.
+    report = {"groups": [canonical(names) for names in islice(edges, 4)]}
+    explain = logdir / "siso_explain"
+    if explain.is_file():
+        with explain.open("rb") as stream:
+            lines = stream.read(16 * 1024).decode("utf-8", errors="replace").splitlines()
+        reasons = []
+        for line in lines:
+            match = re.fullmatch(
+                r"output ([a-zA-Z0-9_./+@=-]{1,512}) older than most recent input "
+                r"([a-zA-Z0-9_./+@=-]{1,512}): out:([0-9T:+.Z-]+) in:([+0-9.hmsµn-]+)", line)
+            if match:
+                output, dependency, output_time, age = match.groups()
+                reasons.append(dict(output=output, dependency=dependency, output_time=output_time, input_newer_by=age))
+                if len(reasons) == 3:
+                    break
+        if reasons:
+            report["mtime_reasons"] = reasons
+    return report
+
+
 def run(out, command, targets, *, dry, noop=False, plan_rules=None):
     start = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="bare28-plan-") as name:
@@ -137,9 +160,11 @@ def run(out, command, targets, *, dry, noop=False, plan_rules=None):
                 raise ValueError("Siso completion/step count unavailable: "
                                  + tail[-1000:].decode(errors="replace"))
         edges = parse_metrics(metrics, int(counts[0]), out, actual=not dry, plan_rules=plan_rules)
-    print(json.dumps({"operation": "plan" if dry else "execute",
-                      "target": targets[0], "steps": len(edges),
-                      "seconds": round(time.monotonic() - start, 2)}), flush=True)
+        report = {"operation": "plan" if dry else "execute", "target": targets[0],
+                  "steps": len(edges), "seconds": round(time.monotonic() - start, 2)}
+        if dry and edges and targets != [TARGET]:
+            report["dirty_targets"] = dirty_target_details(tmp / "logs", edges)
+    print(json.dumps(report), flush=True)
     return edges
 
 
