@@ -301,6 +301,12 @@ class OwnerSnapshot:
             require(r["id"] not in self.by_id or self.by_id[r["id"]]==normalized,"Conflicting private immutable ID")
             self.by_id[r["id"]]=normalized
 
+    def attach_source_grant(self):
+        # These two service IDs and byte digests were fixed before the transfer.
+        for name, aid, size, sha, owner in p.source_grant_rows():
+            self.merge([dict(name=name, id=aid, bytes=size, sha256=sha, owner_issued=owner)],
+                       [name], [name] if owner else [])
+
     def resolve_original_ticket(self, intent):
         """Complete an owner-pinned locator only from the original binder's evidence."""
         self.visible()
@@ -310,7 +316,8 @@ class OwnerSnapshot:
         names, owners = [ticket,p.CLAIM], [ticket]
         records = self.witness(origin,intent["head"],"claim",CLAIM_JOB,names=names,owners=owners)
         self.merge(records,names,owners)
-        rows = [self.by_id[r["id"]] for r in records]
+        self.attach_source_grant()
+        rows = list(self.by_id.values())
         aid = p.private_row(rows,ticket)["id"]
         if "ticket_asset_id" in intent:
             require(type(intent["ticket_asset_id"]) is int and intent["ticket_asset_id"] == aid,
@@ -322,6 +329,7 @@ class OwnerSnapshot:
 
     def draft_rows(self,locator):
         self.visible()
+        self.attach_source_grant()
         ticket=p.TICKET_NAME
         require(self.listed[ticket]["sha256"]==locator["ticket_sha"],"Reservation differs from personal locator")
         origin=self.private_hint(p.CLAIM)["run_id"]

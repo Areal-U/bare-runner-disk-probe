@@ -17,6 +17,7 @@ from zipfile import ZipFile
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "control"))
 import apk_seal
 from admission import BASE_REF, PagedOwnerDraft, RELEASE_ID, REPO, REPO_ID, S2_SHA, require
+import slot1_handoff as handoff
 import receipt_journal as journal
 import recover
 from registration import CAMPAIGN, CLAIM, TICKET_NAME, OWNER, WORKFLOW
@@ -110,6 +111,23 @@ def private_document(api, row, *, owner=False):
     return json.loads(data)
 
 
+def checked_source_grant(api, rows, ticket, claim):
+    """Read the two immutable documents behind the handoff in both API and owner snapshot modes."""
+    handoff.check_reference(claim)
+    documents = []
+    for name, aid, size, sha, owner in source_grant_rows():
+        row = private_row(rows, name)
+        require((row["id"], row["size"], row["digest"]) == (aid, size, "sha256:" + sha),
+                "Different original slot 1 grant or owner ticket")
+        documents.append(private_document(api, row, owner=owner))
+    handoff.check_binding(*documents, ticket)
+
+
+def source_grant_rows():
+    return ((handoff.SOURCE_CLAIM_NAME, handoff.SOURCE_CLAIM_ID, 649, handoff.SOURCE_CLAIM_SHA, False),
+            (handoff.SOURCE_TICKET_NAME, handoff.SOURCE_TICKET_ID, 941, handoff.SOURCE_TICKET_SHA, True))
+
+
 def bind(api, rows, locator):
     ticket_row = private_row(rows, TICKET_NAME)
     require(ticket_row["id"] == locator["ticket_asset_id"] and
@@ -127,6 +145,7 @@ def bind(api, rows, locator):
             claim["registration_id"] == locator["registration_id"] and claim["release_id"] == RELEASE_ID and
             (claim["ticket_asset_id"], claim["ticket_sha"], claim["initial_parent"]) ==
             (ticket_row["id"], ticket_row["digest"][7:], S2_SHA), "Unbound original production claim")
+    checked_source_grant(api, rows, ticket, claim)
     origin = claim["run_id"]
     require(type(origin) is int and origin > 0, "Missing original run")
     replacement = private_row(rows, REPLACEMENT, optional=True)

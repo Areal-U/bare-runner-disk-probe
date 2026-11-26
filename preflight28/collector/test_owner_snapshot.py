@@ -14,6 +14,7 @@ from zipfile import ZipFile
 
 import production as p
 import owner_snapshot as o
+from test_handoff_sample import sample
 
 
 def hashed(b):
@@ -62,10 +63,14 @@ class SnapshotTest(unittest.TestCase):
                     release_id=p.RELEASE_ID,recipient=p.apk_seal.RECIPIENT,initial_parent=p.S2_SHA)
         service="Automation_"+"a"*32
         name=p.TICKET_NAME
-        t=raw(dict(common,collector_registration_id=service,owner_destination_id="owner-private-file-id"))
+        ticket = dict(common,collector_registration_id=service,owner_destination_id="owner-private-file-id")
+        earlier, refs = sample(self, ticket)
+        for source_name, _, data, _ in earlier:
+            self.add_private(source_name,data)
+        t=raw(ticket)
         self.add_private(name,t)
         self.locator=dict(ticket_asset_id=200,ticket_sha=hashed(t),head=self.head,registration_id=service,owner_destination_id="owner-private-file-id")
-        c=raw(dict(common,run_id=self.run,producer_attempt=1,registration_id=service,ticket_asset_id=200,ticket_sha=hashed(t)))
+        c=raw(dict(common,run_id=self.run,producer_attempt=1,registration_id=service,ticket_asset_id=200,ticket_sha=hashed(t),**refs))
         self.add_private(p.CLAIM,c)
         self.claim_witness=self.witness("claim",[(name,200,t,True),(p.CLAIM,201,c,False)])
         self.job(o.CLAIM_JOB,[o.CLAIM_STEP])
@@ -287,7 +292,8 @@ class SnapshotTest(unittest.TestCase):
         # A different vector or an attestation preceding the verified issuer
         # cannot claim the same private files.
         mark=self.jobs[0]["steps"][-1]
-        for field,value in (("name","Attest registered owner claim IDs 201,200"),("started_at",self.utc(-11)),
+        wrong_order = ",".join(reversed(mark["name"].split()[-1].split(",")))
+        for field,value in (("name","Attest registered owner claim IDs "+wrong_order),("started_at",self.utc(-11)),
                             ("conclusion","failure")):
             with patch.dict(mark,{field:value}):
                 self.write()
