@@ -30,14 +30,16 @@ def row_info(row, *, owner_issued):
 
 
 def claim_items(api, rows, run, head, job, expected_id):
-    initial = owner.private_row(rows,TICKET_NAME)
+    gate = owner.s1_resume if any(row["name"] == owner.s1_resume.CLAIM and row["id"] == expected_id
+                                  for row in rows) else owner.handoff
+    initial = owner.private_row(rows,gate.TICKET_NAME)
     ticket = owner.private_document(api,initial,owner=True)
     locator = dict(head=head,ticket_asset_id=initial["id"],ticket_sha=initial["digest"][7:],
                    owner_destination_id=ticket["owner_destination_id"],registration_id=ticket["collector_registration_id"])
     origin, physical, cid, scope = owner.bind(api,rows,locator)
     require(physical == run and cid == expected_id and
             (job == "loss-admission") == scope.replacement, "Wrong physical claim or replacement")
-    result = [row_info(initial,owner_issued=True), row_info(owner.private_row(rows,CLAIM),owner_issued=False)]
+    result = [row_info(initial,owner_issued=True), row_info(owner.private_row(rows,gate.CLAIM),owner_issued=False)]
     if scope.replacement:
         result += [row_info(owner.private_row(rows,f"{CAMPAIGN}-loss-{origin}.json"),owner_issued=True),
                    row_info(owner.private_row(rows,f"{CAMPAIGN}-loss-evidence-{origin}.json"),owner_issued=True),

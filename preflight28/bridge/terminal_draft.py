@@ -132,9 +132,16 @@ def authorize_rescue(env, api):
             event["repository"]["id"] == owner.REPO_ID,"Wrong transfer-only event")
     release=api.draft(b.RELEASE)
     rows=release["assets"]
-    row=owner.private_row(rows,owner.TICKET_NAME)
-    ticket=owner.private_document(api,row,owner=True)
     head=env["GITHUB_SHA"]
+    row = None
+    if any(r["name"] == owner.s1_resume.TICKET_NAME for r in rows):
+        candidate = owner.private_row(rows,owner.s1_resume.TICKET_NAME)
+        registered = owner.private_document(api,candidate,owner=True)
+        if registered["head"] == head:
+            row, ticket = candidate, registered
+    if row is None:
+        row=owner.private_row(rows,owner.TICKET_NAME)
+        ticket=owner.private_document(api,row,owner=True)
     locator=dict(ticket_asset_id=row["id"],ticket_sha=row["digest"][7:],head=head,
                  registration_id=ticket["collector_registration_id"],owner_destination_id=ticket["owner_destination_id"])
     ticket_origin,run,claim,scope=owner.bind(api,rows,locator)

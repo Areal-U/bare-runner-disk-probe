@@ -1,5 +1,5 @@
 name: Bare Personal v2.0.4 build and recovery
-run-name: ${{ inputs.mode == 'build-apk' && format('Bare ARM64 build (up to {0} segments)', inputs.build_segments) || (inputs.mode == 'recover-lost-slot' && 'Recover one confirmed lost Bare interval' || 'Recover encrypted Bare APK') }}
+run-name: ${{ inputs.mode == 'build-apk' && format('Bare ARM64 build from Round 30 S1 (segments 2 through {0})', inputs.build_segments) || (inputs.mode == 'recover-lost-slot' && 'Recover one confirmed lost Bare interval' || 'Recover encrypted Bare APK') }}
 'on':
   workflow_dispatch:
     inputs:
@@ -35,7 +35,7 @@ run-name: ${{ inputs.mode == 'build-apk' && format('Bare ARM64 build (up to {0} 
         type: string
         default: age1t69raxytlqula36e8w0tm6p3ezt49ztwnrtz8k57h6mvpwfguy7sjmr4yx
       checkpoint_key:
-        description: Leave empty to build from R27 S2. Ciphertext recovery uses the exact original cache key.
+        description: Leave empty to resume from the accepted Round 30 S1. Ciphertext recovery uses the exact original cache key.
         type: string
       checkpoint_sha:
         description: SHA-256 from the selected readback
@@ -54,7 +54,7 @@ run-name: ${{ inputs.mode == 'build-apk' && format('Bare ARM64 build (up to {0} 
         default: '0'
         options: ['0', '180']
       build_segments:
-        description: Maximum sequential build segments (12 uses the fixed R27 S2 parent)
+        description: Resume from Round 30 S1 for segments 2 through 12 as needed. Slot 13 verifies the final checkpoint.
         type: choice
         default: '12'
         options: ['12']
@@ -98,13 +98,15 @@ jobs:
         [[ $APK_RECIPIENT == age1t69raxytlqula36e8w0tm6p3ezt49ztwnrtz8k57h6mvpwfguy7sjmr4yx ]]
         [[ $OUTPUT_GIB == 18 && $JOBS == 2 && ($MINUTES == 180 || $MINUTES == 0) ]]
         if [[ -n $PARENT_KEY$PARENT_SHA$PARENT_IDENTITY ]]; then
-          [[ $PARENT_KEY == bare-coexist-204-45285202990-1-checkpoint-production-s2 ]]
-          [[ $PARENT_SHA == 4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf ]]
-          [[ $PARENT_IDENTITY == a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc ]]
+          [[ $PARENT_KEY == bare-coexist-204-45771045621-1-checkpoint-production-s1 ]]
+          [[ $PARENT_SHA == fa44728d39b61c25d4116579e6da2c63ca7898cec24ada0e7ae453548bbd73bf ]]
+          [[ $PARENT_IDENTITY == 8f6e0fc60ac76d6558ff3f7f593a8db5a3a5c2da523b251b3847fb594fa2e3be ]]
         fi
   bind-private-receiver:
     name: Bind the prior private collection registration to this originating run
     needs: validate-build
+    env:
+      R30_RESUME_S1: '1'
     if: ${{ github.run_attempt == '1' && needs.validate-build.result == 'success' }}
     permissions:
       actions: read
@@ -685,36 +687,11 @@ jobs:
       parent_manifest_id: ${{ needs.replacement.outputs.manifest_id }}
       parent_manifest_sha: ${{ needs.replacement.outputs.manifest_sha }}
       parent_producer: ${{ needs.replacement.outputs.producer_sha }}
-  slot01:
-    name: Bounded build segment 1
-    needs:
-    - validate-build
-    - bind-private-receiver
-    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.validate-build.result
-      == 'success' && needs.bind-private-receiver.result == 'success' && needs.bind-private-receiver.outputs.claim_asset_id != '' }}
-    permissions:
-      actions: read
-      contents: write
-    uses: ./.github/workflows/bare-r28-native-slot.yml
-    with:
-      ordinal: 1
-      backend: ${{ inputs.checkpoint_backend }}
-      checkpoint_compression: ${{ inputs.checkpoint_compression }}
-      verify_only: false
-      parent_key: bare-coexist-204-45285202990-1-checkpoint-production-s2
-      parent_sha: 4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf
-      parent_identity: a11dd3df7bccafb011f90f562e997b4601fa8a200f85c39d09d6fc962de8a3dc
-      parent_producer: bf70ddbf474f3390a62220a076b8c43347fecc64
-      apk_recipient: ${{ inputs.apk_recipient }}
-      minutes: ${{ fromJSON(inputs.compile_minutes) }}
   slot02:
     name: Bounded build segment 2
-    needs:
-    - slot01
-    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.slot01.result == 'success'
-      && needs.slot01.outputs.status == 'candidate' && needs.slot01.outputs.ordinal == '1' && needs.slot01.outputs.producer_sha == github.sha &&
-      needs.slot01.outputs.accepted_parent == '4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf' && needs.slot01.outputs.sha !=
-      needs.slot01.outputs.accepted_parent && needs.slot01.outputs.sha != '' }}
+    needs: bind-private-receiver
+    if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12'
+      && needs.bind-private-receiver.result == 'success' && needs.bind-private-receiver.outputs.claim_asset_id != '' }}
     permissions:
       actions: read
       contents: write
@@ -723,23 +700,23 @@ jobs:
       ordinal: 2
       backend: ${{ inputs.checkpoint_backend }}
       checkpoint_compression: ${{ inputs.checkpoint_compression }}
-      parent_manifest_id: ${{ needs.slot01.outputs.manifest_id }}
-      parent_manifest_sha: ${{ needs.slot01.outputs.manifest_sha }}
+      parent_run: '45771045621'
+      parent_manifest_id: '795559195'
+      parent_manifest_sha: f48700364b590b28188715d565d564b1afba5d5d90df1e4b98efa5cef04971c8
       verify_only: false
-      parent_key: ${{ needs.slot01.outputs.key }}
-      parent_sha: ${{ needs.slot01.outputs.sha }}
-      parent_identity: ${{ needs.slot01.outputs.identity }}
-      parent_producer: ${{ needs.slot01.outputs.producer_sha }}
+      parent_key: bare-coexist-204-45771045621-1-checkpoint-production-s1
+      parent_sha: fa44728d39b61c25d4116579e6da2c63ca7898cec24ada0e7ae453548bbd73bf
+      parent_identity: 8f6e0fc60ac76d6558ff3f7f593a8db5a3a5c2da523b251b3847fb594fa2e3be
+      parent_producer: 9869f9af1ba14eeb943e6ef38af7dc77456f4ec3
       apk_recipient: ${{ inputs.apk_recipient }}
       minutes: ${{ fromJSON(inputs.compile_minutes) }}
   slot03:
     name: Bounded build segment 3
     needs:
-    - slot01
     - slot02
     if: ${{ !cancelled() && github.run_attempt == '1' && inputs.mode == 'build-apk' && inputs.build_segments == '12' && needs.slot02.result == 'success'
       && needs.slot02.outputs.status == 'candidate' && needs.slot02.outputs.ordinal == '2' && needs.slot02.outputs.producer_sha == github.sha &&
-      needs.slot02.outputs.accepted_parent == needs.slot01.outputs.sha && needs.slot02.outputs.sha != needs.slot02.outputs.accepted_parent && needs.slot02.outputs.sha
+      needs.slot02.outputs.accepted_parent == 'fa44728d39b61c25d4116579e6da2c63ca7898cec24ada0e7ae453548bbd73bf'  && needs.slot02.outputs.sha != needs.slot02.outputs.accepted_parent && needs.slot02.outputs.sha
       != '' }}
     permissions:
       actions: read
@@ -1023,7 +1000,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     needs:
-    - slot01
+    - bind-private-receiver
     - slot02
     - slot03
     - slot04
@@ -1036,7 +1013,7 @@ jobs:
     - slot11
     - slot12
     - slot13
-    if: ${{ !cancelled() && inputs.mode == 'build-apk' && inputs.build_segments == '12' && github.run_attempt == '1' }}
+    if: ${{ !cancelled() && inputs.mode == 'build-apk' && inputs.build_segments == '12' && github.run_attempt == '1' && needs.bind-private-receiver.result == 'success' && needs.bind-private-receiver.outputs.claim_asset_id != '' }}
     steps:
     - name: Check every causal transition and select the sole outcome
       env:
@@ -1045,11 +1022,11 @@ jobs:
       run: |
         import json, os, re
         jobs = json.loads(os.environ["NEEDS"])
-        parent = "4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf"
+        parent = "fa44728d39b61c25d4116579e6da2c63ca7898cec24ada0e7ae453548bbd73bf"
         end = None
-        seen = {parent}
+        seen = {parent, "4381b248b26a7d12443241192c27d00311abaeb5b7d1839c7a5a17d088f736cf"}
         verified_parent = parent
-        for n in range(1,14):
+        for n in range(2,14):
             row = jobs["slot%02d"%n]
             if end is not None:
                 if row["result"] != "skipped": raise SystemExit("Unexpected work after terminal state")
@@ -1060,8 +1037,7 @@ jobs:
                     "pending_parent":parent if parent != verified_parent else None},sort_keys=True))
                 raise SystemExit(f"Slot {n} failed or returned stale lineage")
             # Each successful non-bootstrap receipt requires the restored whole parent frontier.
-            if n > 1:
-                verified_parent = parent
+            verified_parent = parent
             state = o.get("status")
             if state == "candidate" and n <= 12:
                 child = o["sha"]
@@ -1108,6 +1084,7 @@ jobs:
       id: lookup
       env:
         GH_TOKEN: ${{ github.token }}
+        R30_RESUME_S1: ${{ inputs.mode == 'build-apk' && '1' || '0' }}
         R28_REPLAY_MODE: ${{ inputs.mode }}
         R28_REPLAY_ORDINAL: ${{ needs.reread-loss-admission.outputs.ordinal }}
         R28_REPLAY_PARENT: ${{ needs.reread-loss-admission.outputs.parent_sha }}
