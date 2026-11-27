@@ -163,3 +163,74 @@ class ResourceInventoryEvidenceTest(unittest.TestCase):
         self.assertEqual(set(changed),{RAW,OPTIMIZED})
         self.assertEqual(added,{"extra"})
         self.assertEqual(stream.getvalue(),"")
+
+
+class PathmapMigrationTest(unittest.TestCase):
+    def test_dirty_and_clean_copy_with_verified_material(self):
+        from unittest.mock import patch
+        from pathlib import Path
+        import label_resource_trial as m
+        record = [m.PATHMAP_BYTES, m.PATHMAP_SHA]
+        parent = {name:f"f:0:{record[0]}:{record[1]}" for name in (m.PATHMAP_SOURCE,m.PATHMAP_OUTPUT)}
+        copy = {(m.PATHMAP_OUTPUT,): "copy"}
+        for sequence, expected in (([copy, copy, {}],True),([{}],False)):
+            with self.subTest(expected=expected), patch.object(m,"file_record",return_value=record), \
+                    patch.object(m,"run",side_effect=sequence) as run:
+                result = m.verify_pathmap_copy(Path("."), [], parent, set())
+                self.assertEqual(result["executed"], expected)
+                self.assertEqual(result["group"], m.canonical((m.PATHMAP_OUTPUT,)))
+                self.assertEqual([c.kwargs["dry"] for c in run.call_args_list],
+                                 [True,False,True] if expected else [True])
+
+    def test_copy_rejects_foreign_work_or_damaged_material_before_any_real_action(self):
+        from unittest.mock import patch
+        from pathlib import Path
+        import label_resource_trial as m
+        expected = [m.PATHMAP_BYTES,m.PATHMAP_SHA]
+        parent = {name:f"f:0:{expected[0]}:{expected[1]}" for name in (m.PATHMAP_SOURCE,m.PATHMAP_OUTPUT)}
+        for old, disk, plan in [
+            ({m.PATHMAP_GROUP_ID}, expected, {}),
+            (set(), [m.PATHMAP_BYTES,"other"], {}),
+            (set(), expected, {("foreign",):"copy"}),
+            (set(), expected, {(m.PATHMAP_OUTPUT,):"unexpected"}),
+        ]:
+            with self.subTest(old=old, disk=disk, plan=plan), patch.object(m,"file_record",return_value=disk), \
+                    patch.object(m,"run",return_value=plan) as run, self.assertRaises(ValueError):
+                m.verify_pathmap_copy(Path("."),[],parent,old)
+            self.assertTrue(all(c.kwargs["dry"] for c in run.call_args_list))
+
+    def test_independent_gate_failures_all_observed_and_no_baseline_published(self):
+        from unittest.mock import patch
+        from contextlib import redirect_stdout
+        from io import StringIO
+        import label_resource_trial as m
+        old = {m.canonical(("old",)):("old",)}
+        after = {**old,m.canonical(("extra",)):("extra",)}
+        original = {"files":{"missing":"f:0:1:"+"1"*64}, "planned_groups":old}
+        log = StringIO()
+        with (redirect_stdout(log), patch.object(m,"verify_pathmap_copy",side_effect=ValueError("copy cause")),
+              patch.object(m,"plan",return_value=after),patch.object(m,"inventory",return_value={}) as read,
+              patch.object(m,"write_record") as write, self.assertRaisesRegex(ValueError,"path-map:.*final plan:.*retained inventory:")):
+            m.finish_resources(None,[],original,{})
+        self.assertIn('BARE_LABEL_FINAL_PLAN',log.getvalue())
+        self.assertIn('"outputs": ["extra"]',log.getvalue())
+        self.assertIn('BARE_LABEL_INVENTORY_MISMATCH',log.getvalue())
+        read.assert_called_once()
+        write.assert_not_called()
+
+    def test_failed_resource_check_forbids_copy_and_still_collects_plan_and_inventory(self):
+        from unittest.mock import patch
+        from contextlib import redirect_stdout
+        from io import StringIO
+        import label_resource_trial as m
+        old = {m.canonical(("old",)):("old",)}
+        original = {"files":{"missing":"f:0:1:"+"1"*64}, "planned_groups":old}
+        log = StringIO()
+        with (redirect_stdout(log),patch.object(m,"verify_pathmap_copy") as copy,
+              patch.object(m,"plan",return_value=old),patch.object(m,"inventory",return_value={}) as read,
+              self.assertRaisesRegex(ValueError,"bad resource.*retained inventory:")):
+            m.finish_resources(None,[],original,{},resource_error="bad resource")
+        copy.assert_not_called()
+        read.assert_called_once()
+        self.assertIn("BARE_LABEL_FINAL_PLAN",log.getvalue())
+        self.assertIn("BARE_LABEL_INVENTORY_MISMATCH",log.getvalue())

@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "signing"))
 from label_baseline import (LABEL, manifest_entry, ORIGINAL_CONTENT, PERSONAL_SHA, S1_SHA, S1_PROOF_SHA, UPSTREAM_SHA, activate,
-                            certificate, job_identity, match_lineage, record_successor, restore_source)
+                            certificate, check_material, job_identity, match_lineage, record_successor, restore_source,
+                            PATHMAP_BYTES, PATHMAP_GROUP_ID, PATHMAP_OUTPUT, PATHMAP_SHA, PATHMAP_SOURCE, PENDING_SHA,
+                            RAW, OPTIMIZED)
 from segment_graph import load, write_record
 
 
@@ -22,7 +24,11 @@ class LabelLineageTest(unittest.TestCase):
         self.out = self.root / "out/Bare"
         self.out.mkdir(parents=True)
         self.cert = {"trial_run_id": 10, "raw_sha256": "1" * 64, "optimized_sha256": "2" * 64}
+        pathmap = dict(group=PATHMAP_GROUP_ID, source=PATHMAP_SOURCE, output=PATHMAP_OUTPUT,
+                       sha256=PATHMAP_SHA, bytes=PATHMAP_BYTES)
+        self.cert.update(pending_sha256=PENDING_SHA, pathmap_copy=dict(pathmap, executed=True))
         evidence = dict(parent_sha256=S1_SHA, old_pending=1911, remaining=1911, resource_sha256="1" * 64,
+                        pending_sha256=PENDING_SHA, pathmap_copy=dict(pathmap, executed=False),
                         optimized_sha256="2" * 64, retained={"files": 3, "sha256": "3" * 64})
         self.lineage = dict(version=1, run=20, head="c" * 40, original=S1_SHA, certificate_sha256="4" * 64,
                             trial=10, old_content=ORIGINAL_CONTENT, new_content=evidence["retained"],
@@ -65,6 +71,35 @@ class LabelLineageTest(unittest.TestCase):
         del self.lineage["evidence"]
         with self.assertRaises(ValueError):
             match_lineage(self.lineage, self.cert, "4" * 64, 20, "c" * 40)
+
+    def test_restored_pathmap_and_frontier_require_the_trial_material(self):
+        evidence = self.lineage["evidence"]
+        for field, change in (("pathmap_copy", dict(evidence["pathmap_copy"], group="0"*64)),
+                              ("pathmap_copy", dict(evidence["pathmap_copy"], executed=0)),
+                              ("pending_sha256", "9"*64)):
+            with self.subTest(field=field), patch.dict(evidence, {field: change}):
+                encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("ascii")
+                with patch.dict(self.lineage, evidence_sha256=hashlib.sha256(encoded).hexdigest()), self.assertRaises(ValueError):
+                    match_lineage(self.lineage, self.cert, "4"*64, 20, "c"*40)
+        material = b"map"
+        for name in (RAW, OPTIMIZED, PATHMAP_SOURCE, PATHMAP_OUTPUT):
+            path = self.out / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(material)
+        digest = hashlib.sha256(material).hexdigest()
+        with patch("label_baseline.PATHMAP_BYTES", len(material)), patch("label_baseline.PATHMAP_SHA", digest), \
+                patch("label_baseline.verify_labels"), patch.dict(self.cert, raw_sha256=digest, optimized_sha256=digest):
+            check_material(self.out, self.cert)
+            for name in (PATHMAP_SOURCE, PATHMAP_OUTPUT):
+                path = self.out / name
+                path.write_bytes(b"bad")
+                with self.assertRaisesRegex(ValueError, "resource path map"):
+                    check_material(self.out, self.cert)
+                path.write_bytes(material)
+            (self.out/PATHMAP_OUTPUT).unlink()
+            (self.out/PATHMAP_OUTPUT).symlink_to(self.out/PATHMAP_SOURCE)
+            with self.assertRaisesRegex(ValueError, "resource path map"):
+                check_material(self.out, self.cert)
 
     def test_unapproved_final_resource_digest_is_rejected(self):
         self.lineage["evidence"]["optimized_sha256"] = "0" * 64

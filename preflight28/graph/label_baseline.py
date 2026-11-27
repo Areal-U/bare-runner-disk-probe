@@ -9,7 +9,8 @@ import re
 
 from angle_restore import S1_SHA, S1_PROOF_SHA
 from graph import sha
-from label_resource_trial import OPTIMIZED, RAW, OPTIMIZED_SHA, RAW_SHA
+from label_resource_trial import (OPTIMIZED, RAW, OPTIMIZED_SHA, RAW_SHA, PATHMAP_BYTES,
+                                 PATHMAP_GROUP_ID, PATHMAP_OUTPUT, PATHMAP_SHA, PATHMAP_SOURCE)
 from launcher_labels import verify_labels
 from personal_label import LABEL, PERSONAL_SHA, UPSTREAM_SHA, prepare
 from retained import commitment
@@ -17,6 +18,7 @@ from segment_graph import load, write_record
 
 
 ORIGINAL_CONTENT = {"files": 324262, "sha256": "b0806c54059d411288cd9c33ae68547be38758277f55552899630ed47528d992"}
+PENDING_SHA = "0f475e82f12516553f7e6d7278be9fcca3a5a5b87cbc7ab2ad5689faa1dcd5fd"
 
 
 def require(ok, message):
@@ -24,10 +26,18 @@ def require(ok, message):
         raise ValueError(message)
 
 
+def valid_pathmap(record):
+    return (isinstance(record, dict) and type(record.get("executed")) is bool and
+            type(record.get("bytes")) is int and
+            record == dict(group=PATHMAP_GROUP_ID, source=PATHMAP_SOURCE, output=PATHMAP_OUTPUT,
+                           bytes=PATHMAP_BYTES, sha256=PATHMAP_SHA, executed=record["executed"]))
+
+
 def certificate(directory):
     path = directory / "label_trial_certificate.json"
     cert = load(path)
     require(cert.get("status") == "accepted" and cert.get("source_sha256") == S1_SHA and
+            cert.get("pending_sha256") == PENDING_SHA and valid_pathmap(cert.get("pathmap_copy")) and
             type(cert.get("trial_run_id")) is int and cert["trial_run_id"] > 0 and
             cert["trial_run_id"] not in (45771045621, 45841492691) and
             cert.get("trial_attempt") == 1 and re.fullmatch("[0-9a-f]{40}", cert.get("trial_head", "")) and
@@ -51,6 +61,10 @@ def job_identity(env):
 def check_material(out, cert):
     require(sha(out / RAW) == cert["raw_sha256"] and sha(out / OPTIMIZED) == cert["optimized_sha256"],
             "Restored resource APKs differ from the independently accepted migration")
+    for name in (PATHMAP_SOURCE, PATHMAP_OUTPUT):
+        path = out / name
+        require(path.is_file() and not path.is_symlink() and path.stat().st_size == PATHMAP_BYTES and
+                sha(path) == PATHMAP_SHA, "Restored resource path map differs from the fixed S1 bytes")
     aapt2 = out.parent.parent / "third_party/android_sdk/public/build-tools/37.0.0/aapt2"
     for target in (RAW, OPTIMIZED):
         verify_labels(aapt2, out / target)
@@ -120,6 +134,8 @@ def match_lineage(lineage, cert, cert_sha, run, head):
     require(isinstance(lineage, dict) and type(evidence) is dict and
             hashlib.sha256(encoded).hexdigest() == lineage.get("evidence_sha256") and
             evidence.get("parent_sha256") == S1_SHA and evidence.get("old_pending") == evidence.get("remaining") == 1911 and
+            evidence.get("pending_sha256") == cert.get("pending_sha256") == PENDING_SHA and
+            valid_pathmap(cert.get("pathmap_copy")) and valid_pathmap(evidence.get("pathmap_copy")) and
             evidence.get("resource_sha256") == cert["raw_sha256"] and
             evidence.get("optimized_sha256") == cert["optimized_sha256"] and
             evidence.get("retained") == lineage.get("new_content") and lineage.get("old_content") == ORIGINAL_CONTENT and
