@@ -45,6 +45,19 @@ COMMON = (*HELPERS, "coexist_inputs.py", "checkpoint.py", "build_trial.py",
 WORKER = ".github/workflows/bare-arm64-probe.yml"
 ROOT = Path(__file__).resolve().parents[2]
 CERT_PATH = "preflight28/graph/label_trial_certificate.json"
+# Independently derived from the fixed S1 frontier and GN copy edge.
+PENDING_SHA = "0f475e82f12516553f7e6d7278be9fcca3a5a5b87cbc7ab2ad5689faa1dcd5fd"
+PATHMAP = dict(group="ea99def354ace13d91376294e40913863e1920533923f66324f93583fdfaedaa",
+               source="gen/chrome/android/chrome_public_apk_resources_path_map.txt",
+               output="apks/ChromePublic.apk.pathmap.txt", bytes=203458,
+               sha256="72fc4945715ff35ece4aff242172f614e1385a6bd0d57bd34fba43855690d956")
+
+
+def checked_pathmap(record):
+    require(isinstance(record, dict) and type(record.get("executed")) is bool and
+            type(record.get("bytes")) is int and record == dict(PATHMAP, executed=record["executed"]),
+            "Unverified resource path map in the independent trial")
+    return record
 
 
 def checked_final_certificate(value):
@@ -172,8 +185,12 @@ def verify_trial(helper, ticket):
     s1.fields(steps(worker), {s1.NEGATIVE: "success", s1.FRONTIER: "success", LABEL_STEP: "success",
               s1.COMPILE: "skipped"}, "Independent trial did not prove this migration")
     report = migration_report(jid)
-    s1.fields(report, dict(mode="trial", parent_sha256=PARENT_SHA, old_pending=1911, remaining=1911),
+    s1.fields(report, dict(mode="trial", parent_sha256=PARENT_SHA, old_pending=1911, remaining=1911,
+                           pending_sha256=PENDING_SHA),
               "The independent resource work changed the remaining APK actions")
+    require(cert.get("pending_sha256") == PENDING_SHA and
+            checked_pathmap(cert.get("pathmap_copy")) == checked_pathmap(report.get("pathmap_copy")),
+            "The certificate does not match the independently measured path map or frontier")
     previous = {"b319b80fae9723d99a5d3441a4e6bcb778ea35e32b63f203cb3a289aa8baa40e",
                 "a01ff002507636f864c6fc62b4b153f5fec8e8fa3436af79a012098b659420db"}
     hashes = {"raw_sha256": report["resource_sha256"], "optimized_sha256": report["optimized_sha256"]}

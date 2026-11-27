@@ -52,12 +52,14 @@ class LabelAdmission(LabelTest):
         self.normal_tree = dict(self.trial_tree)
         self.cert = dict(status="accepted", trial_run_id=TRIAL_RUN, trial_attempt=1, trial_head=TRIAL_HEAD,
                          source_sha256=gate.PARENT_SHA, raw_sha256="7"*64, optimized_sha256="8"*64,
+                         pending_sha256=gate.PENDING_SHA, pathmap_copy=dict(gate.PATHMAP, executed=True),
                          trial_workflow_blob="b"*40, trial_worker_blob="a"*40,
                          helpers={Path(p).name:hashlib.sha256((self.root/p).read_bytes()).hexdigest() for p in gate.HELPERS})
         main = "com.google.android.apps.chrome.Main"
         names = (main, main + "NewIcon", main + "IconRetro", main + "IconDark")
         labels = dict(application=["Bare Personal"], enabled=[main], launchers={name:["Bare Personal"] for name in names})
         self.report = dict(mode="trial", parent_sha256=gate.PARENT_SHA, old_pending=1911, remaining=1911,
+                           pending_sha256=gate.PENDING_SHA, pathmap_copy=dict(gate.PATHMAP, executed=True),
                            resource_sha256="7"*64, optimized_sha256="8"*64, raw_labels=labels, optimized_labels=labels)
 
     def verify(self):
@@ -86,6 +88,22 @@ class LabelAdmission(LabelTest):
         with self.assertRaises(ValueError): self.verify()
         for rid in (gate.CONSUMED, gate.FAILED_TRIAL, gate.SOURCE_RUN):
             with self.assertRaises(ValueError): gate.route(dict(self.ticket,trial_run_id=rid))
+
+    def test_pathmap_and_full_pending_set_must_match_the_trial_log(self):
+        self.report["pathmap_copy"]["executed"] = False
+        with self.assertRaises(ValueError):
+            self.verify()
+        self.cert["pathmap_copy"]["executed"] = False
+        self.verify()
+        for container in (self.cert, self.report):
+            for field, value in (("group", "a"*64), ("source", "other"), ("output", "other"),
+                                 ("sha256", "0"*64), ("bytes", 203458.0), ("executed", 0)):
+                with self.subTest(field=field), patch.dict(container["pathmap_copy"], {field:value}), self.assertRaises(ValueError):
+                    self.verify()
+            with patch.dict(container, pending_sha256="0"*64), self.assertRaises(ValueError):
+                self.verify()
+            with patch.dict(container, pathmap_copy=None), self.assertRaises(ValueError):
+                self.verify()
 
     def test_trial_log_uses_actual_emitted_line_once(self):
         def read(data):
