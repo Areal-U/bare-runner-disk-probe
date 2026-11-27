@@ -82,11 +82,11 @@ def publish(folder, env, api):
     return receipt
 
 
-def publish_once_with_reconciliation(folder, env, api, *, pause=time.sleep):
+def reconciled_deposit(operation, *, pause=time.sleep):
     # One transport retry on the same immutable names. Never relax any content, source or owner check.
     for attempt in range(2):
         try:
-            return publish(folder, env, api)
+            return operation()
         except Exception as error:
             transient = (isinstance(error, (OSError, http.client.HTTPException)) or
                          str(error).startswith("Private write unresolved.") or
@@ -94,6 +94,10 @@ def publish_once_with_reconciliation(folder, env, api, *, pause=time.sleep):
             if attempt or not transient:
                 raise
             pause(4)
+
+
+def publish_once_with_reconciliation(folder, env, api, *, pause=time.sleep):
+    return reconciled_deposit(lambda: publish(folder, env, api), pause=pause)
 
 
 def confirmed_private_pair(api, rows, env, *, read_bytes=False):
