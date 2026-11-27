@@ -104,9 +104,8 @@ class TerminalDraft(unittest.TestCase):
             with self.assertRaises(ValueError): d.authorize_rescue(env,Api())
             self.assertEqual(capture.call_count,1)
             out["cipher_id"] = ""
-            import s1_label_resume
-            import s1_setup_resume
-            for gate in (owner.s1_resume, s1_label_resume, s1_setup_resume):
+            from registration import S1_GRANTS
+            for gate in S1_GRANTS:
                 owner.private_row.reset_mock()
                 with patch.object(d.normal.owner_recovery, "resumed_claim", return_value=(gate, (22, {}))) as select:
                     d.authorize_rescue(env, Api())

@@ -124,12 +124,10 @@ def read_claim(api, release, name):
 def resumed_claim(api, release, source_run):
     """Select by the physical producer recorded in the immutable claim, even when both grants exist."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "control"))
-    import s1_resume
-    import s1_label_resume
-    import s1_setup_resume
+    from registration import S1_GRANTS
 
     matches = []
-    for gate in (s1_resume, s1_label_resume, s1_setup_resume):
+    for gate in S1_GRANTS:
         entry = read_claim(api, release, gate.CLAIM)
         if entry and entry[1].get("run_id") == source_run:
             matches.append((gate, entry))
