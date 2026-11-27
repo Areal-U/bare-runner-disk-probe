@@ -386,6 +386,7 @@ jobs:
       checkpoint_identity: ${{ steps.publish.outputs.checkpoint_identity }}
       private_readback_verified: ${{ steps.publish.outputs.private_readback_verified }}
       checkpoint_advanced: ${{ steps.publish.outputs.checkpoint_advanced }}
+      checkpoint_can_resume: ${{ steps.publish.outputs.checkpoint_can_resume }}
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       with:
@@ -497,6 +498,7 @@ jobs:
     - name: Require ordinary and independent consumer evidence
       id: cert
       env:
+        WRITER_HEADROOM: ${{ needs.draft-publisher.outputs.checkpoint_can_resume }}
         HEADROOM: ${{ needs.compile-probe.outputs.headroom }}
         WORKER: ${{ needs.compile-probe.outputs.kind }}
         TERMINAL: ${{ needs.compile-probe.outputs.terminal }}
