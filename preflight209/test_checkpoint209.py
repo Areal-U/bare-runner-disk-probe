@@ -93,6 +93,24 @@ class Checkpoint(unittest.TestCase):
             cp.check_archive(*self.archive())
 
 
+class StorageObservation(unittest.TestCase):
+    def test_unstable_inventory_reobserved_with_hard_deadline(self):
+        os.environ.setdefault('RUNNER_TEMP','/tmp')
+        import admit
+        from unittest.mock import Mock
+        error = admit.storage.StorageUnconfirmed('Artifact inventory still settling')
+        with patch.object(admit.time,'sleep'), patch.object(admit.storage,'admit',side_effect=[error,'admitted']) as read:
+            self.assertEqual(admit.current_view(Mock(),{},12,1,stage='outcome'),'admitted')
+            self.assertEqual(read.call_count,2)
+        with patch.object(admit.storage,'admit',side_effect=error) as read:
+            with self.assertRaises(admit.storage.StorageUnconfirmed):
+                admit.current_view(Mock(),{},12,1,stage='outcome',deadline=admit.time.time()+10)
+            self.assertEqual(read.call_count,1)
+        with patch.object(admit.storage,'admit',side_effect=admit.storage.StorageFull('capacity')):
+            with self.assertRaises(admit.storage.StorageFull):
+                admit.current_view(Mock(),{},12,1,stage='outcome')
+
+
 class ServiceOrigin(unittest.TestCase):
     def test_offline_new_generation_boundaries(self):
         os.environ.setdefault('RUNNER_TEMP','/tmp')
