@@ -141,12 +141,13 @@ class LabelAdmission(LabelTest):
 
 class PhysicalBinding(LabelTest):
     def test_new_ticket_only_old_claim_cannot_be_reissued(self):
+        import s1_setup_resume as live
         draft = OwnerDraft()
-        draft.ticket.update(fixed())
-        draft.ack.update(fixed())
+        draft.ticket.update(fixed(), **live.failure_fields())
+        draft.ack.update(fixed(), **live.failure_fields())
         draft.ticket["collector_ack_sha"] = hashlib.sha256(draft.data(812)).hexdigest()
-        draft.asset["name"] = gate.TICKET_NAME
-        prior_name = gate.s1.CAMPAIGN + "-s02-label-repair-collection-registration.json"
+        draft.asset["name"] = live.TICKET_NAME
+        prior_name = gate.TICKET_NAME
         prior_asset = dict(draft.asset, name=prior_name, id=902)
         list_draft = draft.draft
         def with_prior(release_id):
@@ -164,13 +165,13 @@ class PhysicalBinding(LabelTest):
         def enter(verify=False):
             env["REGISTRATION_SHA"]=hashlib.sha256(draft.data()).hexdigest()
             return registration.bind(draft,env,event,now,verify_only=verify)
-        with patch.object(gate,"validate_source",autospec=True) as evidence,patch.object(registration,"admit",return_value=831) as claim:
+        with patch.object(live,"validate_source",autospec=True) as evidence,patch.object(registration,"admit",return_value=831) as claim:
             self.assertEqual(enter()[0],831)
             self.assertTrue(evidence.call_args.kwargs["initial"])
-            self.assertEqual(claim.call_args.kwargs["name"],gate.CLAIM)
-            self.assertNotEqual(gate.CLAIM,gate.s1.CLAIM)
+            self.assertEqual(claim.call_args.kwargs["name"],live.CLAIM)
+            self.assertNotEqual(live.CLAIM,gate.CLAIM)
             holder=claim.call_args.args[1]
-            gate.check_reference(holder,draft.ticket)
+            live.check_reference(holder,draft.ticket)
             env["GITHUB_JOB"]="collection-lease"
             self.assertEqual(enter(True)[0],831)
             self.assertEqual(claim.call_args.args[0],"recover")

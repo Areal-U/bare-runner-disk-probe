@@ -10,7 +10,7 @@ import sys
 
 import slot1_handoff
 import s1_resume
-import s1_label_resume
+import s1_setup_resume
 from slot1_handoff import CAMPAIGN, CLAIM, TICKET_NAME
 from admission import BASE_REF, REPO, REPO_ID, S2_SHA, RELEASE_ID, PagedOwnerDraft, admit, require
 
@@ -168,7 +168,7 @@ def bind(helper, env, event, now=None, *, verify_only=False):
             and all(event["sender"].get(k) == v for k,v in OWNER.items()), "Unexpected dispatch")
     resume = env.get("R30_RESUME_S1") == "1"
     checked_build_route(event["inputs"], resume=resume)
-    gate = s1_label_resume if resume else slot1_handoff
+    gate = s1_setup_resume if resume else slot1_handoff
     api = helper.metadata(f"{helper.BASE}/actions/runs/{run}/attempts/1")
     require(api["id"] == run and api["run_attempt"] == 1 and api["head_sha"] == revision
             and api["path"] == WORKFLOW and api["event"] == "workflow_dispatch" and api["head_branch"] == BASE_REF
