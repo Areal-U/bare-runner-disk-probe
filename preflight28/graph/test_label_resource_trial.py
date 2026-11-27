@@ -175,12 +175,81 @@ class PathmapMigrationTest(unittest.TestCase):
         copy = {(m.PATHMAP_OUTPUT,): "copy"}
         for sequence, expected in (([copy, copy, {}],True),([{}],False)):
             with self.subTest(expected=expected), patch.object(m,"file_record",return_value=record), \
+                    patch.object(m,"sha",return_value=m.COPY_HANDLER_SHA), \
                     patch.object(m,"run",side_effect=sequence) as run:
                 result = m.verify_pathmap_copy(Path("."), [], parent, set())
                 self.assertEqual(result["executed"], expected)
                 self.assertEqual(result["group"], m.canonical((m.PATHMAP_OUTPUT,)))
                 self.assertEqual([c.kwargs["dry"] for c in run.call_args_list],
                                  [True,False,True] if expected else [True])
+                self.assertEqual([c.kwargs.get("handler_copy") for c in run.call_args_list],
+                                 [None,m.PATHMAP_OUTPUT,None] if expected else [None])
+
+    def test_only_the_expected_handler_can_report_a_successful_copy(self):
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from graph import parse_metrics
+        from label_resource_trial import PATHMAP_OUTPUT
+
+        row = dict(step_id="s1", rule="simple/copy", action="copy", outputs=[PATHMAP_OUTPUT], inputs=1, no_exec=True)
+        with TemporaryDirectory() as root:
+            out = Path(root)
+            metrics = out / "metrics.jsonl"
+
+            def observe(changes, scope=PATHMAP_OUTPUT):
+                metrics.write_text(json.dumps(dict(row, **changes)) + '\n{"build_id":"b1"}\n')
+                return parse_metrics(metrics, 1, out, actual=True, handler_copy=scope)
+
+            self.assertEqual(observe({}), {(PATHMAP_OUTPUT,): "copy"})
+            with self.assertRaisesRegex(ValueError, "did not execute locally"):
+                observe({}, scope=None)
+            for changes in (dict(outputs=["another"]), dict(outputs=[PATHMAP_OUTPUT,"extra"]),
+                            dict(rule="simple/stamp"), dict(action="stamp"), dict(no_exec=False),
+                            dict(no_exec=1), dict(err=True), dict(cached=True), dict(is_remote=True),
+                            dict(is_local=True), dict(fallback=True), dict(racing=True), dict(two_phase_cache_hit=True),
+                            dict(inputs=True), dict(inputs=2), dict(inputs="1"), dict(inputs=None)):
+                with self.subTest(changes=changes), self.assertRaises(ValueError):
+                    observe(changes)
+            from contextlib import redirect_stdout
+            from io import StringIO
+            log = StringIO()
+            with redirect_stdout(log), self.assertRaises(ValueError):
+                observe(dict(rule="private-rule", action="private-action", outputs=["private-path"],
+                             is_remote="private-value", cmdhash="private-hash", inputs="private-inputs"))
+            self.assertNotIn("private", log.getvalue())
+            observed = json.loads(log.getvalue().removeprefix("BARE_LABEL_COPY_METRIC "))
+            self.assertEqual((observed["rule_matches"], observed["action_matches"], observed["output_matches"],
+                              observed["one_input"], observed["steps"], observed["no_exec"], observed["is_remote"]),
+                             (False, False, False, False, 1, True, None))
+            summary = {"build_id":"b1"}
+            for rows, count in (([],0), ([summary],1), ([row],1), ([row,summary],2),
+                                ([row,row,summary],1), ([row,dict(summary,err=True)],1),
+                                ([row,summary,summary],1), ([None],1)):
+                with self.subTest(rows=rows,count=count), redirect_stdout(StringIO()) as log, self.assertRaises(ValueError):
+                    metrics.write_text("".join(json.dumps(value) + "\n" for value in rows))
+                    parse_metrics(metrics, count, out, actual=True, handler_copy=PATHMAP_OUTPUT)
+                self.assertIn("BARE_LABEL_COPY_",log.getvalue())
+
+    def test_changed_handler_and_lost_or_changed_post_copy_bytes_are_rejected(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import label_resource_trial as m
+        record = [m.PATHMAP_BYTES, m.PATHMAP_SHA]
+        parent = {name:f"f:0:{record[0]}:{record[1]}" for name in (m.PATHMAP_SOURCE,m.PATHMAP_OUTPUT)}
+        copy = {(m.PATHMAP_OUTPUT,):"copy"}
+        with (patch.object(m,"file_record",return_value=record), patch.object(m,"sha",return_value="different"),
+              patch.object(m,"run",return_value=copy) as run, self.assertRaisesRegex(ValueError, "copy handler")):
+            m.verify_pathmap_copy(Path("."), [], parent, set())
+        self.assertEqual(run.call_count, 1)
+        for target in (0,1):
+            for bad in ([m.PATHMAP_BYTES,"different"], FileNotFoundError()):
+                final = [record,record]
+                final[target] = bad
+                with (self.subTest(target=target, bad=bad), patch.object(m,"file_record",side_effect=[record,record,*final]),
+                      patch.object(m,"sha",return_value=m.COPY_HANDLER_SHA), patch.object(m,"run",side_effect=[copy,copy,{}]),
+                      self.assertRaises((ValueError, FileNotFoundError))):
+                    m.verify_pathmap_copy(Path("."), [], parent, set())
 
     def test_copy_rejects_foreign_work_or_damaged_material_before_any_real_action(self):
         from unittest.mock import patch

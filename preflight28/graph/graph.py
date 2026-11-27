@@ -56,19 +56,52 @@ def output_name(value, out):
     return p.as_posix()
 
 
-def parse_metrics(metrics, count, out, *, actual, plan_rules=None):
+def check_copy_metric(step, count, output):
+    # StepMetric omits false booleans. Emit only bounded observations even on
+    # rejection; command text, paths and arbitrary metric values stay private.
+    excluded = ("is_local", "is_remote", "cached", "fallback", "racing", "two_phase_cache_hit", "err")
+    observed = {}
+    for key in ("no_exec", *excluded):
+        value = step.get(key, False)
+        observed[key] = value if type(value) is bool else None
+    observed.update(steps=count, rule_matches=step.get("rule") == "simple/copy",
+                    action_matches=step.get("action") == "copy", output_matches=step.get("outputs") == [output],
+                    one_input=type(step.get("inputs")) is int and step["inputs"] == 1)
+    print("BARE_LABEL_COPY_METRIC " + json.dumps(observed, sort_keys=True), flush=True)
+    if (count != 1 or not all(observed[key] for key in ("rule_matches", "action_matches", "output_matches", "one_input"))
+            or observed["no_exec"] is not True or any(observed[key] is not False for key in excluded)):
+        raise ValueError("unexpected Siso metric for the pinned copy handler")
+
+
+def parse_metrics(metrics, count, out, *, actual, plan_rules=None, handler_copy=None):
     edges = {}
     seen_step = set()
     summary = False
+    if handler_copy is not None and not metrics.is_file():
+        check_copy_metric({}, count, handler_copy)
     if not metrics.exists() and count == 0:
         return edges
     with metrics.open(encoding="utf-8") as stream:
         for line in stream:
-            step = json.loads(line)
+            try:
+                step = json.loads(line)
+            except ValueError:
+                if handler_copy is not None:
+                    check_copy_metric({}, count, handler_copy)
+                raise
+            if handler_copy is not None and not isinstance(step, dict):
+                check_copy_metric({}, count, handler_copy)
             if "step_id" not in step:
                 if "build_id" in step:
+                    if handler_copy is not None and (summary or step.get("err", False) is not False):
+                        print("BARE_LABEL_COPY_COVERAGE " + json.dumps(dict(expected_steps=count,
+                              observed_steps=len(edges), duplicate_summary=summary,
+                              summary_error=step.get("err", False) is not False)), flush=True)
+                        raise ValueError("duplicate or failed Siso copy summary")
                     summary = True
                 continue
+            if handler_copy is not None:
+                check_copy_metric(step, count, handler_copy)
             if step["step_id"] in seen_step or step.get("err", False):
                 raise ValueError("duplicate or failed metric")
             seen_step.add(step["step_id"])
@@ -78,12 +111,17 @@ def parse_metrics(metrics, count, out, *, actual, plan_rules=None):
             names = tuple(sorted(output_name(n, out) for n in raw))
             if names in edges or len(set(names)) != len(names):
                 raise ValueError("ambiguous edge output group")
-            if actual and not step.get("is_local", False):
+            if actual and handler_copy is None and not step.get("is_local", False):
                 raise ValueError("small preflight edge did not execute locally")
             edges[names] = step.get("action", "")
             if plan_rules is not None and step.get('rule') in plan_rules[0]:
                 plan_rules[1][canonical(names)] = [step['rule'], output_name(raw[0], out), step['action']]
+    if handler_copy is not None and not edges:
+        check_copy_metric({}, count, handler_copy)
     if count != len(edges) or (count and not summary):
+        if handler_copy is not None:
+            print("BARE_LABEL_COPY_COVERAGE " + json.dumps(dict(expected_steps=count, observed_steps=len(edges),
+                  summary_seen=summary)), flush=True)
         raise ValueError(f"incomplete Siso metrics: {len(edges)} of {count} steps")
     return edges
 
@@ -132,7 +170,10 @@ def dirty_target_details(logdir, edges):
     return report
 
 
-def run(out, command, targets, *, dry, noop=False, plan_rules=None, isolated_logs=False, timeout_seconds=600):
+def run(out, command, targets, *, dry, noop=False, plan_rules=None, isolated_logs=False, timeout_seconds=600,
+        handler_copy=None):
+    if handler_copy is not None and (dry or noop or targets != [handler_copy]):
+        raise ValueError("copy handler evidence requires a single actual target")
     start = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="bare28-plan-") as name:
         tmp = Path(name)
@@ -163,7 +204,8 @@ def run(out, command, targets, *, dry, noop=False, plan_rules=None, isolated_log
             if process.returncode or len(counts) != 1 or b"Build Failed" in tail:
                 raise ValueError("Siso completion/step count unavailable: "
                                  + tail[-1000:].decode(errors="replace"))
-        edges = parse_metrics(metrics, int(counts[0]), out, actual=not dry, plan_rules=plan_rules)
+        edges = parse_metrics(metrics, int(counts[0]), out, actual=not dry, plan_rules=plan_rules,
+                              handler_copy=handler_copy)
         report = {"operation": "plan" if dry else "execute", "target": targets[0],
                   "steps": len(edges), "seconds": round(time.monotonic() - start, 2)}
         if dry and edges and targets != [TARGET]:

@@ -22,6 +22,7 @@ PATHMAP_OUTPUT = "apks/ChromePublic.apk.pathmap.txt"
 PATHMAP_SHA = "72fc4945715ff35ece4aff242172f614e1385a6bd0d57bd34fba43855690d956"
 PATHMAP_BYTES = 203458
 PATHMAP_GROUP_ID = "ea99def354ace13d91376294e40913863e1920533923f66324f93583fdfaedaa"
+COPY_HANDLER_SHA = "6ba62e179c545d32fc9464a49b47d9071c5191e1231bfe28f68b6961060aac34"
 SOURCE = "../../chrome/android/java/res_chromium_base/values/bare_launcher_label.xml"
 RAW_SHA = "b319b80fae9723d99a5d3441a4e6bcb778ea35e32b63f203cb3a289aa8baa40e"
 PERSONAL_RESOURCE_SHA = {
@@ -233,7 +234,9 @@ def verify_pathmap_copy(out, command, original, old):
     if planned and planned != expected_metric:
         raise ValueError(f"Unapproved work for path-map copy: {list(planned.items())[:4]}")
     if planned:
-        actual = run(out, command, [PATHMAP_OUTPUT], dry=False, isolated_logs=True)
+        if sha(out.parent.parent / "build/config/siso/simple.star") != COPY_HANDLER_SHA:
+            raise ValueError("Unreviewed Siso path-map copy handler")
+        actual = run(out, command, [PATHMAP_OUTPUT], dry=False, isolated_logs=True, handler_copy=PATHMAP_OUTPUT)
         if actual != expected_metric:
             raise ValueError(f"Unexpected path-map copy execution: {list(actual.items())[:4]}")
         if run(out, command, [PATHMAP_OUTPUT], dry=True):
