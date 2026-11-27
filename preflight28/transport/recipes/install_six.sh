@@ -20,6 +20,17 @@ REV = "800628ad1ca1fd0c51e3b43b5b2bca081e81c3f6"
 ALLOWED_POOL = re.compile(r"pool/(main|universe|restricted|multiverse)/[a-z0-9]+/[a-z0-9][a-z0-9+.\-]*/[a-zA-Z0-9.+~_%:\-]+\.deb")
 DEB_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+~_%:\-]*\.deb")
 
+# These superseded binaries disappeared from both ordinary Ubuntu pools.
+# Only the same snapshot that authenticated the package plan can supply them.
+EXPAT_SNAPSHOT = {
+    "pool/main/e/expat/libexpat1-dev_2.4.7-1ubuntu0.9_amd64.deb": (
+        "libexpat1-dev", "2.4.7-1ubuntu0.9", "amd64", 151246,
+        "5ed152003cdb6e840985d41a5fbc72a72dfe2e92e187d57b66052de3ea8ee2cd"),
+    "pool/main/e/expat/libexpat1_2.4.7-1ubuntu0.9_i386.deb": (
+        "libexpat1", "2.4.7-1ubuntu0.9", "i386", 98396,
+        "9318c7c4cb706b3db32f31d4236be469f9e2f0533b4a003146fac7dc9870bc64"),
+}
+
 def fail(reason):
     raise ValueError(reason)
 
@@ -89,7 +100,12 @@ def download(host, path, record, dest):
         con = http.client.HTTPSConnection(host, timeout=35)
         try:
             # Use the official pool's path; credentials and cross-host redirects are unnecessary.
-            url = "/ubuntu/"+quote(path,safe="/+.~_:-")
+            base_path = "/ubuntu/"
+            if host == "snapshot.ubuntu.com":
+                if EXPAT_SNAPSHOT.get(path) != record:
+                    fail("Unrecognized signed snapshot fallback object")
+                base_path = urlsplit(SNAP).path
+            url = base_path + quote(path, safe="/+.~_:-")
             con.request("GET",url,headers={"User-Agent":"bare-checkpoint-dependency-readback"})
             response = con.getresponse()
             if response.status != 200:
@@ -114,12 +130,19 @@ def download(host, path, record, dest):
 def acquire(args):
     path,record,dest = args
     status = []
-    for host in ("archive.ubuntu.com","security.ubuntu.com"):
+    hosts = ["archive.ubuntu.com", "security.ubuntu.com"]
+    if path in EXPAT_SNAPSHOT:
+        if EXPAT_SNAPSHOT[path] != record:
+            fail("Pinned expat record differs from signed APT index: " + path)
+        hosts.append("snapshot.ubuntu.com")
+    for host in hosts:
         try:
             result = download(host,path,record,dest)
         except (OSError,http.client.HTTPException) as exc:
             result = type(exc).__name__
         if result == "verified":
+            if host == "snapshot.ubuntu.com":
+                print("Read exact signed package from the fixed snapshot: " + path, flush=True)
             return None
         status.append(host+"="+result)
     return (path, *status)

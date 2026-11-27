@@ -282,3 +282,112 @@ class GuardTests(unittest.TestCase):
         self.p.cache.append(self.p.cache[0])
         with self.assertRaisesRegex(ValueError,"Ambiguous"):
             s.cache_fallback(self.p.get,self.env,1)
+
+
+class ArtifactPaginationTests(unittest.TestCase):
+    @staticmethod
+    def row(aid, **updates):
+        return {"id": aid, "size_in_bytes": aid, "name": str(aid), "expired": False,
+                "expires_at": "2030-01-01T00:00:00Z", "digest": f"sha256:{aid:064x}"} | updates
+
+    def read(self, layouts, run_id=None):
+        from urllib.parse import parse_qs, urlsplit
+        def get(path):
+            query = parse_qs(urlsplit(path).query)
+            width, page = int(query["per_page"][0]), int(query["page"][0])
+            expected, pages = layouts[width]
+            total, rows = pages[page - 1]
+            self.assertEqual(len(pages), expected)
+            return {"total_count": total, "artifacts": rows}
+        with patch.object(s, "ARTIFACT_PAGE_SIZES", tuple(layouts)), contextlib.redirect_stdout(io.StringIO()):
+            return s.receipt_rows(get, run_id=run_id)
+
+    def test_lagging_count_needs_two_independent_complete_views(self):
+        a, b, c = map(self.row, (1, 2, 3))
+        layouts = {100: (1, [(5, [a,b,c])]), 2: (2, [(3, [a,b]), (3,[c])]), 3: (2, [(3,[a,b,c]),(3,[])])}
+        self.assertEqual(set(self.read(layouts)), {1,2,3})
+        with self.assertRaisesRegex(s.StorageUnconfirmed, "no two consecutive"):
+            self.read(dict(list(layouts.items())[:2]))
+
+    def test_metadata_of_any_visible_id_must_match_even_at_equal_size(self):
+        a = self.row(1)
+        layouts = {100:(1,[(3,[a])]), 50:(1,[(1,[a | {"digest": "other"}])])}
+        with self.assertRaisesRegex(s.StorageUnconfirmed, "ID 1 changed metadata"):
+            self.read(layouts)
+
+    def test_missing_row_cannot_be_excused_by_two_lower_matching_totals(self):
+        a,b = map(self.row,(1,2))
+        layouts = {100:(1,[(3,[a,b])]),50:(1,[(1,[a])]),20:(1,[(1,[a])])}
+        with self.assertRaisesRegex(s.StorageUnconfirmed, r"previously observed IDs: \[2\]"):
+            self.read(layouts)
+
+    def test_persistent_incomplete_duplicate_crosspage_and_moving_total_are_rejected(self):
+        a,b,c = map(self.row,(1,2,3))
+        for bad in [
+            {100:(1,[(8,[a,b])]),50:(1,[(8,[a,b])])},
+            {100:(1,[(2,[a,a])]),50:(1,[(2,[a,a])])},
+            {2:(2,[(3,[a,b]),(3,[b])]),50:(1,[(2,[a,b])])},
+            {2:(2,[(4,[a,b]),(3,[c])]),50:(1,[(3,[a,b,c])])},
+        ]:
+            with self.subTest(layouts=tuple(bad)), self.assertRaisesRegex(s.StorageUnconfirmed, "Incomplete"):
+                self.read(bad)
+
+    def test_two_complete_but_different_layouts_do_not_allow_a_write(self):
+        a,b = map(self.row,(1,2))
+        with self.assertRaisesRegex(s.StorageUnconfirmed, "differing IDs"):
+            self.read({100:(1,[(1,[a])]),50:(1,[(2,[a,b])])})
+
+    def test_deadline_interrupts_one_blocked_get(self):
+        with patch.object(s, "INVENTORY_SECONDS", 0.025), self.assertRaisesRegex(s.StorageUnconfirmed, "deadline"):
+            s.receipt_rows(lambda path: s.time.sleep(1))
+        self.assertEqual(s.signal.getitimer(s.signal.ITIMER_REAL),(0,0))
+
+    def test_owner_lease_expiry_is_rechecked_after_inventory(self):
+        now = 1_800_000_000
+        provider = Provider()
+        settings = ENV | {"R28_STORAGE_UNTIL": str(now+s.DAY+7*60)}
+        with patch.object(s.time, "time", side_effect=[now,now+1]), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(s.StorageUnconfirmed, "expired during"):
+                s.admit(provider.get, settings, 1, 1, stage="outcome")
+
+    def test_5000_receipts_including_the_exact_multiple_terminal_page(self):
+        from urllib.parse import parse_qs, urlsplit
+        rows = [self.row(idx+1) for idx in range(s.MAX_ARTIFACTS)]
+        calls = []
+        def get(path):
+            q = parse_qs(urlsplit(path).query)
+            width, page = int(q["per_page"][0]), int(q["page"][0])
+            calls.append((width,page))
+            return {"total_count": len(rows), "artifacts": rows[(page-1)*width:page*width]}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(len(s.receipt_rows(get)),5000)
+        self.assertEqual([p for width,p in calls if width==100],list(range(1,52)))
+        self.assertEqual([p for width,p in calls if width==99],list(range(1,52)))
+
+    def test_foreign_run_arriving_during_inventory_blocks_write(self):
+        provider = Provider()
+        def get(path):
+            if "/actions/artifacts?" in path:
+                provider.runs = [{"id": 82, "status": "in_progress"}]
+            return provider.get(path)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(s.StorageUnconfirmed,"Another run 82"):
+            s.admit(get,ENV,1,1,stage="outcome",now=1_800_000_000)
+
+    def test_only_corroborated_growth_owned_by_our_run_is_accepted(self):
+        a = self.row(1)
+        source = {"id":81,"repository_id":s.REPO_ID,"head_repository_id":s.REPO_ID}
+        b = self.row(2, workflow_run=source)
+        first = (1,[(1,[a])])
+        full = (1,[(2,[a,b])])
+        incomplete = (1,[(4,[a,b])])
+        self.assertEqual(set(self.read({100:first,99:full,50:full},81)),{1,2})
+        for layouts in [{100:first,99:full}, {100:first,99:full,50:first},
+                        {100:first,99:full,50:incomplete,20:full}]:
+            with self.subTest(layouts=tuple(layouts)), self.assertRaises(s.StorageUnconfirmed):
+                self.read(layouts,81)
+        for foreign in (source | {"id":82}, source | {"repository_id":2},
+                        source | {"head_repository_id":2}, None):
+            new = self.row(2, workflow_run=foreign)
+            view = (1,[(2,[a,new])])
+            with self.subTest(foreign=foreign), self.assertRaisesRegex(s.StorageUnconfirmed, "unbound additions"):
+                self.read({100:first,99:(1,[(3,[a,new])]),50:view,20:view},81)

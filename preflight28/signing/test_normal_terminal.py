@@ -93,7 +93,8 @@ def normal_binding(registration_dir, workflows):
     import registration as gate
     jobs=yaml.safe_load((workflows/"bare-checkpoint-transfer.yml").read_text())["jobs"]
     assert "validate-build" in jobs["bind-private-receiver"]["needs"]
-    for n in ("production","slot01"):
+    resumes_s1 = jobs["bind-private-receiver"].get("env", {}).get("R30_RESUME_S1") == "1"
+    for n in ("production", "slot02" if resumes_s1 else "slot01"):
         assert "bind-private-receiver" in jobs[n]["needs"] and "claim_asset_id != ''" in jobs[n]["if"]
     native=yaml.safe_load((workflows/"bare-r28-native-slot.yml").read_text())["jobs"]
     assert "collection-lease" in native["arm"]["needs"]

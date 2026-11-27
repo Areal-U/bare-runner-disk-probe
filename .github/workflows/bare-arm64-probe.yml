@@ -178,6 +178,7 @@ jobs:
       GIT_TERMINAL_PROMPT: '0'
       PROBE_MODE: ${{ inputs.probe }}
       VERIFY_FRONTIER_ONLY: ${{ inputs.verify_frontier_only && 'true' || 'false' }}
+      PERSONAL_LABEL_RUN: ${{ github.event.inputs.mode == 'build-apk' && github.ref == 'refs/heads/bare-coexist-v2.0.4' && inputs.probe == 'checkpoint-production' && inputs.backend == 'draft' && inputs.segment_ordinal >= 2 && inputs.segment_ordinal <= 13 && 'true' || 'false' }}
       COEXIST_COLD: ${{ inputs.coexist_cold && 'true' || 'false' }}
       REPAIR_LEGACY_INPUT_PATHS: ${{ inputs.repair_legacy_input_paths && 'true' || 'false' }}
       LEGACY_PRODUCTION_KEY: bare-transfer-v2-42973841138-1-checkpoint-large
@@ -236,6 +237,16 @@ jobs:
         APK_JOBS: ${{ inputs.apk_jobs }}
       run: |
         [[ $CHECKPOINT_BACKEND == cache || $CHECKPOINT_BACKEND == draft ]]
+        if [[ $PERSONAL_LABEL_RUN == true ]]; then
+          if (( SEGMENT_ORDINAL == 2 )); then
+            [[ $R28_PARENT_RUN == 45771045621 && $R28_PARENT_MANIFEST == 795559195 ]]
+            [[ $EXPECTED_SHA == fa44728d39b61c25d4116579e6da2c63ca7898cec24ada0e7ae453548bbd73bf ]]
+          else
+            # Empty parent_run selects this physical run in the existing Draft bridge;
+            # a nonempty value requests a different run and must fail here.
+            [[ -z $R28_PARENT_RUN && $PARENT_PRODUCER == "$GITHUB_SHA" ]]
+          fi
+        fi
         if [[ -n $R28_PARENT_RUN ]]; then
           [[ $CHECKPOINT_BACKEND == draft && $R28_PARENT_RUN =~ ^[1-9][0-9]{0,18}$ && $R28_PARENT_RUN != "$GITHUB_RUN_ID" ]]
           if [[ $R28_PARENT_RUN == 45771045621 && $SEGMENT_ORDINAL == 2 ]]; then
@@ -355,9 +366,10 @@ jobs:
       timeout-minutes: 5
       run: |
         mkdir -p "$RUNNER_TEMP/bare-ci"
-        for file in checkpoint.py build_trial.py coexist_inputs.py guard.py check_archive.py graph.py retained.py metrics_evidence.py migration_graph.py segment_graph.py angle_restore.py android_outputs.py contract_gate.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
+        for file in checkpoint.py build_trial.py coexist_inputs.py launcher_labels.py apk_qc_evidence.py guard.py check_archive.py graph.py retained.py metrics_evidence.py migration_graph.py segment_graph.py angle_restore.py android_outputs.py contract_gate.py bare-arm64-probe.yml bare-checkpoint-transfer.yml; do
           source=$file
           [[ $file != guard.py ]] || source=preflight28/limits/guard.py
+          [[ $file != launcher_labels.py && $file != apk_qc_evidence.py ]] || source=preflight28/signing/$file
           [[ $file != check_archive.py ]] || source=preflight28/bridge/check_archive.py
           [[ $file != graph.py && $file != retained.py && $file != metrics_evidence.py && $file != migration_graph.py && $file != segment_graph.py && $file != angle_restore.py && $file != android_outputs.py && $file != contract_gate.py ]] || source=preflight28/graph/$file
           [[ $file != *.yml ]] || source=".github/workflows/$file"
@@ -365,6 +377,14 @@ jobs:
             "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/$source" \
             --output "$RUNNER_TEMP/bare-ci/$file"
         done
+        if [[ $PERSONAL_LABEL_RUN == true ]]; then
+          for file in label_resource_trial.py label_baseline.py personal_label.py label_trial_certificate.json; do
+            curl --fail --location --retry 2 --max-time 60 \
+              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/preflight28/graph/$file" \
+              --output "$RUNNER_TEMP/bare-ci/$file"
+          done
+          python3 "$RUNNER_TEMP/bare-ci/label_baseline.py" gate
+        fi
         if [[ $PROBE_MODE == checkpoint-production ]]; then
           mkdir -m 700 "$RUNNER_TEMP/r28-apk-receipt"
           for file in bridge.py artifact_poll.py apk_artifact.py; do
@@ -721,6 +741,9 @@ jobs:
 
         if [[ $PROBE_MODE == checkpoint-* ]]; then
           cp "$RUNNER_TEMP/bare-ci/"*.py "$RUNNER_TEMP/bare-ci/"*.yml exchange/
+          if [[ $PERSONAL_LABEL_RUN == true ]]; then
+            cp -- "$RUNNER_TEMP/bare-ci/label_trial_certificate.json" exchange/
+          fi
           if [[ $CHECKPOINT_BACKEND == draft ]]; then
             install -m 0644 "$RUNNER_TEMP/round26-pool-install.py" exchange/round26-pool-install.py
             install -d -m 0755 exchange/verified-six
@@ -956,6 +979,7 @@ jobs:
           streamed=true
         fi
         docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CI_REVISION=$GITHUB_SHA" -e "BASE_IMAGE=$BARE_BASE_IMAGE" \
+          -e PERSONAL_LABEL_RUN -e GITHUB_SHA -e GITHUB_RUN_ID -e SEGMENT_ORDINAL \
           -e "EXPECTED_IDENTITY=$EXPECTED_IDENTITY" -e COEXIST_27_S2_KEY -e "STREAMED=$streamed" -e VERIFY_FRONTIER_ONLY -e "REPAIR_LEGACY_INPUT_PATHS=$REPAIR_LEGACY_INPUT_PATHS" \
           -e "PROBE_MODE=$PROBE_MODE" -e "EXPECTED_KEY=$EXPECTED_KEY" -e "LEGACY_PRODUCTION_KEY=$LEGACY_PRODUCTION_KEY" \
           -e "EXPANDED_PRODUCTION_KEY=$EXPANDED_PRODUCTION_KEY" \
@@ -1074,7 +1098,13 @@ jobs:
         if data['identity_sha256'] != os.environ['EXPECTED_IDENTITY']:
             raise SystemExit('Producer input identity differs.')
         PYTHON
+        if [[ $PERSONAL_LABEL_RUN == true && $SEGMENT_ORDINAL -gt 2 ]]; then
+          python3 /exchange/label_baseline.py restore-source
+        fi
         python3 /exchange/checkpoint.py restore-inputs out/Bare/checkpoint-inputs.jsonl.gz
+        if [[ $PERSONAL_LABEL_RUN == true && $SEGMENT_ORDINAL -gt 2 ]]; then
+          python3 /exchange/label_baseline.py check-source-manifest
+        fi
         if [[ $PROBE_MODE == checkpoint-production ]]; then
           # The public archive omits apks/, including GN's own text descriptors.
           # Generate them before Siso takes its snapshot of the restored inputs.
@@ -1225,6 +1255,16 @@ jobs:
           tail -n 1 exchange/checkpoint/frontier-before.log | jq -e '.parent_frontier_verified == true and .pending == 1911'
         fi
         echo "verified=$verified" >> "$GITHUB_OUTPUT"
+    - name: Prepare the independently verified Personal resources before the remaining compile
+      if: ${{ env.PERSONAL_LABEL_RUN == 'true' && inputs.segment_ordinal == 2 && !inputs.verify_frontier_only }}
+      timeout-minutes: 30
+      run: |
+        cd "$RUNNER_TEMP/bare-official"
+        docker compose exec -T -e GITHUB_SHA -e GITHUB_RUN_ID -e SEGMENT_ORDINAL chromium-builder bash -euc '
+          cd /work/chromium/src
+          python3 /exchange/label_resource_trial.py --out out/Bare --baseline /exchange/checkpoint/segment-before.json --mode prepare
+          python3 /exchange/label_baseline.py activate
+        '
     - name: Run the real APK target within its time and output budgets
       id: trial
       if: ${{ startsWith(inputs.probe, 'checkpoint-') && !inputs.verify_frontier_only }}
@@ -1410,8 +1450,17 @@ jobs:
         set -o pipefail
         cd /work/chromium/src
         temp=$(mktemp -d)
-        trap 'rm -rf -- "$temp"' EXIT
         apk=out/Bare/apks/ChromePublic.apk
+        # Diagnose the immutable candidate only if QC fails. Keep stdout exclusively for the accepted tar.
+        finish_qc() {
+          local status=$?
+          if (( status != 0 )); then
+            python3 -I /exchange/apk_qc_evidence.py "$apk" "$temp" >&2 || echo 'APK QC diagnostics unavailable.' >&2
+          fi
+          rm -rf -- "$temp"
+          exit "$status"
+        }
+        trap finish_qc EXIT
         sdk=third_party/android_sdk/public/build-tools/37.0.0
         [[ -x $sdk/aapt2 && -x $sdk/apksigner && -x third_party/jdk/current/bin/java ]]
         export JAVA_HOME="$PWD/third_party/jdk/current"
@@ -1424,6 +1473,7 @@ jobs:
           echo 'Android APK signature verification failed.' >&2
           exit 1
         }
+        python3 -I /exchange/launcher_labels.py "$sdk/aapt2" "$apk" --badging "$temp/badging.txt"
         python3 - "$apk" "$temp" <<'PYTHON'
         import hashlib
         import json
@@ -1721,6 +1771,7 @@ jobs:
           timeout --kill-after=2s "${remaining}s" "$@"
         }
         within_pack_deadline docker compose exec -T -e "BARE_REV=$BARE_REV" -e "CI_REVISION=$GITHUB_SHA" -e "BASE_IMAGE=$BARE_BASE_IMAGE" \
+          -e PERSONAL_LABEL_RUN -e GITHUB_SHA -e GITHUB_RUN_ID -e SEGMENT_ORDINAL \
           -e "TRIAL_PHASE=$phase" -e "PROBE_MODE=$PROBE_MODE" -e "PRODUCTION_CAP_BYTES=$PRODUCTION_CAP_BYTES" \
           -e CHECKPOINT_BACKEND -e "RETAIN_EXISTING_CACHES=$RETAIN_EXISTING_CACHES" chromium-builder \
           timeout --kill-after=2m "$pack_timeout" bash -seu <<'CONTAINER'
@@ -1805,6 +1856,10 @@ jobs:
           exit 1
         fi
         printf '{"evidence_valid":%s}\n' "$proof" > /exchange/checkpoint/proof.json
+        if [[ $PERSONAL_LABEL_RUN == true ]]; then
+          test -f /exchange/checkpoint/producer-provenance.json
+          python3 /exchange/label_baseline.py record-successor
+        fi
         if [[ -f /exchange/checkpoint/producer-provenance.json ]]; then
           cp /exchange/checkpoint/producer-provenance.json out/Bare/checkpoint-producer-provenance.json
           cp /exchange/checkpoint/provenance-check.json out/Bare/checkpoint-source-verification.json
@@ -1818,6 +1873,9 @@ jobs:
           python3 /exchange/checkpoint.py check-gn-packaging out/Bare
         fi
         time python3 /exchange/checkpoint.py record-inputs out/Bare/checkpoint-inputs.jsonl.gz
+        if [[ $PERSONAL_LABEL_RUN == true ]]; then
+          python3 /exchange/label_baseline.py check-source-manifest
+        fi
         if [[ $CHECKPOINT_BACKEND == draft ]]; then
           # One existing du scan of the quiescent tree; used only to select a level.
           du -sbx out/Bare | cut -f1 > /exchange/checkpoint/apparent-bytes

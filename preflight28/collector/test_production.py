@@ -138,6 +138,40 @@ class Production(unittest.TestCase):
             with self.assertRaises(ValueError): p.private_depositor({"depositor_run":13},row,[],9,self.head,1)
         with self.assertRaises(ValueError): p.decide([job],[],[row,dict(row,name=row["name"]+"-retry1",id=25)],[],9,self.head,p.recover.ChainStart())
 
+    def test_label_pickup_selects_only_the_registered_ticket_and_historical_ledger(self):
+        api = PrivateDocs()
+        gate = p.s1_label_resume
+        certificate = hashlib.sha256(b"collector test signing certificate").hexdigest()
+        self.enterContext(patch.object(gate, "OWNER_CERT_COMMITMENT", hashlib.sha256(certificate.encode()).hexdigest()))
+        common = dict(schema=1, campaign=p.CAMPAIGN, repository_id=p.REPO_ID, workflow=p.WORKFLOW,
+                      branch=p.BASE_REF, head=self.head, recipient=p.apk_seal.RECIPIENT,
+                      release_id=p.RELEASE_ID, initial_parent=p.s1_resume.PARENT_SHA)
+        ticket = dict(common, collector_registration_id="owner-service", owner_destination_id="owner-file",
+                      final_certificate_sha256=certificate)
+        previous = api.write(p.s1_resume.CLAIM, {"run_id": 45841492691})
+        prior_ticket = api.write(p.s1_resume.TICKET_NAME, {"v": "previous"}, owner=True)
+        current = api.write(gate.TICKET_NAME, ticket, owner=True)
+        locator = dict(head=self.head, ticket_asset_id=current["id"], ticket_sha=current["digest"][7:],
+                       owner_destination_id="owner-file", registration_id="owner-service")
+        claim = dict(common, run_id=88, producer_attempt=1, registration_id="owner-service",
+                     ticket_asset_id=current["id"], ticket_sha=current["digest"][7:])
+        current_claim = api.write(gate.CLAIM, claim)
+        rows = tuple((r["name"], r["id"], r["size"], r["digest"][7:], owner)
+                     for r, owner in ((previous, False), (prior_ticket, True)))
+        with patch.object(gate, "source_rows", return_value=rows), \
+             patch.object(gate, "check_binding") as binding, patch.object(gate, "check_reference") as ref:
+            origin, physical, cid, start = p.bind(api, api.rows, locator)
+            self.assertEqual((origin, physical, cid, start.ordinal, start.sha),
+                             (88, 88, current_claim["id"], 2, p.s1_resume.PARENT_SHA))
+            binding.assert_called_once_with({"run_id": 45841492691}, {"v": "previous"}, ticket)
+            ref.assert_called_once_with(claim, ticket)
+            for bad in (dict(ticket_asset_id=prior_ticket["id"]), dict(owner_destination_id="other")):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    p.bind(api, api.rows, {**locator, **bad})
+            api.files[previous["id"]] = b"{}"
+            with self.assertRaises(ValueError):
+                p.bind(api, api.rows, locator)
+
     def test_clear_bound_to_accepted_revision_and_CI_bytes(self):
         app=b"stand-in for functional code-signing tests"
         meta=dict(apk="ChromePublic.apk",package="org.barebrowser.personal",version_name="2.0.4",
@@ -155,6 +189,21 @@ class Production(unittest.TestCase):
             self.assertEqual(content.call_count,1)
             with self.assertRaises(ValueError):
                 p.clear_bundle(tar,dict(pickup,seal=dict(self.seal,producer_sha="b"*40)),self.path/"wrong","aapt","jar")
+            certificate = hashlib.sha256(b"collector test signing certificate").hexdigest()
+            self.enterContext(patch.object(p.s1_label_resume, "OWNER_CERT_COMMITMENT",
+                                           hashlib.sha256(certificate.encode()).hexdigest()))
+            label_pickup = dict(pickup, owner_destination_id="registered-private-file",
+                                final_certificate_sha256=certificate)
+            clear = p.clear_bundle(tar, label_pickup, self.path/"label", "aapt", "jar")
+            apk = self.path/"label"/"ChromePublic.apk"
+            owner = {k: label_pickup[k] for k in ("owner_destination_id", "final_certificate_sha256")}
+            self.assertEqual({k: clear[k] for k in owner}, owner)
+            with self.assertRaises(ValueError):
+                p.clear_bundle(tar, dict(label_pickup, final_certificate_sha256="1"*64),
+                               self.path/"bad-release-cert", "aapt", "jar")
+            for changed in (dict(final_certificate_sha256="f"*64), dict(owner_destination_id="wrong")):
+                with self.assertRaisesRegex(ValueError, "registered pickup"):
+                    p.compare_signing_payload(apk, clear, apk, {**owner, **changed}, "jar")
         with tarfile.open(tar,"a") as t:
             t.addfile(tarfile.TarInfo("unexpected"))
         with self.assertRaises(ValueError): p.clear_bundle(tar,pickup,self.path/"other","aapt","jar")

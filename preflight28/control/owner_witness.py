@@ -30,8 +30,14 @@ def row_info(row, *, owner_issued):
 
 
 def claim_items(api, rows, run, head, job, expected_id):
-    gate = owner.s1_resume if any(row["name"] == owner.s1_resume.CLAIM and row["id"] == expected_id
-                                  for row in rows) else owner.handoff
+    matches = [gate for gate in owner.PICKUP_GATES
+               if any(row["name"] == gate.CLAIM and row["id"] == expected_id for row in rows)]
+    if job == "loss-admission":
+        require(not matches, "Expected the separate physical replacement claim")
+        gate = owner.handoff
+    else:
+        require(len(matches) == 1, "Missing or ambiguous originating claim ID")
+        gate = matches[0]
     initial = owner.private_row(rows,gate.TICKET_NAME)
     ticket = owner.private_document(api,initial,owner=True)
     locator = dict(head=head,ticket_asset_id=initial["id"],ticket_sha=initial["digest"][7:],

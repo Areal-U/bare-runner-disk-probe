@@ -56,7 +56,63 @@ def output_name(value, out):
     return p.as_posix()
 
 
-def parse_metrics(metrics, count, out, *, actual, plan_rules=None):
+def check_copy_metric(step, count, output):
+    # StepMetric omits false booleans. Emit only bounded observations even on
+    # rejection; command text, paths and arbitrary metric values stay private.
+    excluded = ("is_local", "is_remote", "cached", "fallback", "racing", "two_phase_cache_hit", "err")
+    observed = {}
+    for key in ("no_exec", *excluded):
+        value = step.get(key, False)
+        observed[key] = value if type(value) is bool else None
+    observed.update(steps=count, rule_matches=step.get("rule") == "simple/copy",
+                    action_matches=step.get("action") == "copy", output_matches=step.get("outputs") == [output],
+                    one_input=type(step.get("inputs")) is int and step["inputs"] == 1)
+    print("BARE_LABEL_COPY_METRIC " + json.dumps(observed, sort_keys=True), flush=True)
+    if (count != 1 or not all(observed[key] for key in ("rule_matches", "action_matches", "output_matches", "one_input"))
+            or observed["no_exec"] is not True or any(observed[key] is not False for key in excluded)):
+        raise ValueError("unexpected Siso metric for the pinned copy handler")
+
+
+def parse_copy_metrics(metrics, count, output):
+    from metrics_evidence import inspect_metrics
+
+    steps = before = after = 0
+    failed_phase = stream_verified = False
+
+    def observe(row):
+        nonlocal steps, before, after, failed_phase
+        if not isinstance(row, dict):
+            return  # The shared schema validator rejects this record.
+        if "step_id" in row:
+            steps += 1
+            check_copy_metric(row, count, output)
+        elif "build_id" in row:
+            if steps:
+                after += 1
+            else:
+                before += 1
+            failed_phase |= row.get("err", False) is not False
+
+    try:
+        with metrics.open("rb") as stream:
+            info = os.fstat(stream.fileno())
+            inspect_metrics("siso_metrics.json", info.st_mode, info.st_size, stream, observe=observe)
+        stream_verified = True
+        # Pinned ninjabuild.CheckManifest and doBuild each call rebuildManifest
+        # at most once without a real manifest regeneration. Any such extra
+        # generator step is outside this single-copy invocation.
+        if count != 1 or steps != 1 or before > 2 or after != 1 or failed_phase:
+            raise ValueError("Incomplete or failed Siso path-map copy phases")
+    finally:
+        print("BARE_LABEL_COPY_COVERAGE " + json.dumps(dict(expected_steps=count, observed_steps=steps,
+              before_copy=before, after_copy=after, failed_phase=failed_phase, stream_verified=stream_verified)),
+              flush=True)
+    return {(output,): "copy"}
+
+
+def parse_metrics(metrics, count, out, *, actual, plan_rules=None, handler_copy=None):
+    if handler_copy is not None:
+        return parse_copy_metrics(metrics, count, handler_copy)
     edges = {}
     seen_step = set()
     summary = False
@@ -132,7 +188,10 @@ def dirty_target_details(logdir, edges):
     return report
 
 
-def run(out, command, targets, *, dry, noop=False, plan_rules=None):
+def run(out, command, targets, *, dry, noop=False, plan_rules=None, isolated_logs=False, timeout_seconds=600,
+        handler_copy=None):
+    if handler_copy is not None and (dry or noop or targets != [handler_copy]):
+        raise ValueError("copy handler evidence requires a single actual target")
     start = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="bare28-plan-") as name:
         tmp = Path(name)
@@ -149,17 +208,22 @@ def run(out, command, targets, *, dry, noop=False, plan_rules=None):
                     shutil.copy2(path, state / basename)
             args.extend(["-n", "-state_dir", os.path.relpath(state, out),
                          "-log_dir", str(tmp / "logs")])
+        elif isolated_logs:
+            # Migration changes real build outputs and state, but its ephemeral
+            # Siso metrics/log rotation must not replace authenticated payload.
+            args.extend(["-log_dir", str(tmp / "logs")])
         with (tmp / "console").open("w+b") as console:
             with preserve_ninja_log(out) if (dry or noop) else contextlib.nullcontext():
                 process = subprocess.run([*args, *targets], stdout=console,
-                                         stderr=subprocess.STDOUT, timeout=600, check=False)
+                                         stderr=subprocess.STDOUT, timeout=timeout_seconds, check=False)
                 console.seek(max(0, console.tell() - 8192))
                 tail = console.read()
             counts = END.findall(tail)
             if process.returncode or len(counts) != 1 or b"Build Failed" in tail:
                 raise ValueError("Siso completion/step count unavailable: "
                                  + tail[-1000:].decode(errors="replace"))
-        edges = parse_metrics(metrics, int(counts[0]), out, actual=not dry, plan_rules=plan_rules)
+        edges = parse_metrics(metrics, int(counts[0]), out, actual=not dry, plan_rules=plan_rules,
+                              handler_copy=handler_copy)
         report = {"operation": "plan" if dry else "execute", "target": targets[0],
                   "steps": len(edges), "seconds": round(time.monotonic() - start, 2)}
         if dry and edges and targets != [TARGET]:

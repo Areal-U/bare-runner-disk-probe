@@ -2,7 +2,7 @@ import hashlib
 import json
 import unittest
 from unittest.mock import patch
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 from registration import BASE_REF, CAMPAIGN, CLAIM, FIRST_HEAD, FIRST_JOBS, FIRST_RUN, TICKET_NAME, OWNER, RECIPIENT, RELEASE_ID, REPO, REPO_ID, S2_SHA, WORKFLOW, bind
 
@@ -255,6 +255,53 @@ class TicketTests(unittest.TestCase):
         expiry = instant(self.d.ticket["expires_at"])
         latest, _ = checked_ack(self.d,self.d.draft(RELEASE_ID),self.d.ticket,created,created)
         self.assertEqual(int(expiry.timestamp())-latest,(350+25+45+7)*60+2*3600+900)
+
+    def test_live_registration_checks_the_unchanged_collection_deadline_through_claim_readback(self):
+        from registration import checked_ack, instant
+        created = instant(self.d.origin["created_at"])
+        deadline, _ = checked_ack(self.d, self.d.draft(RELEASE_ID), self.d.ticket, created, created)
+        exact = datetime.fromtimestamp(deadline, timezone.utc)
+        before = exact - timedelta(seconds=1)
+        after = exact + timedelta(microseconds=1)
+        self.env["REGISTRATION_SHA"] = hashlib.sha256(self.d.data()).hexdigest()
+
+        def process_claim(mode, holder, helper, *, name, before_write):
+            if mode == "compute":
+                before_write()
+            return 123
+
+        for job, times, accepted, claim_reads in (
+                ("bind-private-receiver", [before, exact, exact, exact], True, 1),
+                ("bind-private-receiver", [before, after], False, 0),
+                ("bind-private-receiver", [before, before, exact, after], False, 1),
+                ("collection-lease", [before, before, after], False, 1)):
+            with self.subTest(job=job, times=times), patch("registration.datetime", wraps=datetime) as clock, \
+                    patch("storage_admission.admit") as storage, \
+                    patch("registration.admit", side_effect=process_claim) as claim:
+                clock.now.side_effect = times
+                self.env["GITHUB_JOB"] = job
+                if accepted:
+                    self.assertEqual(bind(self.d, self.env, self.event)[0], 123)
+                else:
+                    with self.assertRaisesRegex(ValueError, "lease no longer covers"):
+                        bind(self.d, self.env, self.event, verify_only=job == "collection-lease")
+                self.assertIsNone(storage.call_args.kwargs["now"])
+                self.assertEqual(claim.call_count, claim_reads)
+
+    def test_live_storage_expiry_after_last_private_inventory_cannot_post_claim(self):
+        import storage_admission
+        self.env["REGISTRATION_SHA"] = hashlib.sha256(self.d.data()).hexdigest()
+        expires = (int(self.now.timestamp()) + 350 * 60 + storage_admission.JOURNAL_TAIL
+                   + storage_admission.JOURNAL_DAYS * storage_admission.DAY)
+        with patch("registration.datetime", wraps=datetime) as clock, \
+                patch("storage_admission.policy", return_value=(10*1024**3, expires)), \
+                patch("storage_admission.admit"), patch("admission.claim_info", return_value=None) as inventory, \
+                patch.object(self.d, "request", create=True) as request:
+            clock.now.side_effect = [self.now, self.now, self.now + timedelta(microseconds=1)]
+            with self.assertRaisesRegex(ValueError, "Storage policy expired"):
+                bind(self.d, self.env, self.event)
+        inventory.assert_called_once()
+        request.assert_not_called()
 
     @patch("registration.admit", return_value=123)
     def test_owner_ack_discovery_pins_immutable_id_and_bytes(self, claim):

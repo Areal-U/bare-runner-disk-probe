@@ -91,6 +91,22 @@ class Witness(unittest.TestCase):
                 with self.assertRaises(ValueError): w.preserve(self.docs,env,"claim")
                 self.assertEqual(save.call_count,1)
 
+    def test_resumed_witness_uses_exact_claim_id_with_both_grants_present(self):
+        import s1_label_resume
+        grants = [(w.owner.s1_resume, 31, 32, 151), (s1_label_resume, 41, 42, 152)]
+        for gate, tid, cid, run in grants:
+            ticket = dict(collector_registration_id=self.service, owner_destination_id=self.dest)
+            self.docs.add(gate.TICKET_NAME, ticket, owner=True, aid=tid)
+            self.docs.add(gate.CLAIM, {"run_id": run}, aid=cid)
+        for gate, tid, cid, run in grants:
+            scope = w.owner.recover.ChainStart(2, w.owner.s1_resume.PARENT_SHA, w.owner.s1_resume.PARENT_IDENTITY)
+            with patch.object(w.owner, "bind", return_value=(run, run, cid, scope)) as bind:
+                rows = w.claim_items(self.docs, self.docs.rows, run, self.env["GITHUB_SHA"], "bind-private-receiver", cid)
+                self.assertEqual(bind.call_args.args[2]["ticket_asset_id"], tid)
+                self.assertEqual([row["name"] for row in rows], [gate.TICKET_NAME, gate.CLAIM])
+                with self.assertRaisesRegex(ValueError, "Wrong physical claim"):
+                    w.claim_items(self.docs, self.docs.rows, run + 1, self.env["GITHUB_SHA"], "bind-private-receiver", cid)
+
     def test_terminal_outputs_only_the_two_correlated_physical_rows(self):
         payload=b"age-encryption.org/v1\nonly sealed data"
         part=self.docs.add("r28-77-a1-s01-apk.age",payload)
