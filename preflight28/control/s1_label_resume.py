@@ -23,7 +23,7 @@ OLD_TICKET_SHA = "e21fc767b4c5ea8a5a6264ff44fd5af410d9b95376591632a02c150c48a398
 OLD_ACK_SHA = "c03da98452f428f3856f2715852275085d781c665b8c2ecbb8f58efda25307e2"
 CLOSURE_SHA = "1a22b4050ad0493db3f1a3bac6d0f3bea8bd2ff19422af033cfe75dba2c2e46c"
 OWNER_CERT_COMMITMENT = "5c7257bce4824872e737c11b2bcb7d26da60d8cb8488b6555819dce77a58ddd5"
-TICKET_NAME = s1.CAMPAIGN + "-s02-label-repair-collection-registration.json"
+TICKET_NAME = s1.CAMPAIGN + "-s02-label-repair-preclaim-45938899386-collection-registration.json"
 CLAIM = s1.CAMPAIGN + "-s02-label-repair-796328557.json"
 TRIAL_BRANCH = "bare-r30-s1-label-20261127"
 FAILED_TRIAL = 45905086655
@@ -148,7 +148,9 @@ def migration_report(job_id):
     # the temporary URL nor arbitrary archived log text.
     pattern = re.compile(rb"^\d{4}-\d\d-\d\dT[0-9:.]+Z BARE_LABEL_MIGRATION (\{[^\r\n]*\})\r?\n?$")
     with TemporaryFile() as log:
-        subprocess.run(["gh", "api", f"repos/{REPO}/actions/jobs/{job_id}/logs"],
+        # Hosted job logs contain ANSI formatting. Keep the original bytes in
+        # this private file so only the exact timestamped report is parsed.
+        subprocess.run(["gh", "api", "--allow-escape-sequences", f"repos/{REPO}/actions/jobs/{job_id}/logs"],
                        stdout=log, timeout=90, check=True)
         require(log.tell() <= 128 * 1024**2, "Unexpected trial log size")
         log.seek(0)
