@@ -19,8 +19,8 @@
   "source_sha256": "fa44728d39b61c25d4116579e6da2c63ca7898cec24ada0e7ae453548bbd73bf",
   "status": "accepted",
   "trial_attempt": 1,
-  "trial_head": "cc748c38aec27a16d8004bda30de36bb083c0ad3",
-  "trial_run_id": 45929712881,
+  "trial_head": "d5951590ba22fb23b75b5af2a04d643fd4a4b9ab",
+  "trial_run_id": 45945428584,
   "trial_worker_blob": "09f65689cb415371bb4636b5ad76287e55dad6b6",
   "trial_workflow_blob": "073213a97eff2fcac9b98a18c8c5e434c5caa132"
 }
