@@ -126,9 +126,10 @@ def resumed_claim(api, release, source_run):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "control"))
     import s1_resume
     import s1_label_resume
+    import s1_setup_resume
 
     matches = []
-    for gate in (s1_resume, s1_label_resume):
+    for gate in (s1_resume, s1_label_resume, s1_setup_resume):
         entry = read_claim(api, release, gate.CLAIM)
         if entry and entry[1].get("run_id") == source_run:
             matches.append((gate, entry))

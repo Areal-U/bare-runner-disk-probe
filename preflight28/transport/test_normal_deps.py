@@ -31,7 +31,7 @@ class NormalDepsTests(unittest.TestCase):
                 with patch.object(normal_deps, "shell", local_stage):
                     normal_deps.stage()
             expected = {
-                "round26-pool-install.py": "c99035a293eb9e78fb5b2c5ceb136dfa920d73a7c28e7ff43a8734110d8a815d",
+                "round26-pool-install.py": "e4f42fd4b0510eb9b5e63bcd53b31915d7685a77a46cd908456c7ef8fbd6297e",
                 "verified-six/receive_six.py": "e68454af99b97c0d00230764d6546711c94ddbd57c744e7686819c63a3086a03",
                 "verified-six/public_urls.py": "1e5df94632a2a01db64d1225401e1754aa86552cdb874937e13ab44a9bf7487d",
                 "verified-six/receipts.json": "0e07cf7378adb98e54164297bbfee7ed4e884b3d1a62ceef8e8b572bbe703fb3",
