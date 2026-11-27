@@ -142,11 +142,15 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual((self.root/"accepted"/p.apk_seal.CIPHER_FILE).read_bytes(),self.cipher)
 
     def test_owner_locator_distinguishes_current_and_historical_slot_two_tickets(self):
+        retired = p.CAMPAIGN + "-s02-label-repair-collection-registration.json"
+        self.add_private(retired, b"unclaimed-registration")
         self.add_private(p.s1_resume.TICKET_NAME, b"old-registration")
         self.add_private(p.s1_label_resume.TICKET_NAME, b"personal-label-registration")
         self.write()
         snapshot = o.OwnerSnapshot(self.root, self.helper)
         snapshot.visible()
+        with self.assertRaises(ValueError):
+            snapshot.pickup_gate(dict(ticket_sha=hashed(b"unclaimed-registration")))
         for data, gate in ((b"old-registration", p.s1_resume),
                            (b"personal-label-registration", p.s1_label_resume)):
             self.assertIs(snapshot.pickup_gate(dict(ticket_sha=hashed(data))), gate)
