@@ -1,1 +1,26 @@
-{"status":"awaiting-independent-resource-trial"}
+{
+  "helpers": {
+    "graph.py": "01a0baaece26ebeb397b9d9a6ebab773070fae0c8a8ab5084114cd761dd49e7a",
+    "label_resource_trial.py": "b759b44622bc8522a26faf4da2b0fa36c2c59d0ce945c22cc9e7b693f2a350bc",
+    "launcher_labels.py": "22280d10136353c8c2a7c2a75ad25acd2a12028926c2187a0a1d4928bf8e9891",
+    "personal_label.py": "c52e05a8ebd37ce6aea6975ec0c3951cd7a4e532765984000566e57b98005475"
+  },
+  "optimized_sha256": "23041a04f9719bd42727b4c7a4f9c15cc011c81f5ccddb5aabc21881fa56953f",
+  "pathmap_copy": {
+    "bytes": 203458,
+    "executed": true,
+    "group": "ea99def354ace13d91376294e40913863e1920533923f66324f93583fdfaedaa",
+    "output": "apks/ChromePublic.apk.pathmap.txt",
+    "sha256": "72fc4945715ff35ece4aff242172f614e1385a6bd0d57bd34fba43855690d956",
+    "source": "gen/chrome/android/chrome_public_apk_resources_path_map.txt"
+  },
+  "pending_sha256": "0f475e82f12516553f7e6d7278be9fcca3a5a5b87cbc7ab2ad5689faa1dcd5fd",
+  "raw_sha256": "a664cc5b6e46e862d247e3aaf97e4a2784b8d5a2c74555c4a609d0bb4086498d",
+  "source_sha256": "fa44728d39b61c25d4116579e6da2c63ca7898cec24ada0e7ae453548bbd73bf",
+  "status": "accepted",
+  "trial_attempt": 1,
+  "trial_head": "cc748c38aec27a16d8004bda30de36bb083c0ad3",
+  "trial_run_id": 45929712881,
+  "trial_worker_blob": "09f65689cb415371bb4636b5ad76287e55dad6b6",
+  "trial_workflow_blob": "073213a97eff2fcac9b98a18c8c5e434c5caa132"
+}
