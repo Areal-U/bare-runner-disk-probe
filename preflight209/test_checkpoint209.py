@@ -56,6 +56,18 @@ class Checkpoint(unittest.TestCase):
     def test_real_tar(self):
         self.assertEqual(cp.check_archive(*self.archive()),self.proof)
 
+    def test_unprivileged_restore_preserves_all_modes_and_bytes(self):
+        original = retained209.content(retained209.source_rows(self.out))
+        archive,_=self.archive()
+        dest=self.root/'fresh-vm'
+        dest.mkdir()
+        subprocess.run(['tar','--zstd','--extract','--no-same-owner','--same-permissions',
+                        '--delay-directory-restore','-f',str(archive)],cwd=dest,check=True,umask=0o077)
+        self.assertEqual(retained209.content(retained209.source_rows(dest/'out/Bare')),original)
+        path = dest/'out/Bare/a.o'
+        path.chmod(path.stat().st_mode ^ 0o001)
+        self.assertNotEqual(retained209.content(retained209.source_rows(dest/'out/Bare')),original)
+
     def test_wrong_generation(self):
         archive,rec=self.archive()
         for c in [dict(run=18),dict(schema='bare-r28-checkpoint-private-v1'),dict(parent_sha='a'*64),dict(proof_sha='9'*64)]:

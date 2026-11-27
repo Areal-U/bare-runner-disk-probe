@@ -49,9 +49,11 @@ def prepare(record_path):
     heads = adjust_git_inputs()
     if record_path:
         rec = json.loads(record_path.read_text())
-        check_archive(WORK/'parent.tar.zst', rec)
-        subprocess.run(['tar', '--zstd', '--extract', '--no-same-owner', '--delay-directory-restore',
+        accepted = check_archive(WORK/'parent.tar.zst', rec)
+        subprocess.run(['tar', '--zstd', '--extract', '--no-same-owner', '--same-permissions', '--delay-directory-restore',
                         '-f', str(WORK/'parent.tar.zst')], check=True)
+        retained = retained209.content(retained209.source_rows(OUT))
+        require(retained == accepted['retained']['tree'], 'Restored output bytes, path or mode differs')
         require(encode(heads) == (STATE/'git-heads.json').read_bytes(), 'Source checkout revisions differ')
         # The immutable predecessor is still independently readable in the
         # owner's Draft. Reclaim its local compressed copy before compiling.
