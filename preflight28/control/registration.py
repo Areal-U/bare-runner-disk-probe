@@ -10,7 +10,9 @@ import sys
 
 import slot1_handoff
 import s1_resume
+import s1_label_resume
 import s1_setup_resume
+import s1_inventory_resume
 from slot1_handoff import CAMPAIGN, CLAIM, TICKET_NAME
 from admission import BASE_REF, REPO, REPO_ID, S2_SHA, RELEASE_ID, PagedOwnerDraft, admit, require
 
@@ -25,6 +27,8 @@ WORKFLOW = ".github/workflows/bare-checkpoint-transfer.yml"
 OWNER = {"id": 292261483, "login": "Areal-U"}
 RECIPIENT = "age1t69raxytlqula36e8w0tm6p3ezt49ztwnrtz8k57h6mvpwfguy7sjmr4yx"
 SEGMENT_MINUTES = 350
+# Old physical claims remain discoverable. Only the newest route admits a producer.
+S1_GRANTS = (s1_resume, s1_label_resume, s1_setup_resume, s1_inventory_resume)
 
 
 def instant(value):
@@ -168,7 +172,7 @@ def bind(helper, env, event, now=None, *, verify_only=False):
             and all(event["sender"].get(k) == v for k,v in OWNER.items()), "Unexpected dispatch")
     resume = env.get("R30_RESUME_S1") == "1"
     checked_build_route(event["inputs"], resume=resume)
-    gate = s1_setup_resume if resume else slot1_handoff
+    gate = S1_GRANTS[-1] if resume else slot1_handoff
     api = helper.metadata(f"{helper.BASE}/actions/runs/{run}/attempts/1")
     require(api["id"] == run and api["run_attempt"] == 1 and api["head_sha"] == revision
             and api["path"] == WORKFLOW and api["event"] == "workflow_dispatch" and api["head_branch"] == BASE_REF
