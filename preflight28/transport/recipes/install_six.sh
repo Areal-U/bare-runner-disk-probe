@@ -20,8 +20,10 @@ REV = "800628ad1ca1fd0c51e3b43b5b2bca081e81c3f6"
 ALLOWED_POOL = re.compile(r"pool/(main|universe|restricted|multiverse)/[a-z0-9]+/[a-z0-9][a-z0-9+.\-]*/[a-zA-Z0-9.+~_%:\-]+\.deb")
 DEB_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+~_%:\-]*\.deb")
 
-# These superseded binaries disappeared from both ordinary Ubuntu pools.
-# Only the same snapshot that authenticated the package plan can supply them.
+# Keep the accepted receipts for all six separately staged packages intact.
+SIX_RECEIPTS_SHA256 = "0e07cf7378adb98e54164297bbfee7ed4e884b3d1a62ceef8e8b572bbe703fb3"
+
+# Retain the two additional receipt pins from the earlier expat repair.
 EXPAT_SNAPSHOT = {
     "pool/main/e/expat/libexpat1-dev_2.4.7-1ubuntu0.9_amd64.deb": (
         "libexpat1-dev", "2.4.7-1ubuntu0.9", "amd64", 151246,
@@ -102,8 +104,8 @@ def download(host, path, record, dest):
             # Use the official pool's path; credentials and cross-host redirects are unnecessary.
             base_path = "/ubuntu/"
             if host == "snapshot.ubuntu.com":
-                if EXPAT_SNAPSHOT.get(path) != record:
-                    fail("Unrecognized signed snapshot fallback object")
+                if not ALLOWED_POOL.fullmatch(path):
+                    fail("Unrecognized fixed snapshot pool path")
                 base_path = urlsplit(SNAP).path
             url = base_path + quote(path, safe="/+.~_:-")
             con.request("GET",url,headers={"User-Agent":"bare-checkpoint-dependency-readback"})
@@ -130,12 +132,11 @@ def download(host, path, record, dest):
 def acquire(args):
     path,record,dest = args
     status = []
-    hosts = ["archive.ubuntu.com", "security.ubuntu.com"]
-    if path in EXPAT_SNAPSHOT:
-        if EXPAT_SNAPSHOT[path] != record:
-            fail("Pinned expat record differs from signed APT index: " + path)
-        hosts.append("snapshot.ubuntu.com")
-    for host in hosts:
+    if path in EXPAT_SNAPSHOT and EXPAT_SNAPSHOT[path] != record:
+        fail("Pinned expat record differs from signed APT index: " + path)
+    # Every remote task comes from records_for(plan), excluding the staged six.
+    # Use the same signed snapshot when its ordinary pool object has disappeared.
+    for host in ("archive.ubuntu.com", "security.ubuntu.com", "snapshot.ubuntu.com"):
         try:
             result = download(host,path,record,dest)
         except (OSError,http.client.HTTPException) as exc:
@@ -146,6 +147,12 @@ def acquire(args):
             return None
         status.append(host+"="+result)
     return (path, *status)
+
+def fixed_receipts(staged):
+    receipt_bytes = (staged / "receipts.json").read_bytes()
+    if sha256(receipt_bytes).hexdigest() != SIX_RECEIPTS_SHA256:
+        fail("Different fixed six package receipts")
+    return json.loads(receipt_bytes)
 
 def main():
     os.environ["LC_ALL"] = "C"
@@ -171,7 +178,7 @@ def main():
     if options.lib32 or options.backwards_compatible:
         subprocess.run(["sudo","dpkg","--add-architecture","i386"],check=True)
     staged = Path("/exchange/verified-six")
-    receipts = json.loads((staged / "receipts.json").read_text())
+    receipts = fixed_receipts(staged)
     subprocess.run(["python3", "-I", str(staged / "receive_six.py"), "index", str(staged)], check=True)
 
     packages = module["find_missing_packages"](options)
