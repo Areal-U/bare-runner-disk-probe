@@ -1,0 +1,539 @@
+name: Bare Personal 2.0.9 physical interval
+'on':
+  workflow_call:
+    inputs:
+      ordinal:
+        type: string
+        required: true
+      parent:
+        type: string
+        required: true
+      parent_identity:
+        type: string
+        required: true
+      origin:
+        type: string
+        required: true
+      manifest:
+        type: string
+        required: true
+      manifest_sha:
+        type: string
+        required: true
+      ticket_id:
+        type: string
+        required: true
+      ticket_sha:
+        type: string
+        required: true
+      genesis:
+        type: string
+        required: true
+    outputs:
+      kind:
+        value: ${{ jobs.certify.outputs.kind }}
+      manifest:
+        value: ${{ jobs.certify.outputs.manifest }}
+      manifest_sha:
+        value: ${{ jobs.certify.outputs.manifest_sha }}
+      parent:
+        value: ${{ jobs.certify.outputs.parent }}
+      parent_identity:
+        value: ${{ jobs.certify.outputs.parent_identity }}
+      next_slot:
+        value: ${{ jobs.certify.outputs.next_slot }}
+      artifact:
+        value: ${{ jobs.certify.outputs.artifact }}
+permissions: {}
+env:
+  BARE_GENERATION: 2.0.9
+  R28_HEAD_SHA: ${{ github.sha }}
+  R28_SLOT: ${{ inputs.ordinal }}
+  R28_PARENT_SHA: ${{ inputs.parent }}
+  R28_PARENT_IDENTITY: ${{ inputs.parent_identity }}
+  R28_PARENT_RUN: ${{ inputs.origin }}
+  R28_PARENT_MANIFEST: ${{ inputs.manifest }}
+  R28_PARENT_MANIFEST_SHA: ${{ inputs.manifest_sha }}
+  R209_GENESIS: ${{ inputs.genesis }}
+  R28_OWNER_RECIPIENT: age1t69raxytlqula36e8w0tm6p3ezt49ztwnrtz8k57h6mvpwfguy7sjmr4yx
+  R28_PARENT_READBACK_ONLY: 'false'
+  R28_PARENT_BACKEND: draft
+jobs:
+  lease:
+    name: Check owner lease, retention and free storage before interval
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: write
+      actions: read
+    outputs:
+      claim: ${{ steps.owner.outputs.claim }}
+      storage_ceiling: ${{ steps.owner.outputs.storage_ceiling }}
+      storage_until: ${{ steps.owner.outputs.storage_until }}
+      latest_start: ${{ steps.owner.outputs.latest_start }}
+      draft_id: ${{ steps.owner.outputs.draft_id }}
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - name: Stage pinned transport code
+      run: python3 preflight28/transport/prepare.py tools
+    - name: Verify current reservation and immutable claim
+      id: owner
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TICKET: ${{ inputs.ticket_id }}
+        TICKET_SHA: ${{ inputs.ticket_sha }}
+      run: python3 preflight209/owner.py lease --ticket-id "$TICKET" --ticket-sha "$TICKET_SHA" --genesis "$R209_GENESIS"
+  compile-probe:
+    needs: lease
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      R28_COLLECTION_CLAIM: ${{ needs.lease.outputs.claim }}
+      R28_STORAGE_CEILING: ${{ needs.lease.outputs.storage_ceiling }}
+      R28_STORAGE_UNTIL: ${{ needs.lease.outputs.storage_until }}
+      R209_LATEST_START: ${{ needs.lease.outputs.latest_start }}
+      R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
+    name: Compile APK slot ${{ inputs.ordinal }}
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      kind: ${{ steps.worker.outputs.kind }}
+      terminal: ${{ steps.terminal_1.outputs.artifact_id || steps.terminal_2.outputs.artifact_id }}
+      cache_key: ${{ steps.cache_pre.outputs.cache_key }}
+      seal_sha: ${{ steps.cache_pre.outputs.seal_sha }}
+      cipher_sha: ${{ steps.cache_pre.outputs.cipher_sha }}
+      cipher_bytes: ${{ steps.cache_pre.outputs.cipher_bytes }}
+      claim: ${{ steps.cache_pre.outputs.claim }}
+      parent: ${{ steps.cache_pre.outputs.parent }}
+      ordinal: ${{ steps.cache_pre.outputs.ordinal }}
+      cache_id: ${{ steps.cache_receipt.outputs.cache_id }}
+      terminal_status: ${{ steps.cache_receipt.outputs.terminal_status }}
+      headroom: ${{ steps.worker.outputs.next_has_headroom }}
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - name: Recheck actual start against finite owner lease
+      run: test "$R209_LATEST_START" -ge "$(date +%s)"
+    - name: Establish actual job start
+      env:
+        JOB_READ_TOKEN: ${{ github.token }}
+        CLOCK_SUFFIX: Compile APK slot ${{ inputs.ordinal }}
+      run: |
+        set -euo pipefail
+        check=$(python3 preflight28/limits/guard.py job-check --job-suffix "$CLOCK_SUFFIX")
+        python3 preflight28/limits/guard.py job-clock --check-run "$check" > "$RUNNER_TEMP/bare-probe-start"
+    - name: Reserve the relay peak before acquiring a large peer artifact
+      run: bash preflight28/bridge/host_space.sh
+    - name: Stage the pinned standard uploader before compiling
+      timeout-minutes: 4
+      run: |
+        set -euo pipefail
+        tool="$RUNNER_TEMP/r28-uploader"
+        pin=cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        mkdir -m 700 "$tool"
+        git -C "$tool" init --quiet
+        git -C "$tool" sparse-checkout set --no-cone '/dist/upload/' '/package.json'
+        GIT_TERMINAL_PROMPT=0 git -C "$tool" -c credential.helper= -c http.extraHeader= fetch --no-tags --depth=1 https://github.com/actions/upload-artifact.git "$pin"
+        git -C "$tool" checkout --quiet --detach FETCH_HEAD
+        [[ $(git -C "$tool" rev-parse HEAD) == "$pin" ]]
+        [[ $(git hash-object "$tool/dist/upload/index.js") == 7b3f92ae681d6eeca5f5e5e4cf892ad0dfb254ea ]]
+    - name: Bind peer artifacts to this run and logical slot
+      id: peer_names
+      run: python3 preflight28/bridge/normal.py names
+    - name: Create an ephemeral ordinary transfer key
+      id: peer_key
+      timeout-minutes: 4
+      env:
+        GH_TOKEN: ${{ github.token }}
+        CHECK_RUN: ${{ job.check_run_id }}
+        CLOCK_SUFFIX: Compile APK slot ${{ inputs.ordinal }}
+      run: |-
+        set -euo pipefail
+        if [[ ! ${CHECK_RUN:-} =~ ^[1-9][0-9]*$ ]]; then
+          CHECK_RUN=$(JOB_READ_TOKEN="$GH_TOKEN" python3 -I preflight28/limits/guard.py job-check --job-suffix "$CLOCK_SUFFIX")
+        fi
+        python3 preflight28/bridge/normal.py keygen ordinary --check-run "$CHECK_RUN"
+        python3 preflight209/admit.py peer "$RUNNER_TEMP/r28-normal/public.pem" "$RUNNER_TEMP/r28-normal/holder.json"
+    - name: Deposit key in this run
+      id: peer_put_key
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      timeout-minutes: 4
+      with:
+        name: ${{ steps.peer_names.outputs.key_name }}
+        path: |-
+          ${{ runner.temp }}/r28-normal/public.pem
+          ${{ runner.temp }}/r28-normal/holder.json
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 1
+        compression-level: 0
+    - name: Discover exact peer descriptor
+      id: peer_wait_descriptor
+      timeout-minutes: 12
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 preflight28/bridge/normal.py wait descriptor
+    - name: Fetch authenticated descriptor by immutable artifact ID
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 4
+      with:
+        artifact-ids: ${{ steps.peer_wait_descriptor.outputs.id }}
+        path: ${{ runner.temp }}/r28-normal/incoming
+        merge-multiple: true
+    - name: Acquire the exact predecessor or cold genesis
+      id: peer_acquire
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 preflight28/bridge/normal.py acquire
+    - name: Prepare pinned Chromium, official patches, tools and Personal resources
+      timeout-minutes: 80
+      run: bash preflight209/setup.sh
+    - name: Compile on the reviewed normal entry and freeze its actual frontier
+      id: worker
+      env:
+        R209_SENDER_UNTIL: ${{ steps.peer_acquire.outputs.sender_outcome_deadline }}
+      run: bash preflight209/worker.sh
+    - name: Verify storage at terminal upload
+      env:
+        GH_TOKEN: ${{ github.token }}
+      if: ${{ steps.worker.outputs.kind == 'apk' }}
+      run: |-
+        p="$RUNNER_TEMP/bare-official/exchange/slot209/owner"
+        python3 preflight209/admit.py terminal "$p"/{Bare-Personal-2.0.9-arm64-v8a.tar.age,seal.json}
+      id: terminal_gate
+      continue-on-error: true
+    - name: Publish owner-encrypted APK only
+      id: sealed
+      if: ${{ steps.terminal_gate.outcome == 'success' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      continue-on-error: true
+      timeout-minutes: 7
+      with:
+        name: bare-personal-209-owner-${{ github.run_id }}-a1-s${{ inputs.ordinal }}
+        path: ${{ runner.temp }}/bare-official/exchange/slot209/owner/
+        retention-days: 3
+        compression-level: 0
+        if-no-files-found: error
+        overwrite: false
+    - name: Download exact encrypted artifact and compare all bytes
+      id: terminal_1
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RETURNED: ${{ steps.sealed.outputs.artifact-id }}
+      if: ${{ !cancelled() && (steps.sealed.outcome == 'success' || steps.sealed.outcome == 'failure') }}
+      run: |-
+        args=()
+        [[ -z $RETURNED ]] || args+=(--id "$RETURNED")
+        python3 preflight209/terminal.py resolve "$RUNNER_TEMP/bare-official/exchange/slot209/owner" "${args[@]}"
+      continue-on-error: true
+    - name: Recheck admission for the same encrypted bytes
+      id: terminal_retry_gate
+      env:
+        GH_TOKEN: ${{ github.token }}
+      if: ${{ !cancelled() && steps.terminal_1.outputs.decision == 'absent' }}
+      continue-on-error: true
+      run: |-
+        p="$RUNNER_TEMP/bare-official/exchange/slot209/owner"
+        python3 preflight209/admit.py terminal "$p"/{Bare-Personal-2.0.9-arm64-v8a.tar.age,seal.json}
+    - name: Retry same encrypted upload once after a complete negative receipt
+      id: sealed_retry
+      if: ${{ !cancelled() && steps.terminal_retry_gate.outcome == 'success' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      continue-on-error: true
+      timeout-minutes: 7
+      with:
+        name: bare-personal-209-owner-${{ github.run_id }}-a1-s${{ inputs.ordinal }}
+        path: ${{ runner.temp }}/bare-official/exchange/slot209/owner/
+        retention-days: 3
+        compression-level: 0
+        if-no-files-found: error
+        overwrite: false
+    - name: Reconcile retry by immutable ID and encrypted content
+      id: terminal_2
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RETURNED: ${{ steps.sealed_retry.outputs.artifact-id }}
+      if: ${{ !cancelled() && (steps.sealed_retry.outcome == 'success' || steps.sealed_retry.outcome == 'failure') }}
+      run: |-
+        args=()
+        [[ -z $RETURNED ]] || args+=(--id "$RETURNED")
+        python3 preflight209/terminal.py resolve "$RUNNER_TEMP/bare-official/exchange/slot209/owner" "${args[@]}"
+      continue-on-error: true
+    - name: Preserve sealed bytes after failed terminal delivery, within the live free cache ceiling
+      id: cache_pre
+      env:
+        GH_TOKEN: ${{ github.token }}
+      if: ${{ !cancelled() && steps.worker.outputs.kind == 'apk' && !steps.terminal_1.outputs.artifact_id && !steps.terminal_2.outputs.artifact_id
+        }}
+      run: python3 preflight209/terminal.py cache-prepare "$RUNNER_TEMP/bare-official/exchange/slot209/owner"
+    - name: Save exact original ciphertext and seal for independent fallback
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+      id: cache_save
+      if: ${{ !cancelled() && steps.cache_pre.outcome == 'success' }}
+      continue-on-error: true
+      timeout-minutes: 7
+      with:
+        path: .r209-owner-cache
+        key: ${{ steps.cache_pre.outputs.cache_key }}
+    - name: Find the exact physical immutable cache after the save attempt
+      id: cache_receipt
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R209_PRIMARY_ABSENT: ${{ steps.terminal_1.outputs.decision == 'absent' && steps.terminal_2.outputs.decision == 'absent' }}
+      if: ${{ !cancelled() && (steps.cache_save.outcome == 'success' || steps.cache_save.outcome == 'failure') }}
+      run: python3 preflight209/terminal.py cache-receipt "$RUNNER_TEMP/bare-official/exchange/slot209/owner"
+    - name: Publish a terminal or failed stop for the independent receiver
+      id: peer_stop
+      env:
+        JOB_STATUS: ${{ job.status }}
+        KIND: ${{ steps.worker.outputs.kind }}
+        TERMINAL: ${{ steps.terminal_1.outputs.artifact_id || steps.terminal_2.outputs.artifact_id || (steps.cache_receipt.outputs.terminal_status
+          == 'cache' && steps.cache_receipt.outputs.cache_id) }}
+      if: ${{ always() && !cancelled() && steps.peer_acquire.outcome == 'success' && steps.worker.outputs.kind != 'checkpoint' }}
+      run: |
+        reason=failed
+        if [[ $JOB_STATUS == success && $KIND == apk && -n $TERMINAL ]]; then reason=apk; fi
+        python3 preflight28/bridge/normal.py stop --reason "$reason"
+    - name: Measure retained relay bytes before uploading the sealed checkpoint
+      id: peer_capacity
+      if: ${{ always() && !cancelled() && (steps.peer_stop.outcome == 'success' || steps.worker.outputs.kind == 'checkpoint') }}
+      timeout-minutes: 3
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
+      run: python3 preflight28/bridge/outcome_relay.py plan
+    - name: Deposit outcome in this run
+      id: peer_put_outcome
+      uses: ./preflight28/bridge/normal_upload
+      continue-on-error: true
+      timeout-minutes: ${{ fromJSON(steps.peer_capacity.outputs.upload_minutes || '4') }}
+      with:
+        name: ${{ steps.peer_names.outputs.outcome_name }}
+        path: ${{ steps.worker.outputs.kind == 'checkpoint' && format('{0}/r28-normal/outcome.json{1}{0}/r28-normal/checkpoint.cms', runner.temp,
+          fromJSON('"\n"')) || format('{0}/r28-normal/outcome.json', runner.temp) }}
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 1
+        compression-level: 0
+      if: ${{ !cancelled() && steps.peer_capacity.outputs.decision == 'upload' }}
+    - name: Reconcile sealed outcome upload number 1
+      id: resolve_relay_1
+      if: ${{ !cancelled() && (steps.peer_put_outcome.outcome == 'success' || steps.peer_put_outcome.outcome == 'failure') }}
+      timeout-minutes: 3
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SDK_STATUS: ${{ steps.peer_put_outcome.outputs.upload-status }}
+        RETURNED_ID: ${{ steps.peer_put_outcome.outputs.artifact-id }}
+        RETURNED_DIGEST: ${{ steps.peer_put_outcome.outputs.artifact-digest }}
+      run: python3 preflight28/bridge/outcome_relay.py resolve --round 1
+    - name: Retry the same sealed files at the same immutable name once
+      id: retry_relay
+      uses: ./preflight28/bridge/normal_upload
+      continue-on-error: true
+      timeout-minutes: ${{ fromJSON(steps.peer_capacity.outputs.upload_minutes || '4') }}
+      with:
+        name: ${{ steps.peer_names.outputs.outcome_name }}
+        path: ${{ steps.worker.outputs.kind == 'checkpoint' && format('{0}/r28-normal/outcome.json{1}{0}/r28-normal/checkpoint.cms', runner.temp,
+          fromJSON('"\n"')) || format('{0}/r28-normal/outcome.json', runner.temp) }}
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 1
+        compression-level: 0
+      if: ${{ !cancelled() && steps.resolve_relay_1.outputs.decision == 'retry' }}
+    - name: Reconcile sealed outcome upload number 2
+      id: resolve_relay_2
+      if: ${{ !cancelled() && (steps.retry_relay.outcome == 'success' || steps.retry_relay.outcome == 'failure') }}
+      timeout-minutes: 3
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SDK_STATUS: ${{ steps.retry_relay.outputs.upload-status }}
+        RETURNED_ID: ${{ steps.retry_relay.outputs.artifact-id }}
+        RETURNED_DIGEST: ${{ steps.retry_relay.outputs.artifact-digest }}
+      run: python3 preflight28/bridge/outcome_relay.py resolve --round 2
+    - name: Record the final transfer decision for this slot
+      id: relay_final
+      if: ${{ always() && !cancelled() && steps.peer_capacity.outcome == 'success' }}
+      env:
+        RELAY_STATE: ${{ steps.resolve_relay_2.outputs.decision || steps.resolve_relay_1.outputs.decision || steps.peer_capacity.outputs.decision
+          }}
+        RELAY_ID: ${{ steps.resolve_relay_2.outputs.id || steps.resolve_relay_1.outputs.id || steps.peer_capacity.outputs.id }}
+      run: python3 preflight28/bridge/outcome_relay.py finish
+  draft-publisher:
+    needs: lease
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      R28_COLLECTION_CLAIM: ${{ needs.lease.outputs.claim }}
+      R28_STORAGE_CEILING: ${{ needs.lease.outputs.storage_ceiling }}
+      R28_STORAGE_UNTIL: ${{ needs.lease.outputs.storage_until }}
+      R209_LATEST_START: ${{ needs.lease.outputs.latest_start }}
+      R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
+    name: Receive private checkpoint slot ${{ inputs.ordinal }}
+    permissions:
+      contents: write
+      actions: read
+    outputs:
+      peer_status: ${{ steps.publish.outputs.peer_status }}
+      checkpoint_manifest_id: ${{ steps.publish.outputs.checkpoint_manifest_id }}
+      checkpoint_manifest_sha: ${{ steps.publish.outputs.checkpoint_manifest_sha }}
+      checkpoint_sha: ${{ steps.publish.outputs.checkpoint_sha }}
+      checkpoint_identity: ${{ steps.publish.outputs.checkpoint_identity }}
+      private_readback_verified: ${{ steps.publish.outputs.private_readback_verified }}
+      checkpoint_advanced: ${{ steps.publish.outputs.checkpoint_advanced }}
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - name: Recheck actual start against finite owner lease
+      run: test "$R209_LATEST_START" -ge "$(date +%s)"
+    - name: Reserve the relay peak before acquiring a large peer artifact
+      run: bash preflight28/bridge/host_space.sh
+    - name: Bind peer artifacts to this run and logical slot
+      id: peer_names
+      run: python3 preflight28/bridge/normal.py names
+    - name: Stage the fixed owner-Draft interface
+      run: python3 preflight28/transport/prepare.py tools
+    - name: Create an ephemeral limited transfer key
+      id: peer_key
+      timeout-minutes: 4
+      env:
+        GH_TOKEN: ${{ github.token }}
+        CHECK_RUN: ${{ job.check_run_id }}
+        CLOCK_SUFFIX: Receive private checkpoint slot ${{ inputs.ordinal }}
+      run: |-
+        set -euo pipefail
+        if [[ ! ${CHECK_RUN:-} =~ ^[1-9][0-9]*$ ]]; then
+          CHECK_RUN=$(JOB_READ_TOKEN="$GH_TOKEN" python3 -I preflight28/limits/guard.py job-check --job-suffix "$CLOCK_SUFFIX")
+        fi
+        sender_start=$(JOB_READ_TOKEN="$GH_TOKEN" python3 -I preflight28/limits/guard.py job-clock --check-run "$CHECK_RUN")
+        python3 preflight28/bridge/normal.py keygen limited --check-run "$CHECK_RUN" --job-start "$sender_start"
+    - name: Discover exact peer key
+      id: peer_wait_key
+      timeout-minutes: 12
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 preflight28/bridge/normal.py wait key
+    - name: Fetch authenticated key by immutable artifact ID
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 4
+      with:
+        artifact-ids: ${{ steps.peer_wait_key.outputs.id }}
+        path: ${{ runner.temp }}/r28-normal/incoming
+        merge-multiple: true
+    - name: Issue time-limited parent read descriptors bound to the peer
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        if ! command -v age >/dev/null; then
+          sudo -n apt-get -qq -o Acquire::Retries=2 update
+          sudo -n apt-get -qq --no-install-recommends install -y age
+        fi
+        python3 preflight28/bridge/normal.py issue
+        python3 preflight209/admit.py peer "$RUNNER_TEMP/r28-normal/input.cms"
+    - name: Deposit descriptor in this run
+      id: peer_put_descriptor
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      timeout-minutes: 4
+      with:
+        name: ${{ steps.peer_names.outputs.descriptor_name }}
+        path: ${{ runner.temp }}/r28-normal/input.cms
+        if-no-files-found: error
+        overwrite: false
+        retention-days: 1
+        compression-level: 0
+    - name: Discover exact peer outcome
+      id: peer_wait_outcome
+      timeout-minutes: 315
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 preflight28/bridge/normal.py wait outcome
+    - name: Fetch authenticated outcome by immutable artifact ID
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      timeout-minutes: 10
+      with:
+        artifact-ids: ${{ steps.peer_wait_outcome.outputs.id }}
+        path: ${{ runner.temp }}/r28-normal/incoming
+        merge-multiple: true
+      if: ${{ steps.peer_wait_outcome.outputs.id != '' }}
+    - name: Receive bounded ciphertext and independently verify fixed private publication
+      id: publish
+      timeout-minutes: 21
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 preflight28/bridge/normal.py publish
+      if: ${{ steps.peer_wait_outcome.outputs.id != '' }}
+  certify:
+    name: Certify exact private result
+    needs:
+    - compile-probe
+    - draft-publisher
+    - deliver-cached-apk
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      kind: ${{ steps.cert.outputs.kind }}
+      manifest: ${{ steps.cert.outputs.manifest }}
+      manifest_sha: ${{ steps.cert.outputs.manifest_sha }}
+      parent: ${{ steps.cert.outputs.parent }}
+      parent_identity: ${{ steps.cert.outputs.parent_identity }}
+      next_slot: ${{ steps.cert.outputs.next_slot }}
+      artifact: ${{ steps.cert.outputs.artifact }}
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - name: Require ordinary and independent consumer evidence
+      id: cert
+      env:
+        HEADROOM: ${{ needs.compile-probe.outputs.headroom }}
+        WORKER: ${{ needs.compile-probe.outputs.kind }}
+        TERMINAL: ${{ needs.compile-probe.outputs.terminal }}
+        PEER: ${{ needs.draft-publisher.outputs.peer_status }}
+        READBACK: ${{ needs.draft-publisher.outputs.private_readback_verified }}
+        ADVANCED: ${{ needs.draft-publisher.outputs.checkpoint_advanced }}
+        MANIFEST: ${{ needs.draft-publisher.outputs.checkpoint_manifest_id }}
+        MANIFEST_SHA: ${{ needs.draft-publisher.outputs.checkpoint_manifest_sha }}
+        PARENT: ${{ needs.draft-publisher.outputs.checkpoint_sha }}
+        IDENTITY: ${{ needs.draft-publisher.outputs.checkpoint_identity }}
+        PRIVATE_RECEIPT: ${{ needs.deliver-cached-apk.outputs.receipt_id }}
+        RECEIPT_SHA: ${{ needs.deliver-cached-apk.outputs.receipt_sha }}
+        CIPHER_ID: ${{ needs.deliver-cached-apk.outputs.cipher_id }}
+      run: |-
+        python3 preflight209/campaign.py certify
+        echo "next_slot=$(( R28_SLOT + 1 ))" >> "$GITHUB_OUTPUT"
+    if: ${{ !cancelled() && needs.compile-probe.result == 'success' && needs.draft-publisher.result == 'success' && (needs.deliver-cached-apk.result
+      == 'success' || needs.deliver-cached-apk.result == 'skipped') }}
+  deliver-cached-apk:
+    name: Recover original owner ciphertext from exact cache
+    needs:
+    - compile-probe
+    - lease
+    if: ${{ !cancelled() && needs.compile-probe.outputs.terminal_status == 'cache' }}
+    permissions:
+      contents: write
+      actions: read
+    uses: ./.github/workflows/bare-personal209-cache-delivery.yml
+    with:
+      ticket_id: ${{ inputs.ticket_id }}
+      ticket_sha: ${{ inputs.ticket_sha }}
+      genesis: ${{ inputs.genesis }}
+      ordinal: ${{ inputs.ordinal }}
+      parent: ${{ inputs.parent }}
+      claim: ${{ needs.lease.outputs.claim }}
+      cache_key: ${{ needs.compile-probe.outputs.cache_key }}
+      cache_id: ${{ needs.compile-probe.outputs.cache_id }}
+      seal_sha: ${{ needs.compile-probe.outputs.seal_sha }}
+      cipher_sha: ${{ needs.compile-probe.outputs.cipher_sha }}
+      cipher_bytes: ${{ needs.compile-probe.outputs.cipher_bytes }}
