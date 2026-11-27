@@ -1,3 +1,4 @@
+import os
 import unittest
 from label_resource_trial import check_plan
 
@@ -166,6 +167,48 @@ class ResourceInventoryEvidenceTest(unittest.TestCase):
 
 
 class PathmapMigrationTest(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("SISO"), "requires the pinned Siso executable")
+    def test_live_manifest_phases_surround_one_handled_copy(self):
+        import json
+        from pathlib import Path
+        import subprocess
+        from tempfile import TemporaryDirectory
+        from graph import parse_metrics
+        from label_resource_trial import PATHMAP_OUTPUT
+
+        with TemporaryDirectory() as name:
+            root = Path(name)
+            (root / ".gclient").touch()
+            (root / "input").write_bytes(b"content")
+            config = root / "build/config/siso"
+            config.mkdir(parents=True)
+            (config / "main.star").write_text(
+                'load("@builtin//encoding.star", "json")\nload("@builtin//struct.star", "module")\n'
+                'def copy(ctx, cmd):\n    ctx.actions.copy(cmd.inputs[0], cmd.outputs[0])\n'
+                '    ctx.actions.exit(exit_status=0)\n'
+                'def init(ctx):\n    rules = [{"name":"simple/copy","action":"copy","handler":"copy"}]\n'
+                '    return module("config", filegroups={}, step_config=json.encode({"rules":rules}), '
+                'handlers={"copy":copy})\n')
+            out = root / "out/Bare"
+            (out / "apks").mkdir(parents=True)
+            (out / "build.ninja").write_text(
+                "rule regen\n  command = touch build.ninja\n  generator = 1\n"
+                "build build.ninja: regen ../../input\nrule copy\n  command = false\n"
+                f"build {PATHMAP_OUTPUT}: copy ../../input\n")
+            raw = root / "run.jsonl"
+            logs = root / "logs"
+            logs.mkdir()
+            # Go's startup logger uses TMPDIR before Siso opens its build logs.
+            subprocess.run([os.environ["SISO"], "ninja", "-C", str(out), "-metrics_json", str(raw),
+                            "-log_dir", str(logs), PATHMAP_OUTPUT], cwd=root,
+                           env=dict(os.environ, GOMAXPROCS="2", TMPDIR=str(logs)),
+                           check=True, capture_output=True, timeout=30)
+            rows = [json.loads(line) for line in raw.read_bytes().splitlines()]
+            self.assertEqual(["step_id" in row for row in rows], [False, False, True, False])
+            self.assertEqual(parse_metrics(raw, 1, out, actual=True, handler_copy=PATHMAP_OUTPUT),
+                             {(PATHMAP_OUTPUT,):"copy"})
+            self.assertEqual((out / PATHMAP_OUTPUT).read_bytes(), b"content")
+
     def test_dirty_and_clean_copy_with_verified_material(self):
         from unittest.mock import patch
         from pathlib import Path
@@ -192,13 +235,15 @@ class PathmapMigrationTest(unittest.TestCase):
         from graph import parse_metrics
         from label_resource_trial import PATHMAP_OUTPUT
 
-        row = dict(step_id="s1", rule="simple/copy", action="copy", outputs=[PATHMAP_OUTPUT], inputs=1, no_exec=True)
+        row = dict(step_id="11111111-1111-1111-1111-111111111111", duration_nanos=10,
+                   rule="simple/copy", action="copy", outputs=[PATHMAP_OUTPUT], inputs=1, no_exec=True)
+        summary = dict(build_id="22222222-2222-2222-2222-222222222222", duration_nanos=30)
         with TemporaryDirectory() as root:
             out = Path(root)
             metrics = out / "metrics.jsonl"
 
             def observe(changes, scope=PATHMAP_OUTPUT):
-                metrics.write_text(json.dumps(dict(row, **changes)) + '\n{"build_id":"b1"}\n')
+                metrics.write_text(json.dumps(dict(row, **changes)) + "\n" + json.dumps(summary) + "\n")
                 return parse_metrics(metrics, 1, out, actual=True, handler_copy=scope)
 
             self.assertEqual(observe({}), {(PATHMAP_OUTPUT,): "copy"})
@@ -218,14 +263,25 @@ class PathmapMigrationTest(unittest.TestCase):
                 observe(dict(rule="private-rule", action="private-action", outputs=["private-path"],
                              is_remote="private-value", cmdhash="private-hash", inputs="private-inputs"))
             self.assertNotIn("private", log.getvalue())
-            observed = json.loads(log.getvalue().removeprefix("BARE_LABEL_COPY_METRIC "))
+            observed = json.loads(log.getvalue().splitlines()[0].removeprefix("BARE_LABEL_COPY_METRIC "))
             self.assertEqual((observed["rule_matches"], observed["action_matches"], observed["output_matches"],
                               observed["one_input"], observed["steps"], observed["no_exec"], observed["is_remote"]),
                              (False, False, False, False, 1, True, None))
-            summary = {"build_id":"b1"}
+            phase1 = dict(summary,duration_nanos=10)
+            phase2 = dict(summary,duration_nanos=20)
+            for before in ([], [phase1], [phase1,phase2]):
+                metrics.write_text("".join(json.dumps(v) + "\n" for v in [*before,row,summary]))
+                self.assertEqual(parse_metrics(metrics,1,out,actual=True,handler_copy=PATHMAP_OUTPUT),
+                                 {(PATHMAP_OUTPUT,):"copy"})
             for rows, count in (([],0), ([summary],1), ([row],1), ([row,summary],2),
                                 ([row,row,summary],1), ([row,dict(summary,err=True)],1),
-                                ([row,summary,summary],1), ([None],1)):
+                                ([row,summary,summary],1), ([None],1), ([phase1,phase2,row],1),
+                                ([dict(phase1,err=True),phase2,row,summary],1), ([phase2,phase1,row,summary],1),
+                                ([dict(phase1,build_id=row["step_id"]),phase2,row,summary],1),
+                                ([phase1,phase1,row,summary],1), ([phase1,phase2,row,phase2,summary],1),
+                                ([dict(phase1,duration_nanos=1),phase1,phase2,row,summary],1),
+                                ([dict(phase1,private_data="secret"),phase2,row,summary],1),
+                                ([phase1,dict(row,action="gn"),phase2,row,summary],1)):
                 with self.subTest(rows=rows,count=count), redirect_stdout(StringIO()) as log, self.assertRaises(ValueError):
                     metrics.write_text("".join(json.dumps(value) + "\n" for value in rows))
                     parse_metrics(metrics, count, out, actual=True, handler_copy=PATHMAP_OUTPUT)

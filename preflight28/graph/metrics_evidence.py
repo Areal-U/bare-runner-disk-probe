@@ -78,7 +78,7 @@ def _kind(row):
     return "step"
 
 
-def inspect_metrics(name, mode, size, stream, *, regular=True):
+def inspect_metrics(name, mode, size, stream, *, regular=True, observe=None):
     """Read the original regular archive member, returning its identity and typed facts."""
     if (not metrics_name(name) or not regular or type(mode) is not int
             or stat.S_IFMT(mode) not in (0, stat.S_IFREG) or mode & 0o7111
@@ -99,6 +99,8 @@ def inspect_metrics(name, mode, size, stream, *, regular=True):
             row = json.loads(line.decode("utf-8"), object_pairs_hook=_object)
         except (UnicodeError, RecursionError, ValueError) as exc:
             raise ValueError("invalid Siso JSONL row") from exc
+        if observe is not None:
+            observe(row)  # An optional caller can inspect a decoded row before schema rejection.
         if _kind(row) == "summary":
             # A generator edge for build.ninja adds manifest build phases in the
             # SAME invocation. Each records its own time.Since(buildStart).

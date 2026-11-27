@@ -73,35 +73,58 @@ def check_copy_metric(step, count, output):
         raise ValueError("unexpected Siso metric for the pinned copy handler")
 
 
+def parse_copy_metrics(metrics, count, output):
+    from metrics_evidence import inspect_metrics
+
+    steps = before = after = 0
+    failed_phase = stream_verified = False
+
+    def observe(row):
+        nonlocal steps, before, after, failed_phase
+        if not isinstance(row, dict):
+            return  # The shared schema validator rejects this record.
+        if "step_id" in row:
+            steps += 1
+            check_copy_metric(row, count, output)
+        elif "build_id" in row:
+            if steps:
+                after += 1
+            else:
+                before += 1
+            failed_phase |= row.get("err", False) is not False
+
+    try:
+        with metrics.open("rb") as stream:
+            info = os.fstat(stream.fileno())
+            inspect_metrics("siso_metrics.json", info.st_mode, info.st_size, stream, observe=observe)
+        stream_verified = True
+        # Pinned ninjabuild.CheckManifest and doBuild each call rebuildManifest
+        # at most once without a real manifest regeneration. Any such extra
+        # generator step is outside this single-copy invocation.
+        if count != 1 or steps != 1 or before > 2 or after != 1 or failed_phase:
+            raise ValueError("Incomplete or failed Siso path-map copy phases")
+    finally:
+        print("BARE_LABEL_COPY_COVERAGE " + json.dumps(dict(expected_steps=count, observed_steps=steps,
+              before_copy=before, after_copy=after, failed_phase=failed_phase, stream_verified=stream_verified)),
+              flush=True)
+    return {(output,): "copy"}
+
+
 def parse_metrics(metrics, count, out, *, actual, plan_rules=None, handler_copy=None):
+    if handler_copy is not None:
+        return parse_copy_metrics(metrics, count, handler_copy)
     edges = {}
     seen_step = set()
     summary = False
-    if handler_copy is not None and not metrics.is_file():
-        check_copy_metric({}, count, handler_copy)
     if not metrics.exists() and count == 0:
         return edges
     with metrics.open(encoding="utf-8") as stream:
         for line in stream:
-            try:
-                step = json.loads(line)
-            except ValueError:
-                if handler_copy is not None:
-                    check_copy_metric({}, count, handler_copy)
-                raise
-            if handler_copy is not None and not isinstance(step, dict):
-                check_copy_metric({}, count, handler_copy)
+            step = json.loads(line)
             if "step_id" not in step:
                 if "build_id" in step:
-                    if handler_copy is not None and (summary or step.get("err", False) is not False):
-                        print("BARE_LABEL_COPY_COVERAGE " + json.dumps(dict(expected_steps=count,
-                              observed_steps=len(edges), duplicate_summary=summary,
-                              summary_error=step.get("err", False) is not False)), flush=True)
-                        raise ValueError("duplicate or failed Siso copy summary")
                     summary = True
                 continue
-            if handler_copy is not None:
-                check_copy_metric(step, count, handler_copy)
             if step["step_id"] in seen_step or step.get("err", False):
                 raise ValueError("duplicate or failed metric")
             seen_step.add(step["step_id"])
@@ -111,17 +134,12 @@ def parse_metrics(metrics, count, out, *, actual, plan_rules=None, handler_copy=
             names = tuple(sorted(output_name(n, out) for n in raw))
             if names in edges or len(set(names)) != len(names):
                 raise ValueError("ambiguous edge output group")
-            if actual and handler_copy is None and not step.get("is_local", False):
+            if actual and not step.get("is_local", False):
                 raise ValueError("small preflight edge did not execute locally")
             edges[names] = step.get("action", "")
             if plan_rules is not None and step.get('rule') in plan_rules[0]:
                 plan_rules[1][canonical(names)] = [step['rule'], output_name(raw[0], out), step['action']]
-    if handler_copy is not None and not edges:
-        check_copy_metric({}, count, handler_copy)
     if count != len(edges) or (count and not summary):
-        if handler_copy is not None:
-            print("BARE_LABEL_COPY_COVERAGE " + json.dumps(dict(expected_steps=count, observed_steps=len(edges),
-                  summary_seen=summary)), flush=True)
         raise ValueError(f"incomplete Siso metrics: {len(edges)} of {count} steps")
     return edges
 
