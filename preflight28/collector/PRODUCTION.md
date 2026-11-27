@@ -15,6 +15,12 @@ Run `45941809628/1` acquired claim `799012388` and received S1. Package setup fa
 
 The originating run writes one claim named `bare-personal-204-r30-s02-setup-repair-799012388.json`. For owner collection, include both previous private documents named by `s1_setup_resume.source_rows()` and the new physical binder witness. Follow the same original-run journal and encrypted terminal pickup procedure.
 
+## Inventory admission retry from the same S1
+
+Run `45954444176/1` acquired claim `799332558`. The ordinary transfer-key job failed its capacity check before opening S1. Preserve the prior tickets, claims and private binder witness. For the successor, the registered owner collector issues a fresh ACK and a ticket named `bare-personal-204-r30-s02-inventory-repair-799332558-collection-registration.json`. Both carry the complete `s1_inventory_resume.route(ticket)`, including the closed owner record for the failed run. The admitted independent resource trial is `45945428584/1`. The binder checks the same certified source files at promotion.
+
+The new immutable claim is `bare-personal-204-r30-s02-inventory-repair-799332558.json`. For pickup include its physical binder witness and the source claim and ticket from `s1_inventory_resume.source_rows()`. Use the existing recipient, signer, owner destinations, expiry and free capacity reservation, and the original-run collection and publication procedures below.
+
 ## Historical R30 registrations
 
 The initial run `45763502309` ended before acquiring a claim. Run `45765306771` acquired claim `794539925` and ended before restoring S2 or compiling. The slot-1 handoff used the S2 parent, the claim (649 bytes), the preclaim-1 ticket (941 bytes), and the grant in `control/slot1_handoff.py`. Run `45771045621` created the fixed S1 used in the current correction.
