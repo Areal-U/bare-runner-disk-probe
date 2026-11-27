@@ -187,12 +187,17 @@ def collection_claim(api,release,ctx):
     return claim_id
 
 
-def open_saved(zip_path, service_receipt, age_identity_path, dest, *, artifact_id, run, ordinal, head, parent_sha, claim_id):
+def check_saved_origin(service_receipt, artifact_id, run, ordinal, head, parent_sha, claim_id):
     exp={"artifact_id":artifact_id,"run":run,"ordinal":ordinal,"producer_sha":head,"parent_sha":parent_sha,
          "claim_id":claim_id,"name":expected_name(run,ordinal)}
-    b.require(1<=ordinal<=12 and artifact_id>0 and run>0 and claim_id>0 and b.sha(parent_sha)
+    maximum = 99 if os.environ.get("BARE_GENERATION") == "2.0.9" else 12
+    b.require(1<=ordinal<=maximum and artifact_id>0 and run>0 and claim_id>0 and b.sha(parent_sha)
               and re.fullmatch("[0-9a-f]{40}",head) and all(service_receipt.get(k)==v for k,v in exp.items())
               and b.sha(service_receipt.get("zip_sha256","")), "Wrong service receipt or recovery attempt")
+
+
+def open_saved(zip_path, service_receipt, age_identity_path, dest, *, artifact_id, run, ordinal, head, parent_sha, claim_id):
+    check_saved_origin(service_receipt,artifact_id,run,ordinal,head,parent_sha,claim_id)
     zst=zip_path.lstat()
     b.require(stat.S_ISREG(zst.st_mode) and 0<zst.st_size<=b.CAP+32*1024**2
               and b.digest(zip_path)==service_receipt["zip_sha256"], "Wrong immutable Artifact ZIP")

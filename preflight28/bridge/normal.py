@@ -525,6 +525,9 @@ def verify_outputs(mid,sha_manifest,deadline):
           "manifest_sha256":sha_manifest,"archive_bytes":m["bytes"],"archive_sha256":m["sha256"],
           "deadline_epoch":int(deadline),"assets":list(observations.values())},sort_keys=True),flush=True)
     flag=str(verified).lower()
+    if R209:
+        b.require(type(m.get("next_has_headroom")) is bool, "Missing next physical slot headroom")
+        b.output(checkpoint_can_resume=str(m["next_has_headroom"]).lower())
     b.output(checkpoint_manifest_id=mid,checkpoint_manifest_sha=sha_manifest,checkpoint_sha=m["sha256"],
              checkpoint_bytes=m["bytes"],checkpoint_identity=m["identity"],checkpoint_key=m["key"],
              checkpoint_ordinal=m["ordinal"],producer_sha=m["producer_sha"],private_readback_verified=flag,
