@@ -12,7 +12,7 @@ RECIPE_SHA256 = {
     "archive_helpers.sh": "7d2961a280e073246c1364e338969337e4693e2245270a454112bd2ea059ccc0",
     "draft_transfer.sh": "fc20cadfa04f38a958a3af710fe25ef62ccebacad7162989b3b3d4e7db1de618",
     "fetch_six.sh": "1c2e72e59cc16811bc07e7e15b9126575028ceb6fd3db636379cfb605ac7b28d",
-    "install_six.sh": "12392ba436a6b587ac0f76149677c041fb7ca7edc700ad7033b96ed2cd854cc6"
+    "install_six.sh": "0f47bd06fbfebd08c7cac1ff0990437e674bcfbfabc19dca7749c7dfa476fc73"
 }
 
 
