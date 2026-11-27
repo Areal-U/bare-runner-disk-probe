@@ -5,9 +5,10 @@ from collections import defaultdict
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import time
 
-from graph import canonical, file_record, run, sha
+from graph import TARGET, canonical, file_record, run, sha
 from retained import ANDROID_RULES_SHA256, commitment, compare_payload, inventory
 from segment_graph import load, plan, write_record
 from angle_restore import GRAPH, S1_PROOF_SHA, S1_SHA
@@ -16,6 +17,11 @@ RAW = "obj/chrome/android/chrome_public_apk.ap_"
 OPTIMIZED = "obj/chrome/android/chrome_public_apk.optimized.ap_"
 APK = "apks/ChromePublic.apk"
 OPTIMIZED_SHA = "a01ff002507636f864c6fc62b4b153f5fec8e8fa3436af79a012098b659420db"
+PATHMAP_SOURCE = "gen/chrome/android/chrome_public_apk_resources_path_map.txt"
+PATHMAP_OUTPUT = "apks/ChromePublic.apk.pathmap.txt"
+PATHMAP_SHA = "72fc4945715ff35ece4aff242172f614e1385a6bd0d57bd34fba43855690d956"
+PATHMAP_BYTES = 203458
+PATHMAP_GROUP_ID = "ea99def354ace13d91376294e40913863e1920533923f66324f93583fdfaedaa"
 SOURCE = "../../chrome/android/java/res_chromium_base/values/bare_launcher_label.xml"
 RAW_SHA = "b319b80fae9723d99a5d3441a4e6bcb778ea35e32b63f203cb3a289aa8baa40e"
 PERSONAL_RESOURCE_SHA = {
@@ -84,7 +90,16 @@ def permitted_actions(out):
     if ([len(raw), len(optimized), len(apk)] != [154, 1028, 1029]
             or not raw <= optimized <= apk):
         raise ValueError("Unexpected action scope in the pinned build graph")
-    return raw, optimized, apk
+    # The actual command targets chrome_public_apk, a phony GN aggregate.
+    # Its path map, R.txt copy and size-info siblings are not inputs to the APK.
+    goal = through(TARGET)
+    side_outputs = [(PATHMAP_OUTPUT,), ("apks/ChromePublic.apk.R.txt",),
+                    tuple("size-info/ChromePublic.apk." + suffix for suffix in ("jar.info", "pak.info", "res.info"))]
+    if not apk <= goal or goal - apk != {canonical(group) for group in side_outputs}:
+        raise ValueError("The pinned full APK target has unexpected companion actions")
+    if rules[by_output[PATHMAP_OUTPUT]] != "copy" or canonical(groups[by_output[PATHMAP_OUTPUT]]) != PATHMAP_GROUP_ID:
+        raise ValueError("The pinned S1 path-map copy is missing")
+    return raw, optimized, goal
 
 
 def check_plan(old, current, allowed):
@@ -132,7 +147,8 @@ def relink(out, command, target, permitted, old, *, labels=None):
     new_sha = sha(out / target) if target in PERSONAL_RESOURCE_SHA else None
     examples = list(executed) if target == OPTIMIZED else list(executed)[:2]
     print("BARE_LABEL_EXECUTION " + json.dumps(dict(target=target, before=old_sha, after=new_sha,
-          steps=len(executed), metrics=[{"action": executed[g], "outputs": g} for g in examples[:8]])), flush=True)
+          steps=len(executed), metrics_sha256=canonical(sorted(executed.items())),
+          metrics=[{"action": executed[g], "outputs": g} for g in examples[:8]])), flush=True)
     if target in PERSONAL_RESOURCE_SHA:
         from launcher_labels import verify_labels
         aapt2 = out.parent.parent / "third_party/android_sdk/public/build-tools/37.0.0/aapt2"
@@ -199,9 +215,93 @@ def verify_resource_inventory(parent, current, authorized):
     return replacements, added_files
 
 
+def verify_pathmap_copy(out, command, original, old):
+    expected = [PATHMAP_BYTES, PATHMAP_SHA]
+    identity = f"f:0:{PATHMAP_BYTES}:{PATHMAP_SHA}"
+    names = (PATHMAP_SOURCE, PATHMAP_OUTPUT)
+    if PATHMAP_GROUP_ID in old or any(original.get(name) != identity for name in names):
+        raise ValueError("Path-map source/copy do not match the fixed completed S1 group")
+    # Even a dirty copy must have retained its authenticated bytes. Never
+    # overwrite an unexplained change to make the destination look valid.
+    for name in names:
+        material = file_record(out, name)
+        if material != expected:
+            raise ValueError(f"Unexpected pre-copy bytes for {name}: {material}")
+    group = (PATHMAP_OUTPUT,)
+    expected_metric = {group: "copy"}
+    planned = run(out, command, [PATHMAP_OUTPUT], dry=True)
+    if planned and planned != expected_metric:
+        raise ValueError(f"Unapproved work for path-map copy: {list(planned.items())[:4]}")
+    if planned:
+        actual = run(out, command, [PATHMAP_OUTPUT], dry=False, isolated_logs=True)
+        if actual != expected_metric:
+            raise ValueError(f"Unexpected path-map copy execution: {list(actual.items())[:4]}")
+        if run(out, command, [PATHMAP_OUTPUT], dry=True):
+            raise ValueError("Path-map copy remained dirty")
+    for name in names:
+        material = file_record(out, name)
+        if material != expected:
+            raise ValueError(f"Unexpected final bytes for {name}: {material}")
+    result = dict(group=PATHMAP_GROUP_ID, source=PATHMAP_SOURCE, output=PATHMAP_OUTPUT,
+                  bytes=PATHMAP_BYTES, sha256=PATHMAP_SHA, executed=bool(planned))
+    print("BARE_LABEL_PATHMAP " + json.dumps(result, sort_keys=True), flush=True)
+    return result
+
+
+def finish_resources(out, command, original, executed, *, resource_error=None):
+    from contract_gate import verify_pending_contract
+
+    old_groups = original["planned_groups"]
+    old = set(old_groups)
+    errors = [resource_error] if resource_error else []
+    # These observations are independent. A failed resource check prevents
+    # any further real build actions, but still permits a dry plan and inventory.
+    expected_errors = (OSError, ValueError, subprocess.SubprocessError)
+    if resource_error:
+        print("BARE_LABEL_PATHMAP_SKIPPED prior resource verification failed", flush=True)
+    else:
+        try:
+            pathmap = verify_pathmap_copy(out, command, original["files"], old)
+            if pathmap["executed"]:
+                executed[(PATHMAP_OUTPUT,)] = "copy"
+        except expected_errors as exc:
+            errors.append(f"path-map: {exc}")
+    try:
+        rules = {}
+        remaining = plan(out, command, rules)
+        added, lost = remaining.keys() - old, old - remaining.keys()
+        # plan() comes from the fixed GN/Siso query. Log concrete members for
+        # differences even when their IDs are outside the static input scope.
+        def examples(keys, groups):
+            return [{"id": edge, "outputs": groups[edge][:8]} for edge in sorted(keys)[:5]]
+        print("BARE_LABEL_FINAL_PLAN " + json.dumps(dict(target=TARGET, old=len(old), remaining=len(remaining),
+              prior_sha256=canonical(sorted(old)), current_sha256=canonical(sorted(remaining)),
+              added=len(added), missing=len(lost), new_examples=examples(added, remaining),
+              missing_examples=examples(lost, old_groups))), flush=True)
+        if added or lost:
+            errors.append(f"final plan: added={len(added)}, missing={len(lost)}")
+        checked = verify_pending_contract(out, remaining, rules, parent_sha=S1_SHA, graph=GRAPH)
+        print("BARE_LABEL_PENDING_CONTRACT " + json.dumps(dict(evaluated=len(remaining),
+              checked=checked, original_ids_match=not added and not lost)), flush=True)
+    except expected_errors as exc:
+        errors.append(f"final plan: {exc}")
+    try:
+        # Hash the post-migration tree once, also when another gate failed.
+        authorized = {name for group in executed for name in group}
+        authorized.update(name + ".md5.stamp" for name in tuple(authorized) if name.endswith(".resources.zip"))
+        current = inventory(out)
+        replacements, added_files = verify_resource_inventory(original["files"], current, authorized)
+        print("BARE_LABEL_INVENTORY_VERIFIED " + json.dumps(dict(files=len(current),
+              replacements=len(replacements), new_files=len(added_files))), flush=True)
+    except expected_errors as exc:
+        errors.append(f"retained inventory: {exc}")
+    if errors:
+        raise ValueError("Resource migration rejected: " + " | ".join(errors))
+    return pathmap, remaining, rules, current, replacements, added_files
+
+
 def migrate(out, baseline, mode):
     from personal_label import prepare, UPSTREAM_SHA, PERSONAL_SHA
-    from contract_gate import verify_pending_contract
 
     src = out.parent.parent
     parent_proof = out / "checkpoint-segment-frontier.json"
@@ -216,7 +316,7 @@ def migrate(out, baseline, mode):
             or sha(out / OPTIMIZED) != OPTIMIZED_SHA):
         raise ValueError("The R30 S1 baseline or its linked resources differ")
     verify_s1_javac_stamp(out, proof)
-    raw_scope, optimized_scope, apk_scope = permitted_actions(out)
+    raw_scope, optimized_scope, goal_scope = permitted_actions(out)
     command = ["autoninja"]
     if run(out, command, [RAW, OPTIMIZED], dry=True):
         raise ValueError("The original S1 resource target was already dirty")
@@ -225,31 +325,24 @@ def migrate(out, baseline, mode):
         raise ValueError("Did not apply the exact old-to-new source bytes")
 
     changed_plan = set(plan(out, command))
-    check_plan(old, changed_plan, apk_scope)
+    check_plan(old, changed_plan, goal_scope)
     labels = {}
-    executed = relink(out, command, RAW, raw_scope, old, labels=labels)
-    # The final apkbuilder consumes optimized.ap_, not the intermediate raw file.
-    optimized_work = relink(out, command, OPTIMIZED, optimized_scope, old, labels=labels)
-    if set(executed) & set(optimized_work):
-        raise ValueError("Optimizing resources repeated a previously finished raw action")
-    executed.update(optimized_work)
-    rules = {}
-    remaining = plan(out, command, rules)
-    check_plan(old, set(remaining), apk_scope)
-    if set(remaining) != old:
-        raise ValueError("Final resource migration left additional or missing APK work: " +
-                         str(sorted(set(remaining) ^ old)[:8]))
-
-    # The real generators account for every replacement. Chromium prepare_resources
-    # stores MD5 input-state sidecars beside its declared resource ZIP outputs.
-    authorized = {name for group in executed for name in group}
-    authorized.update(name + ".md5.stamp" for name in tuple(authorized) if name.endswith(".resources.zip"))
-    current = inventory(out)
-    replacements, added_files = verify_resource_inventory(original["files"], current, authorized)
-
-    verify_pending_contract(out, remaining, rules, parent_sha=S1_SHA, graph=GRAPH)
-    report = {"mode": mode, "parent_sha256": S1_SHA, "old_pending": len(old),
+    executed = {}
+    resource_error = None
+    try:
+        executed.update(relink(out, command, RAW, raw_scope, old, labels=labels))
+        # The final apkbuilder consumes optimized.ap_, not the intermediate raw file.
+        optimized_work = relink(out, command, OPTIMIZED, optimized_scope, old, labels=labels)
+        if set(executed) & set(optimized_work):
+            raise ValueError("Optimizing resources repeated a previously finished raw action")
+        executed.update(optimized_work)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        resource_error = f"resource rebuild or verification: {exc}"
+    pathmap, remaining, rules, current, replacements, added_files = finish_resources(
+        out, command, original, executed, resource_error=resource_error)
+    report = {"mode": mode, "parent_sha256": S1_SHA, "old_pending": len(old), "pathmap_copy": pathmap,
               "before_resource_rebuild": len(changed_plan), "remaining": len(remaining),
+              "pending_sha256": canonical(sorted(remaining)),
               "resource_executed": len(executed), "replacements": replacements, "new_files": sorted(added_files),
               "source": transition, "resource_sha256": sha(out / RAW), "raw_labels": labels[RAW],
               "optimized_sha256": sha(out / OPTIMIZED), "optimized_labels": labels[OPTIMIZED],
