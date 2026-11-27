@@ -417,7 +417,15 @@ def capacity():
         size += sealed
     envelope = size + (2*1024**2 if candidate else 8*1024)
     b.require(candidate or envelope <= 16*1024, "Oversized control-only outcome")
-    answer = storage.admit(b.api_json, os.environ, envelope, 1, stage="outcome", exact_name=stem()+"-outcome")
+    if R209:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]/"preflight209"))
+        from admit import current_view
+        latest = sender_deadline(info()) - ((UPLOAD_MINUTES if candidate else 2) + VISIBILITY_MINUTES)*60
+        answer = current_view(b.api_json, os.environ, envelope, 1, stage="outcome",
+                              exact_name=stem()+"-outcome", deadline=latest)
+    else:
+        answer = storage.admit(b.api_json, os.environ, envelope, 1, stage="outcome", exact_name=stem()+"-outcome")
     if answer == "existing":
         raise RelayPriorExists("Existing exact outcome must be reconciled")
     time_left(sender_deadline(info()), ((UPLOAD_MINUTES if candidate else 2)+VISIBILITY_MINUTES)*60, "outcome upload")
