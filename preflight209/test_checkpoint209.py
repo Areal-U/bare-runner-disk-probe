@@ -1,5 +1,6 @@
 """Exercise the actual compressed checkpoint acceptance and slot certificate."""
 import json
+import sys
 import os
 from pathlib import Path
 import subprocess
@@ -78,6 +79,26 @@ class Checkpoint(unittest.TestCase):
         (self.out/'.r209/inputs.gz').write_bytes(b'bad gzip')
         with self.assertRaises((ValueError,OSError)):
             cp.check_archive(*self.archive())
+
+
+class ServiceOrigin(unittest.TestCase):
+    def test_offline_new_generation_boundaries(self):
+        os.environ.setdefault('RUNNER_TEMP','/tmp')
+        sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'preflight28/bridge'))
+        import owner_recovery as recovery
+        parent, head, claim, run, asset = 'a'*64, 'b'*40, 2, 10, 109
+        with patch.dict(os.environ,BARE_GENERATION='2.0.9'):
+            for slot in [13,99]:
+                row = dict(artifact_id=asset,run=run,ordinal=slot,producer_sha=head,parent_sha=parent,
+                           claim_id=claim,name=f'r209-{run}-a1-s{slot:02}-outcome',zip_sha256='c'*64)
+                recovery.check_saved_origin(row,asset,run,slot,head,parent,claim)
+                with self.assertRaises(ValueError):
+                    recovery.check_saved_origin(row,asset,run+1,slot,head,parent,claim)
+                with self.assertRaises(ValueError):
+                    recovery.check_saved_origin(row,asset,run,slot+1,head,parent,claim)
+            row.update(ordinal=100, name=f'r209-{run}-a1-s100-outcome')
+            with self.assertRaises(ValueError):
+                recovery.check_saved_origin(row,asset,run,100,head,parent,claim)
 
 
 if __name__ == '__main__':

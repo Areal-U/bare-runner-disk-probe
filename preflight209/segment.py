@@ -53,6 +53,9 @@ def prepare(record_path):
         subprocess.run(['tar', '--zstd', '--extract', '--no-same-owner', '--delay-directory-restore',
                         '-f', str(WORK/'parent.tar.zst')], check=True)
         require(encode(heads) == (STATE/'git-heads.json').read_bytes(), 'Source checkout revisions differ')
+        # The immutable predecessor is still independently readable in the
+        # owner's Draft. Reclaim its local compressed copy before compiling.
+        (WORK/'parent.tar.zst').unlink()
         result = input_state.restore(STATE/'inputs.gz')
         print('restore_input_verification', json.dumps(result), flush=True)
         require(result['skipped'] == 0, 'Source snapshot differs from accepted parent')

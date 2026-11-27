@@ -52,6 +52,7 @@ install -m 0644 /etc/ssl/certs/ca-certificates.crt docker/bare-ci-apt-ca.pem
 python3 -I "$repo/preflight209/builder_environment.py" dockerfile docker/Dockerfile docker/Dockerfile
 bash builder.sh build
 bash builder.sh start
+bash "$repo/preflight209/transfer_access.sh" probe
 docker compose exec -T chromium-builder bash -seu <<'UBUNTU'
 set -o pipefail
 [[ $(id -un) == builder && $(uname -m) == x86_64 ]]

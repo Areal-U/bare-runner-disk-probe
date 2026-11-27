@@ -61,7 +61,8 @@ def certify():
               'private Draft receipt '+w['PRIVATE_RECEIPT']+' sha256='+w['RECEIPT_SHA'])
     else:
         require(w['WORKER'] == 'checkpoint' and w['PEER'] == 'candidate' and w['READBACK'] == 'true'
-                and w['ADVANCED'] == 'true' and w['MANIFEST'].isdigit() and
+                and w['ADVANCED'] == 'true' and w['HEADROOM'] in ('true','false') and w['HEADROOM'] == w['WRITER_HEADROOM']
+                and w['MANIFEST'].isdigit() and
                 all(valid_hex(w[k]) for k in ('MANIFEST_SHA','PARENT','IDENTITY')),
                 'Checkpoint requires complete independent private receipt')
         n.b.output(kind='checkpoint' if w['HEADROOM']=='true' else 'saved-capacity-limit',manifest=w['MANIFEST'],manifest_sha=w['MANIFEST_SHA'],

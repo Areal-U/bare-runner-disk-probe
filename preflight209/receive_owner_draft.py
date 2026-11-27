@@ -59,7 +59,8 @@ def full_assets(raw, release):
 def asset(rows, name, cap, inputs):
     row=qc.collector.private_row(rows,name,retry=True)
     other=[r for r in rows if r['name'] in (name,name+'-retry1') and r['id']!=row['id']]
-    qc.require(all(r['name']==name and r['state']=='starter' and r['size']==0 for r in other),
+    qc.require((row['name']==name or len(other)==1) and
+               all(r['name']==name and r['state']=='starter' and r['size']==0 for r in other),
                'Conflicting private Draft residue')
     path=inputs/(str(row['id'])+'.bin')
     qc.require(stat.S_ISREG(path.lstat().st_mode) and 0<path.stat().st_size==row['size']<=cap and

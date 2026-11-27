@@ -97,6 +97,32 @@ class Admission(unittest.TestCase):
                         pickup.take(b, clock=lambda:when+(86400 if mode=='expired' else 0))
                     self.assertFalse(b.out.exists())
 
+    def test_retry_step_and_bad_zip_encoding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d=Path(tmp); s=d/'sealed';s.mkdir()
+            data=b'age-encryption.org/v1\n'+bytes(22)
+            (s/qc.CIPHER).write_bytes(data)
+            record=dict(schema=qc.SCHEMA,**qc.origin(context()),recipient=qc.RECIPIENT,
+                        sha=qc.sha(s/qc.CIPHER),bytes=len(data))
+            (s/'seal.json').write_bytes(qc.encode(record))
+            f=d/'unused'; f.write_text('{}'); routes=dict(ticket=f,ledger=f)
+            when=pickup.timestamp('2026-12-01T00:02:00Z')
+            with patch.object(qc,'route',return_value=dict(owner_destination_id='test')):
+                a=api_source(d,s,routes); j=qc.document(a.job);j['steps'][0]['name']=pickup.RETRY
+                a.job.write_bytes(qc.encode(j));self.assertEqual(pickup.take(a,clock=lambda:when)['job_id'],j['id'])
+                for mode in ('symlink','bzip2','wrong-inner-bytes'):
+                    a=api_source(d,s,routes);a.out=d/'fail'
+                    with zipfile.ZipFile(a.zip,'w') as z:
+                        z.write(s/'seal.json','seal.json')
+                        zinfo=zipfile.ZipInfo(qc.CIPHER)
+                        if mode=='symlink': zinfo.external_attr=0o120777<<16
+                        if mode=='bzip2': zinfo.compress_type=zipfile.ZIP_BZIP2
+                        z.writestr(zinfo,bytes(len(data)) if mode=='wrong-inner-bytes' else data)
+                    row=dict(qc.document(a.artifact),size_in_bytes=a.zip.stat().st_size,digest='sha256:'+qc.sha(a.zip))
+                    a.artifact.write_bytes(qc.encode(row));a.inventory.write_bytes(qc.encode(dict(total_count=1,artifacts=[row])))
+                    with self.subTest(mode=mode), self.assertRaises(ValueError):pickup.take(a,clock=lambda:when)
+                    self.assertFalse(a.out.exists())
+
     def test_library_generations(self):
         for x in (0,'0',1,'1',12,'12'):
             self.assertEqual(qc.generation(x),int(x))

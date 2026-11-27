@@ -8,10 +8,6 @@ stage=$ex/slot209
 cd "$work"
 umask 077
 mkdir -m 0700 "$stage"
-builder_uid=$(docker compose exec -T chromium-builder id -u)
-runner_uid=$(id -u)
-runner_gid=$(id -g)
-[[ $builder_uid =~ ^[1-9][0-9]*$ && $runner_uid != "$builder_uid" ]]
 cp -R "$repo/preflight28" "$ex/"
 cp "$repo/checkpoint.py" "$repo/build_trial.py" "$repo/preflight28/limits/guard.py" "$ex/"
 chmod -R a+rX "$ex/preflight28"
@@ -30,8 +26,7 @@ if (( R28_SLOT > 1 )); then
   mv "$RUNNER_TEMP/r28-normal/checkpoint.tar.zst" "$stage/parent.tar.zst"
   args=(--record /exchange/slot209/parent.json)
 fi
-sudo chown -R --no-dereference "$builder_uid:$runner_gid" "$stage"
-sudo chmod 0710 "$stage"
+bash "$repo/preflight209/transfer_access.sh" input
 "${ctx[@]}" chromium-builder python3 /exchange/r209/segment.py prepare "${args[@]}"
 # Both VMs' actual hosted starts bound the tail. Never take packing, upload
 # retry, acquisition or independent full readback minutes for compilation.
@@ -57,11 +52,10 @@ docker stop --time 20 "$container" >/dev/null
 [[ $(docker inspect "$container" --format '{{.State.Running}}') == false ]]
 docker start "$container" >/dev/null
 "${ctx[@]}" chromium-builder python3 /exchange/r209/segment.py close
-sudo chown -h "$runner_uid:$runner_gid" "$stage/kind"
+bash "$repo/preflight209/transfer_access.sh" result kind
 case "$(cat "$stage/kind")" in
   checkpoint)
-    sudo chown -h "$runner_uid:$runner_gid" "$stage/next.tar.zst" "$stage/proof.json"
-    chmod 0600 "$stage/next.tar.zst" "$stage/proof.json"
+    bash "$repo/preflight209/transfer_access.sh" result next.tar.zst proof.json
     cd "$repo"
     python3 -c 'import json,sys; print("next_has_headroom="+str(json.load(open(sys.argv[1]))["next_has_headroom"]).lower())' "$stage/proof.json" >> "$GITHUB_OUTPUT"
     id=$(sha256sum "$stage/proof.json" | cut -d' ' -f1)
@@ -74,10 +68,7 @@ case "$(cat "$stage/kind")" in
       python3 /exchange/r209/owner_apk.py seal --apk out/Bare/apks/ChromePublic.apk --report /exchange/slot209/trial.json \
           --sdk "$sdk" --run "$GITHUB_RUN_ID" --head "$R28_HEAD_SHA" --slot "$R28_SLOT" \
           --parent "$R28_PARENT_SHA" --claim "$R28_COLLECTION_CLAIM" --out /exchange/slot209/owner'
-    sudo chown -h "$runner_uid:$runner_gid" "$stage/owner"
-    sudo chown -h "$runner_uid:$runner_gid" "$stage/owner/seal.json" "$stage/owner/Bare-Personal-2.0.9-arm64-v8a.tar.age"
-    chmod 0700 "$stage/owner"
-    chmod 0600 "$stage/owner/"*
+    bash "$repo/preflight209/transfer_access.sh" sealed
     ;;
   *) exit 1 ;;
 esac
