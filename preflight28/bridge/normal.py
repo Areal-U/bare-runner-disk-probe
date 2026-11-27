@@ -22,7 +22,8 @@ ROOT = Path(os.environ["RUNNER_TEMP"]) / "r28-normal"
 b.ROOT = ROOT
 PARENT = {"sha": b.PARENT_SHA, "identity": b.PARENT_IDENTITY}
 PART = 2_000_000_000
-SCHEMA = "bare-r28-checkpoint-private-v1"
+R209 = os.environ.get("BARE_GENERATION") == "2.0.9"
+SCHEMA = "bare-personal-209-checkpoint-v1" if R209 else "bare-r28-checkpoint-private-v1"
 STOPS = {"apk", "no-progress", "verify-only", "size-exceeded", "failed", "cancelled"}
 JOB_MINUTES = 350
 DOWNLOAD_MINUTES = 10
@@ -36,18 +37,21 @@ VISIBILITY_REQUEST_SECONDS = 150
 
 def slot():
     n = int(os.environ["R28_SLOT"])
-    b.require(1 <= n <= 13, "Unbounded segment")
+    b.require(1 <= n <= (99 if R209 else 13), "Unbounded segment")
     return n
 
 
 def logical(number, *, run_id=None):
     run = b.env_int("GITHUB_RUN_ID") if run_id is None else run_id
+    if R209:
+        return f"bare-personal-209-{run}-1-checkpoint-s{number}"
     return f"bare-coexist-204-{run}-1-checkpoint-production-s{number}"
 
 
 def stem(number=None, *, run_id=None):
     run = b.env_int("GITHUB_RUN_ID") if run_id is None else run_id
-    return f"r28-{run}-a1-s{slot() if number is None else number:02}"
+    prefix = "r209" if R209 else "r28"
+    return f"{prefix}-{run}-a1-s{slot() if number is None else number:02}"
 
 
 def parent_read_run():
@@ -56,6 +60,17 @@ def parent_read_run():
     origin = os.environ.get("R28_PARENT_RUN", "")
     if not origin:
         return current
+    if R209:
+        b.require(re.fullmatch("[1-9][0-9]{0,18}", origin) and int(origin) != current and slot() > 1,
+                  "Invalid new-generation recovery origin")
+        # lease/bind additionally validates the new ticket/claim; the manifest
+        # must independently match this exact old run, slot, CI SHA and schema.
+        result = b.api_json(f"/repos/{b.REPO}/actions/runs/{origin}")
+        b.require(result["status"] == "completed" and result["head_sha"] == os.environ["GITHUB_SHA"]
+                  and result["head_branch"] == "bare-coexist-v2.0.9" and result["run_attempt"] == 1
+                  and result["path"] == ".github/workflows/bare-checkpoint-transfer.yml"
+                  and result["event"] == "workflow_dispatch", "Recovery origin is active or mismatched")
+        return int(origin)
     if r30_parent.authorized(os.environ):
         return r30_parent.RUN
     b.require(re.fullmatch("[1-9][0-9]{0,18}", origin) and int(origin) != current and
@@ -83,7 +98,16 @@ def context():
     parent, identity = os.environ["R28_PARENT_SHA"], os.environ["R28_PARENT_IDENTITY"]
     b.require(os.environ["GITHUB_REPOSITORY"] == b.REPO and re.fullmatch("[0-9a-f]{40}", head)
               and b.sha(parent) and b.sha(identity), "Invalid immutable generation")
-    if n == 1:
+    if R209:
+        lock = Path(__file__).resolve().parents[2] / "preflight209/upstream-lock.json"
+        genesis = b.digest(lock)
+        b.require(os.environ.get("GITHUB_RUN_ATTEMPT") == "1"
+                  and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+                  and os.environ.get("GITHUB_REF") == "refs/heads/bare-coexist-v2.0.9"
+                  and os.environ.get("GITHUB_SHA") == head and os.environ.get("R209_GENESIS") == genesis
+                  and ((n == 1 and (parent, identity) == (genesis, genesis)) or
+                       (n > 1 and genesis not in (parent, identity))), "Invalid 2.0.9 production generation")
+    elif n == 1:
         b.require((parent,identity) == (PARENT["sha"],PARENT["identity"]), "Initial parent differs from S2")
     return {"schema":SCHEMA, "key":logical(n), "run":b.env_int("GITHUB_RUN_ID"), "attempt":1,
             "ordinal":n,"producer_sha":head, "parent_sha":parent, "parent_identity":identity}
@@ -362,7 +386,7 @@ def acquire():
 def seal(file,identity,proof_sha):
     rec=info()
     b.require(file.resolve()==file and file.is_file() and not file.is_symlink() and
-              0<file.stat().st_size<=b.CAP and sha_check(identity) and sha_check(proof_sha) and slot()<=12,
+              0<file.stat().st_size<=b.CAP and sha_check(identity) and sha_check(proof_sha) and slot()<=(99 if R209 else 12),
               "Unsafe checkpoint candidate")
     plain_hash=b.digest(file)
     b.require(plain_hash!=rec["parent_sha"],"Exact parent replay")
@@ -393,7 +417,15 @@ def capacity():
         size += sealed
     envelope = size + (2*1024**2 if candidate else 8*1024)
     b.require(candidate or envelope <= 16*1024, "Oversized control-only outcome")
-    answer = storage.admit(b.api_json, os.environ, envelope, 1, stage="outcome", exact_name=stem()+"-outcome")
+    if R209:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]/"preflight209"))
+        from admit import current_view
+        latest = sender_deadline(info()) - ((UPLOAD_MINUTES if candidate else 2) + VISIBILITY_MINUTES)*60
+        answer = current_view(b.api_json, os.environ, envelope, 1, stage="outcome",
+                              exact_name=stem()+"-outcome", deadline=latest)
+    else:
+        answer = storage.admit(b.api_json, os.environ, envelope, 1, stage="outcome", exact_name=stem()+"-outcome")
     if answer == "existing":
         raise RelayPriorExists("Existing exact outcome must be reconciled")
     time_left(sender_deadline(info()), ((UPLOAD_MINUTES if candidate else 2)+VISIBILITY_MINUTES)*60, "outcome upload")
@@ -501,6 +533,9 @@ def verify_outputs(mid,sha_manifest,deadline):
           "manifest_sha256":sha_manifest,"archive_bytes":m["bytes"],"archive_sha256":m["sha256"],
           "deadline_epoch":int(deadline),"assets":list(observations.values())},sort_keys=True),flush=True)
     flag=str(verified).lower()
+    if R209:
+        b.require(type(m.get("next_has_headroom")) is bool, "Missing next physical slot headroom")
+        b.output(checkpoint_can_resume=str(m["next_has_headroom"]).lower())
     b.output(checkpoint_manifest_id=mid,checkpoint_manifest_sha=sha_manifest,checkpoint_sha=m["sha256"],
              checkpoint_bytes=m["bytes"],checkpoint_identity=m["identity"],checkpoint_key=m["key"],
              checkpoint_ordinal=m["ordinal"],producer_sha=m["producer_sha"],private_readback_verified=flag,
@@ -569,12 +604,12 @@ def publish():
         b.require(r["status"] in {"verify-only", "failed", "cancelled"}, "Read-only restore cannot publish")
     if r["status"]!="candidate":
         b.require(r["status"] in STOPS,"Unknown result")
-        b.output(private_readback_verified="false",checkpoint_advanced="false")
+        b.output(private_readback_verified="false",checkpoint_advanced="false",peer_status=r["status"])
         return
     file=ROOT/"incoming/checkpoint.cms"
     b.require(0<r["bytes"]<=b.CAP and r["bytes"]<r["sealed_bytes"]<=r["bytes"]+16*1024**2
               and sha_check(r["sha256"]) and sha_check(r["identity"]) and sha_check(r["proof_sha"])
-              and slot()<=12 and file.stat().st_size==r["sealed_bytes"] and b.digest(file)==r["sealed_sha"]
+              and slot()<=(99 if R209 else 12) and file.stat().st_size==r["sealed_bytes"] and b.digest(file)==r["sealed_sha"]
               and b.fingerprint(ROOT/"public.pem")==r["recipient_fpr"],"Sealed checkpoint mismatch")
     owner_recovery.checked(r["owner_recovery"],context(),os.environ["R28_OWNER_RECIPIENT"],
                            b.env_int("R28_COLLECTION_CLAIM"),r["recipient_fpr"])
@@ -582,8 +617,19 @@ def publish():
     b.disk("before-private-writer-decryption",r["bytes"]+144*1024**2)
     frames.receive(file,plain,r["bytes"],r["sha256"])
     b.require(plain.stat().st_size==r["bytes"] and b.digest(plain)==r["sha256"],"Checkpoint content changed")
-    verify_payload(plain,r,require_current=True)
+    if R209:
+        sys_path = Path(__file__).resolve().parents[2] / "preflight209"
+        import sys
+        sys.path.insert(0, str(sys_path))
+        from checkpoint209 import check_archive
+        proof = check_archive(plain, r)
+    else:
+        verify_payload(plain,r,require_current=True)
+    if R209:
+        b.output(peer_status="candidate")
     m={**context(),**{k:r[k] for k in ("bytes","sha256","identity","proof_sha")},"format":"tar.zst","parts":[]}
+    if R209:
+        m["next_has_headroom"] = proof["next_has_headroom"]
     # A small immutable intent permits GET-only recovery of all or some already
     # uploaded plaintext parts, even if the final manifest write never ran.
     expected=[]

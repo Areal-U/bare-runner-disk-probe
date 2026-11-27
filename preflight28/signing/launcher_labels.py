@@ -138,7 +138,7 @@ def string_values(table, ref, parents=()):
     return result
 
 
-def verify_labels(aapt2, apk, badging=None):
+def observed_labels(aapt2, apk, badging=None):
     command = [str(aapt2), 'dump']
     if badging is None:
         badging = subprocess.check_output([*command, 'badging', str(apk)], text=True, timeout=120)
@@ -162,8 +162,12 @@ def verify_labels(aapt2, apk, badging=None):
     app_values.update(values[app])
     values[app] = app_values
     effective = {name: sorted(set().union(*(values[s] for s in labels))) for name, labels in sources.items()}
-    report = dict(application=sorted(app_values), launchers=effective, enabled=active)
-    if app_values != {EXPECTED} or any(labels != [EXPECTED] for labels in effective.values()):
+    return dict(application=sorted(app_values), launchers=effective, enabled=active)
+
+
+def verify_labels(aapt2, apk, badging=None):
+    report = observed_labels(aapt2, apk, badging)
+    if report['application'] != [EXPECTED] or any(labels != [EXPECTED] for labels in report['launchers'].values()):
         raise ValueError('Unexpected personal launcher label. ' + json.dumps(report, sort_keys=True))
     return report
 

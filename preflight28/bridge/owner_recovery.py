@@ -69,7 +69,8 @@ def checked(wrapper, ctx, recipient, claim, writer):
 
 
 def expected_name(run,ordinal):
-    return f"r28-{run}-a1-s{ordinal:02}-outcome"
+    prefix = "r209" if os.environ.get("BARE_GENERATION") == "2.0.9" else "r28"
+    return f"{prefix}-{run}-a1-s{ordinal:02}-outcome"
 
 
 def service_record(row, run, ordinal, head, parent, claim, *, expect_id=None):
@@ -186,12 +187,17 @@ def collection_claim(api,release,ctx):
     return claim_id
 
 
-def open_saved(zip_path, service_receipt, age_identity_path, dest, *, artifact_id, run, ordinal, head, parent_sha, claim_id):
+def check_saved_origin(service_receipt, artifact_id, run, ordinal, head, parent_sha, claim_id):
     exp={"artifact_id":artifact_id,"run":run,"ordinal":ordinal,"producer_sha":head,"parent_sha":parent_sha,
          "claim_id":claim_id,"name":expected_name(run,ordinal)}
-    b.require(1<=ordinal<=12 and artifact_id>0 and run>0 and claim_id>0 and b.sha(parent_sha)
+    maximum = 99 if os.environ.get("BARE_GENERATION") == "2.0.9" else 12
+    b.require(1<=ordinal<=maximum and artifact_id>0 and run>0 and claim_id>0 and b.sha(parent_sha)
               and re.fullmatch("[0-9a-f]{40}",head) and all(service_receipt.get(k)==v for k,v in exp.items())
               and b.sha(service_receipt.get("zip_sha256","")), "Wrong service receipt or recovery attempt")
+
+
+def open_saved(zip_path, service_receipt, age_identity_path, dest, *, artifact_id, run, ordinal, head, parent_sha, claim_id):
+    check_saved_origin(service_receipt,artifact_id,run,ordinal,head,parent_sha,claim_id)
     zst=zip_path.lstat()
     b.require(stat.S_ISREG(zst.st_mode) and 0<zst.st_size<=b.CAP+32*1024**2
               and b.digest(zip_path)==service_receipt["zip_sha256"], "Wrong immutable Artifact ZIP")
@@ -206,9 +212,12 @@ def open_saved(zip_path, service_receipt, age_identity_path, dest, *, artifact_i
         b.require(0<meta.file_size<=65536,"Unbounded outcome receipt")
         outcome=json.loads(z.read(meta))
         n=outcome
-        b.require(n["schema"]=="bare-r28-checkpoint-private-v1" and n["attempt"]==1 and n["run"]==run
+        new = os.environ.get("BARE_GENERATION") == "2.0.9"
+        schema = "bare-personal-209-checkpoint-v1" if new else "bare-r28-checkpoint-private-v1"
+        key = f"bare-personal-209-{run}-1-checkpoint-s{ordinal}" if new else f"bare-coexist-204-{run}-1-checkpoint-production-s{ordinal}"
+        b.require(n["schema"]==schema and n["attempt"]==1 and n["run"]==run
                   and n["ordinal"]==ordinal and n["producer_sha"]==head and n["parent_sha"]==parent_sha
-                  and n["key"]==f"bare-coexist-204-{run}-1-checkpoint-production-s{ordinal}" and n["status"]=="candidate"
+                  and n["key"]==key and n["status"]=="candidate"
                   and all(b.sha(n[k]) for k in ("sha256","sealed_sha","proof_sha","identity","parent_identity","recipient_fpr"))
                   and n["sha256"]!=parent_sha and type(n["bytes"]) is int and 0<n["bytes"]<=b.CAP
                   and n["bytes"]<n["sealed_bytes"]<=n["bytes"]+16*1024**2, "Invalid normal outcome")
@@ -235,7 +244,12 @@ def open_saved(zip_path, service_receipt, age_identity_path, dest, *, artifact_i
             b.ROOT=work
             frames.receive(cipher,candidate,n["bytes"],n["sha256"])
         finally:b.ROOT=original
-        verify_payload(candidate,n)
+        if new:
+            sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"preflight209"))
+            from checkpoint209 import check_archive
+            check_archive(candidate,n)
+        else:
+            verify_payload(candidate,n)
         try:
             os.link(candidate,dest)
         except FileExistsError:

@@ -1,0 +1,43 @@
+{
+  "bare_commit": "019a612f7bb758da20c33ecf43c086e696391aec",
+  "bare_tree": "962d2ef7453447f0c47969b18e8f6ac06e417b0a",
+  "chromium_commit": "52bdd21723d5db0c9ab11716d38feac74828cf84",
+  "chromium_version": "158.0.8127.42",
+  "clang_package": "llvmorg-24-init-14453-ge063be79-1",
+  "depot_tools_commit": "b86fc981b72ab966f8260f73b4eca600b3b12677",
+  "label_files": {
+    "app_name": {
+      "file": "channel_constants.xml",
+      "official_sha256": "76ec311c9bb019d8ddf995270c7e64a77e58f30481dfac36eae8347716a3c0f6",
+      "personal_sha256": "e2cf0b3a31f82d5a17c0f8aa956d440edff80ffcc1a1424a9e83607cf807913e"
+    },
+    "bare_launcher_label": {
+      "file": "bare_launcher_label.xml",
+      "official_sha256": "0510766ab72aedd7ca1c4d5208b70741ff76e3bb7c782ddd32d31c9de0f006ee",
+      "personal_sha256": "e97675848cc5cb05e95ba9fa826948c304eeadffccd6147ce0a7912d2863ab65"
+    }
+  },
+  "patch_count": 374,
+  "patch_tree": "261f63d5db7156edc1426268522e264971baad81",
+  "patched_manifest_sha256": "7f0b5223ae72e3a9898fb1a7d8010d8ceb69712af277b1dd610a8a41bffec017",
+  "personal_gn_sha256": "bdb8722ccd0e53fa49afa9d908b19021c8b01c4ab2b36e4c7cc264dbd2517a92",
+  "personal_package": "org.barebrowser.personal",
+  "siso_revision": "dfc32e4edca158cff2b64a1658ee3940f0116b3a",
+  "source_files": {
+    "DEPS": "db3d3a3f508dd4210446814aa977d6ef9e4a046194b04a94ad6a0d3ea5f39017",
+    "build/install-build-deps.py": "a89e1810377176a5dc4546c9aed1b5b98abbe707547007f75ad30b1fb20812e1",
+    "build/install-build-deps.sh": "ed195bd040cbb52c5d9441c4bd42eddd8143a6c968293454f26c37447c55e13c",
+    "chrome/VERSION": "319520d2961d9d16d1658252b3643d77e272c1178c4eb01851811feaf27fe21a",
+    "chrome/android/profiles/newest.txt": "fca32b65463d775e7b0848f356082d8524b6497f92b8ec7543eb741b8196d05f",
+    "chrome/build/android-arm64.orderfile.txt": "a122be40071547a3969ce1f55ab08c74e5e3307f599e9b8037dfde59e79d4781",
+    "chrome/build/android-desktop-arm64.pgo.txt": "10a45b205e265f423540ad9cf41fa0d1bdba97793c8265bf76da76bafe56f6da",
+    "tools/clang/scripts/update.py": "2b1df80b299dcda2d2351251dedef222a52a56bd3f4b977ce171d58897f34cfa",
+    "v8/include/v8-version.h": "49ab34c927ef63ec03a3c4963a4a685d892f602e7f4738afff574536f202add7",
+    "v8/tools/builtins-pgo/download_profiles.py": "b580e440c69f23e3e29fc386c137902b6fddf57fcda7b7b61e61d1c60e765931"
+  },
+  "ubo_sha256": "d688ed3f0262ec4f8bdcd4c8f65987c5444c560aeb387a9e02aca1facdfa7046",
+  "upstream_gn_sha256": "2382c95937bfdbea6d670377ae197c159c9d756e199f7cfece995cd30034b8ef",
+  "v8_commit": "b601a2347f005e8bfadd32f285df97ffba5cf1bd",
+  "version": "2.0.9",
+  "version_code": 802000915
+}
