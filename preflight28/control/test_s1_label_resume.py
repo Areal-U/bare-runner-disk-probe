@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import registration
 import s1_label_resume as gate
@@ -108,13 +108,15 @@ class LabelAdmission(LabelTest):
     def test_trial_log_uses_actual_emitted_line_once(self):
         def read(data):
             def output(command, *, stdout, **kwargs):
-                self.assertEqual(command[-1], f"repos/{gate.REPO}/actions/jobs/8/logs")
+                self.assertEqual(command, ["gh", "api", "--allow-escape-sequences", f"repos/{gate.REPO}/actions/jobs/8/logs"])
+                self.assertFalse(stdout.isatty())
                 stdout.write(data)
             with patch("subprocess.run",side_effect=output):
                 return gate.migration_report(8)
         line=b'2026-11-27T02:00:45.1234567Z BARE_LABEL_MIGRATION {"remaining":1911}\r\n'
-        self.assertEqual(read(b'echo BARE_LABEL_MIGRATION fake\n'+line),{"remaining":1911})
-        for bad in (b'anything else',line + line):
+        noise = b'2026-11-27T02:00:44.0000000Z \x1b[36;1mecho BARE_LABEL_MIGRATION fake\x1b[0m\n'
+        self.assertEqual(read(noise+line),{"remaining":1911})
+        for bad in (noise, noise+line+line, line.replace(b"BARE_LABEL_MIGRATION", b"\x1b[1mBARE_LABEL_MIGRATION")):
             with self.assertRaises(ValueError): read(bad)
 
     def test_consumed_claim_and_previous_owner_are_required(self):
@@ -144,6 +146,14 @@ class PhysicalBinding(LabelTest):
         draft.ack.update(fixed())
         draft.ticket["collector_ack_sha"] = hashlib.sha256(draft.data(812)).hexdigest()
         draft.asset["name"] = gate.TICKET_NAME
+        prior_name = gate.s1.CAMPAIGN + "-s02-label-repair-collection-registration.json"
+        prior_asset = dict(draft.asset, name=prior_name, id=902)
+        list_draft = draft.draft
+        def with_prior(release_id):
+            release = list_draft(release_id)
+            release["assets"].append(prior_asset)
+            return release
+        self.enterContext(patch.object(draft, "draft", side_effect=with_prior))
         event = dict(repository={"id":registration.REPO_ID},sender=registration.OWNER,
                      inputs={"mode":"build-apk","build_segments":"12","apk_recipient":registration.RECIPIENT})
         env = dict(RUNNER_ENVIRONMENT="github-hosted",REGISTRATION_ASSET_ID="901",GITHUB_SHA=draft.ticket["head"],
@@ -165,9 +175,31 @@ class PhysicalBinding(LabelTest):
             self.assertEqual(enter(True)[0],831)
             self.assertEqual(claim.call_args.args[0],"recover")
             self.assertFalse(evidence.call_args.kwargs["initial"])
+            with patch.dict(env, REGISTRATION_ASSET_ID=str(prior_asset["id"])), self.assertRaises(ValueError):
+                enter(True)
+            with patch.dict(draft.asset, name=prior_name), self.assertRaises(ValueError):
+                enter(True)
             draft.ack["prior_owner_closure_sha"]="0"*64
             draft.ticket["collector_ack_sha"]=hashlib.sha256(draft.data(812)).hexdigest()
             with self.assertRaises(ValueError): enter(True)
             draft.asset["name"]=gate.s1.TICKET_NAME
             with self.assertRaises(ValueError): enter(True)
             self.assertEqual(claim.call_count,2)
+
+
+    def test_existing_physical_claim_can_only_be_read_by_its_bound_registration(self):
+        from admission import admit, encode
+
+        # The two ticket names reserve one immutable claim in the same Draft.
+        self.assertEqual(gate.CLAIM, gate.s1.CAMPAIGN + "-s02-label-repair-796328557.json")
+        holder = dict(run_id=81, producer_attempt=1, head="a"*40, ticket_asset_id=901, ticket_sha="b"*64)
+        helper = Mock()
+        helper.draft.return_value = {"assets": [dict(name=gate.CLAIM, id=831)]}
+        helper.asset_info.return_value = {"id": 831}
+        helper.download.side_effect = lambda aid, size, sha, dest: dest.write(encode(holder))
+        for mode in ("compute", "recover"):
+            self.assertEqual(admit(mode, holder, helper, name=gate.CLAIM), 831)
+            for changed in (dict(run_id=82), dict(head="c"*40), dict(ticket_asset_id=902), dict(ticket_sha="d"*64)):
+                with self.subTest(mode=mode, changed=changed), self.assertRaises(ValueError):
+                    admit(mode, {**holder, **changed}, helper, name=gate.CLAIM)
+        helper.request.assert_not_called()
