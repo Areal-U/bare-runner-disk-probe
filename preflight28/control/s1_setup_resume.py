@@ -46,13 +46,17 @@ def check_binding(claim, old_ticket, ticket):
                        registration_id=old_ticket["collector_registration_id"]), "Wrong prior admitted run")
     previous.s1.fields(old_ticket, dict(head=FAILED_HEAD, trial_run_id=PREVIOUS_TRIAL,
                        trial_head=PREVIOUS_TRIAL_HEAD), "Wrong prior owner registration")
+    same_owner_policy(old_ticket, ticket)
+    route(ticket)
+
+
+def same_owner_policy(old_ticket, ticket):
     stable = ("schema", "repository_id", "release_id", "campaign", "workflow", "branch", "recipient",
               "owner_destination_id", "collector_registration_id", "storage_policy", "artifact_ceiling_bytes",
               "storage_valid_until", "expires_at", "final_certificate_sha256")
     previous.s1.fields(ticket, {k: old_ticket[k] for k in stable}, "Changed destination, signing or free grant")
     require(all(ticket[k] != old_ticket[k] for k in ("head", "registration_nonce", "collector_ack_sha")),
-            "Setup retry requires a new revision, nonce and receiver acknowledgement")
-    route(ticket)
+            "Handoff requires a new revision, nonce and receiver acknowledgement")
 
 
 def check_reference(claim, ticket):

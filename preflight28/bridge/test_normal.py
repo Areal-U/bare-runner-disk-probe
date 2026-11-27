@@ -83,6 +83,7 @@ class TestTransport(unittest.TestCase):
         import s1_resume
         import s1_label_resume
         import s1_setup_resume
+        import s1_inventory_resume
         api = LocalDraft()
         release = api.draft(b.RELEASE)
 
@@ -92,10 +93,12 @@ class TestTransport(unittest.TestCase):
             api.assets.append(row)
             api.data[aid] = raw
 
+        claim(s1_inventory_resume, 17, 500)
         claim(s1_setup_resume, 16, 400)
         claim(s1_label_resume, 14, 200)
         claim(s1_resume, 15, 100)
-        for gate, run, aid in ((s1_resume, 100, 15), (s1_label_resume, 200, 14), (s1_setup_resume, 400, 16)):
+        for gate, run, aid in ((s1_resume, 100, 15), (s1_label_resume, 200, 14), (s1_setup_resume, 400, 16),
+                               (s1_inventory_resume, 500, 17)):
             self.assertEqual(n.owner_recovery.resumed_claim(api, release, run), (gate, (aid, {"run_id": run})))
         self.assertEqual(n.owner_recovery.resumed_claim(api, release, 300), (None, None))
         api.assets.pop()

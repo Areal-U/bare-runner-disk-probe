@@ -22,10 +22,9 @@ from admission import BASE_REF, PagedOwnerDraft, RELEASE_ID, REPO, REPO_ID, S2_S
 import slot1_handoff as handoff
 import s1_resume
 import s1_label_resume
-import s1_setup_resume
 import receipt_journal as journal
 import recover
-from registration import CAMPAIGN, CLAIM, TICKET_NAME, OWNER, WORKFLOW
+from registration import CAMPAIGN, CLAIM, TICKET_NAME, OWNER, WORKFLOW, S1_GRANTS
 
 REPLACEMENT = CAMPAIGN + "-loss-replacement-claim.json"
 DRAFT_JOB = "Deliver the verified cache-only terminal ciphertext to the original owner Draft"
@@ -121,7 +120,7 @@ def private_document(api, row, *, owner=False):
     return json.loads(data)
 
 
-PICKUP_GATES = (handoff, s1_resume, s1_label_resume, s1_setup_resume)
+PICKUP_GATES = (handoff, *S1_GRANTS)
 
 
 def checked_source_grant(api, rows, ticket, claim, gate):
@@ -175,7 +174,7 @@ def bound_pickup(api, rows, locator):
             (ticket_row["id"], ticket_row["digest"][7:], parent), "Unbound original production claim")
     checked_source_grant(api, rows, ticket, claim, gate)
     signing = {}
-    if gate in (s1_label_resume, s1_setup_resume):
+    if gate not in (handoff, s1_resume):
         signing["final_certificate_sha256"] = s1_label_resume.checked_final_certificate(ticket["final_certificate_sha256"])
     origin = claim["run_id"]
     require(type(origin) is int and origin > 0, "Missing original run")

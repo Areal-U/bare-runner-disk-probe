@@ -141,13 +141,14 @@ class LabelAdmission(LabelTest):
 
 class PhysicalBinding(LabelTest):
     def test_new_ticket_only_old_claim_cannot_be_reissued(self):
-        import s1_setup_resume as live
+        import s1_inventory_resume as live
         draft = OwnerDraft()
-        draft.ticket.update(fixed(), **live.failure_fields())
-        draft.ack.update(fixed(), **live.failure_fields())
+        for document in (draft.ticket, draft.ack):
+            document.update(fixed(), **live.previous.failure_fields(), **live.failure_fields())
+            document.update(trial_run_id=live.TRIAL_RUN, trial_head=live.TRIAL_HEAD)
         draft.ticket["collector_ack_sha"] = hashlib.sha256(draft.data(812)).hexdigest()
         draft.asset["name"] = live.TICKET_NAME
-        prior_name = gate.TICKET_NAME
+        prior_name = live.previous.TICKET_NAME
         prior_asset = dict(draft.asset, name=prior_name, id=902)
         list_draft = draft.draft
         def with_prior(release_id):
