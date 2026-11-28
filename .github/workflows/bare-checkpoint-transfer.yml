@@ -11,7 +11,7 @@ jobs:
       BARE_GENERATION: 2.0.9
       R209_DRAFT_ALIAS_SHA: 2790fdb38a07380c623f48a20730426ec3eb4f0c71d465cdae58112236bc1a55
     permissions:
-      contents: read
+      contents: write
       actions: read
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
