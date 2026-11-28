@@ -1,227 +1,206 @@
 name: Bare private Draft compatibility check
-run-name: Read the existing Bare owner Draft
-on: workflow_dispatch
+run-name: Verify current registration and read free storage
+'on':
+  workflow_dispatch:
+    inputs:
+      ticket_sha:
+        type: string
+        required: true
+        description: Independently read target ticket SHA-256
+      owner_alias_sha:
+        type: string
+        required: true
+        description: Owner-observed SHA-256 after the final Draft save
 permissions: {}
 jobs:
   verify:
-    if: github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-209-private-draft-check-20261128' && github.run_attempt == '1'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    env:
-      BARE_GENERATION: 2.0.9
-      R209_DRAFT_ALIAS_SHA: 2790fdb38a07380c623f48a20730426ec3eb4f0c71d465cdae58112236bc1a55
     permissions:
+      # A read-scoped job token returned 403 for this unpublished Draft (#41).
+      # The strict GET-only transport is the same tested network boundary as #42.
       contents: write
       actions: read
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       with:
-        ref: '888cb5b20d3470131a1d77f9a08b7010e09a4110'
-        path: prior
+        ref: 6e3f7c7e38f07a1d2a012f0717318e5f45af68b9
         persist-credentials: false
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      with:
-        ref: 'dc91d054c06cfa2c722db51e19db14616120d7f8'
-        path: fixed
-        persist-credentials: false
-    - name: Stage verified transfer helpers from both immutable commits
+    - name: Read new owner receipt and live admission
+      env:
+        GH_TOKEN: ${{ github.token }}
+        BARE_GENERATION: 2.0.9
+        TICKET_SHA: ${{ inputs.ticket_sha }}
+        R209_DRAFT_ALIAS_SHA: ${{ inputs.owner_alias_sha }}
       run: |
         set -euo pipefail
         umask 077
-        [ "$(git -C prior rev-parse HEAD)" = '888cb5b20d3470131a1d77f9a08b7010e09a4110' ]
-        [ "$(git -C fixed rev-parse HEAD)" = 'dc91d054c06cfa2c722db51e19db14616120d7f8' ]
-        [ "$(git -C fixed rev-parse 'HEAD^{tree}')" = '957099393e951b250cc1a2cdc5906aea170f39c8' ]
-        for side in prior fixed; do
-          mkdir "$RUNNER_TEMP/$side"
-          (cd "$side"; RUNNER_TEMP="$RUNNER_TEMP/$side" GITHUB_WORKSPACE="$PWD" python3 preflight28/transport/prepare.py tools >/dev/null)
-        done
-        cat >"$RUNNER_TEMP/check.py" <<'PY'
-        """Read-only service replay of the exact owner-admission failure; emit only stage labels."""
+        [[ "$GITHUB_REF" == refs/heads/bare-209-private-draft-check-20261128 && "$GITHUB_RUN_ATTEMPT" == 1 ]]
+        [[ "$(git rev-parse HEAD)" == 6e3f7c7e38f07a1d2a012f0717318e5f45af68b9 ]]
+        [[ "$(git rev-parse 'HEAD^{tree}')" == 957099393e951b250cc1a2cdc5906aea170f39c8 ]]
+        python3 preflight28/transport/prepare.py tools >/dev/null
+        cat >"$RUNNER_TEMP/current-preissue.py" <<'PYTHON'
+        """Read the new production receipt and live inputs without creating a run claim."""
+        from contextlib import redirect_stdout
+        from datetime import datetime, timezone
         import hashlib
+        import io
         import json
         import os
-        import re
         from pathlib import Path
+        import re
         import sys
-        from urllib.parse import urlsplit
+        import time
 
-        OLD_HEAD = "888cb5b20d3470131a1d77f9a08b7010e09a4110"
-        FAILED_RUN = 46088654643
-        # Independent observation after registration, outside the Actions execution.
-        OWNER_ALIAS_V7 = "2790fdb38a07380c623f48a20730426ec3eb4f0c71d465cdae58112236bc1a55"
-        # SHA256("v7\\n" + SHA256(exact ticket bytes) + "\\n" + SHA256(exact ACK bytes) + "\\n").
-        OWNER_PAIR_V7 = "ec3a89fb4c22389dc3b506790f68604c7c6bb8cc724c2beaf92e32d83012d1fd"
-        STAGE = "initialize"
-
-
-        def check(value):
-            if not value:
-                raise ValueError("Diagnostic assertion")
+        HEAD = "6e3f7c7e38f07a1d2a012f0717318e5f45af68b9"
+        TREE = "957099393e951b250cc1a2cdc5906aea170f39c8"
+        DIAGNOSTIC_BRANCH = "bare-209-private-draft-check-20261128"
+        PREVIOUS = {45996971462: "a17316eecfdc92f77db46e5f48604e65ad41508c",
+                    46088654643: "888cb5b20d3470131a1d77f9a08b7010e09a4110"}
+        BLOCKED = 46088654643
+        PHASE = "inputs"
 
 
-        class ClaimBoundary(Exception):
-            """The verified production claim reached the network boundary; no POST is sent."""
+        def require(ok):
+            if not ok:
+                raise ValueError("Conditions changed")
 
 
-        def verify(mode, checkout, stage):
-            global STAGE
-            checkout = Path(checkout).resolve()
-            sys.path[:0] = [str(Path(stage).resolve()), str(checkout / "preflight209")]
-            import transfer
+        def now():
+            return datetime.now(timezone.utc)
+
+
+        def preissue():
+            global PHASE
+            workspace = Path(os.environ["GITHUB_WORKSPACE"])
+            sys.path[:0] = [os.environ["RUNNER_TEMP"], str(workspace / "preflight209")]
             import owner
-            import r28_verified_draft as anchor
-
-            actual_request = transfer.request
-            expected_body = None
-            expected_path = None
-
-            def get(host, method, path, **kwargs):
-                if method == "POST":
-                    check(STAGE == "read_only_admission" and expected_body is not None and
-                          host == transfer.UPLOAD and path == expected_path and kwargs == {
-                              "auth": True, "body": expected_body, "length": len(expected_body),
-                              "content_type": "application/json"})
-                    raise ClaimBoundary()
-                check(method == "GET" and host in {transfer.API, *transfer.CDNS} and
-                      not kwargs.get("body") and not kwargs.get("length") and
-                      (host == transfer.API or not kwargs.get("auth")))
-                return actual_request(host, method, path, **kwargs)
-
-            transfer.request = get
-            actual_download = transfer.download
-            seen = set()
-
-            def small(asset_id, length, sha, sink):
-                check(type(length) is int and 0 < length <= 16384)
-                actual_download(asset_id, length, sha, sink)
-                seen.add((asset_id, length, sha))
-
+            import transfer
+            env = dict(os.environ, R28_STORAGE_VERIFY_ONLY="false")
+            alias, ticket_sha = (env[key] for key in ("R209_DRAFT_ALIAS_SHA", "TICKET_SHA"))
+            require(all(re.fullmatch("[0-9a-f]{64}", v) for v in (alias, ticket_sha)))
+            require(env["BARE_GENERATION"] == "2.0.9" and env["GITHUB_RUN_ATTEMPT"] == "1" and
+                    env["GITHUB_REF"] == "refs/heads/" + DIAGNOSTIC_BRANCH and
+                    env["GITHUB_EVENT_NAME"] == "workflow_dispatch" and env["GITHUB_REPOSITORY"] == owner.REPO)
+            actual = transfer.request
+            def read(host, method, path, **kw):
+                require(method == "GET" and host in {transfer.API, *transfer.CDNS} and
+                        not kw.get("body") and not kw.get("length") and (host == transfer.API or not kw.get("auth")))
+                return actual(host, method, path, **kw)
+            transfer.request = read
+            ordinary_download = transfer.download
+            def small(aid, size, digest, output):
+                require(type(size) is int and 0 < size <= 16384)
+                return ordinary_download(aid, size, digest, output)
             transfer.download = small
-            STAGE = "release_metadata"
-            release = transfer.metadata(f"{transfer.BASE}/releases/{transfer.RELEASE_ID}")
-            check(release["id"] == transfer.RELEASE_ID and release["draft"] is True and
-                  release["published_at"] is None and transfer.is_owner(release["author"]))
-            alias = urlsplit(release["html_url"]).path.rsplit("/", 1)[-1]
-            alias_hash = hashlib.sha256(alias.encode()).hexdigest()
-            STAGE = "independent_observation"
-            check(alias_hash == OWNER_ALIAS_V7 and os.environ.get("R209_DRAFT_ALIAS_SHA") == OWNER_ALIAS_V7 and
-                  os.environ.get("BARE_GENERATION") == "2.0.9")
-
-            def rejection(message):
-                try:
-                    transfer.draft(transfer.RELEASE_ID)
-                except ValueError as exc:
-                    check(str(exc) == message)
-                else:
-                    raise AssertionError("Expected the exact compatibility rejection")
-
-            if mode == "negative":
-                STAGE = "reproduce_old_alias_rejection"
-                check(not anchor.is_observed_rotation(alias_hash) and alias_hash != transfer.DRAFT_TAG_SHA256)
-                rejection("Rotated owner Draft alias did not match its immutable receipts")
-                return
-            check(mode == "positive")
-            STAGE = "reject_wrong_digest"
-            os.environ["R209_DRAFT_ALIAS_SHA"] = "0" * 64
-            try:
-                rejection("Owner Draft permalink differs from the registered dispatch digest")
-            finally:
-                os.environ["R209_DRAFT_ALIAS_SHA"] = OWNER_ALIAS_V7
-
-            STAGE = "fixed_paged_release"
             api = owner.PagedOwnerDraft(transfer)
-            draft = api.draft(transfer.RELEASE_ID)
-            check(draft["html_url"] == release["html_url"] and
-                  all((aid, size, sha) in seen for _, aid, size, sha in anchor.CLAIMS))
-            STAGE = "failed_production_attempt"
-            run = api.metadata(f"{api.BASE}/actions/runs/{FAILED_RUN}/attempts/1")
-            check(run["id"] == FAILED_RUN and run["run_attempt"] == 1 and run["head_sha"] == OLD_HEAD and
-                  run["event"] == "workflow_dispatch" and run["path"] == owner.WORKFLOW and
-                  run["head_branch"] == owner.BRANCH and run["status"] == "completed" and run["conclusion"] == "failure" and
-                  run["repository"]["id"] == run["head_repository"]["id"] == owner.REPO_ID and owner.owner_account(run["actor"]))
-            STAGE = "owner_ticket_and_ack"
-            parent = owner.cold.SELECTOR["origin_run"]
-            name = f"{owner.CAMPAIGN}-{OLD_HEAD}-after-{parent}-ticket.json"
-            row, = [a for a in draft["assets"] if a["name"] == name]
-            check(row["digest"].startswith("sha256:"))
-            ticket_sha = row["digest"][7:]
-            cutoff = owner.instant(run["created_at"])
-            ticket_id, ticket = owner.doc(api, draft, name, row["id"], ticket_sha, cutoff)
+            def check_head_and_runs():
+                remote = api.metadata(f"{api.BASE}/git/ref/heads/{owner.BRANCH}")
+                require(remote["object"]["type"] == "commit" and remote["object"]["sha"] == HEAD and
+                        remote["ref"] == "refs/heads/" + owner.BRANCH)
+                rows = api.metadata(f"{api.BASE}/actions/runs?branch={owner.BRANCH}&per_page=100&page=1")
+                found = rows["workflow_runs"]
+                require(rows["total_count"] == len(found) == len(PREVIOUS) and {r["id"] for r in found} == set(PREVIOUS))
+                require(all(r["head_sha"] == PREVIOUS[r["id"]] and r["repository"]["id"] == r["head_repository"]["id"] == owner.REPO_ID
+                            and r["head_branch"] == owner.BRANCH and r["run_attempt"] == 1 and r["event"] == "workflow_dispatch"
+                            and r["path"] == owner.WORKFLOW and r["status"] == "completed" and r["conclusion"] == "failure"
+                            and owner.owner_account(r["actor"]) for r in found))
+
+            PHASE = "production_head_and_run_inventory"
+            check_head_and_runs()
+            require(api.metadata(f"{api.BASE}/git/commits/{HEAD}")["tree"]["sha"] == TREE)
+            rid = int(env["GITHUB_RUN_ID"])
+            run = api.metadata(f"{api.BASE}/actions/runs/{rid}/attempts/1")
+            require(run["id"] == rid and run["run_attempt"] == 1 and run["path"] == owner.WORKFLOW and
+                    run["event"] == "workflow_dispatch" and run["status"] == "in_progress" and
+                    run["head_branch"] == DIAGNOSTIC_BRANCH and run["head_sha"] == env["GITHUB_SHA"] and
+                    run["repository"]["id"] == run["head_repository"]["id"] == owner.REPO_ID and owner.owner_account(run["actor"]))
+            created = owner.instant(run["created_at"])
+            require(created <= now())
+            genesis = hashlib.sha256((workspace / "preflight209" / "upstream-lock.json").read_bytes()).hexdigest()
+            selector = owner.cold.SELECTOR
+            require(selector["origin_run"] != BLOCKED and set(PREVIOUS) == {selector["origin_run"], BLOCKED})
+            def no_other_claim(release):
+                require(not any(re.fullmatch(owner.CAMPAIGN + r"-after-[0-9]+-claim\.json", a["name"]) or
+                                a["name"].startswith(f"r209-{BLOCKED}-") for a in release["assets"]))
+
+            PHASE = "new_owner_ticket_and_ack"
+            draft = api.draft(api.RELEASE_ID)
+            no_other_claim(draft)
+            ticket_name = f"{owner.CAMPAIGN}-{HEAD}-after-{selector['origin_run']}-ticket.json"
+            ticket_id, ticket = owner.doc(api, draft, ticket_name, "lookup", ticket_sha, created)
+            ack_name = f'{owner.CAMPAIGN}-ack-{ticket["registration_nonce"]}.json'
             ack_sha = ticket["collector_ack_sha"]
-            ack_id, ack = owner.doc(api, draft, f'{owner.CAMPAIGN}-ack-{ticket["registration_nonce"]}.json',
-                                    ticket["collector_ack_asset_id"], ack_sha, cutoff)
-            check(hashlib.sha256(f"v7\n{ticket_sha}\n{ack_sha}\n".encode("ascii")).hexdigest() == OWNER_PAIR_V7)
+            ack_id, ack = owner.doc(api, draft, ack_name, ticket["collector_ack_asset_id"], ack_sha, created)
+            latest = owner.validate_route(ticket, ack, head=HEAD, genesis=genesis, created=created, now=now(), resume=selector)
+            ceiling, until = owner.storage.policy(ticket, ack)
+            env.update(R28_STORAGE_CEILING=str(ceiling), R28_STORAGE_UNTIL=str(until))
+            def window():
+                t = now().timestamp()
+                require(t <= latest and t <= until - (owner.SEGMENT + owner.storage.JOURNAL_TAIL +
+                                                       owner.storage.JOURNAL_DAYS * owner.storage.DAY))
+            window()
 
-            STAGE = "prepare_claim_boundary"
-            genesis = hashlib.sha256((checkout / "preflight209" / "upstream-lock.json").read_bytes()).hexdigest()
-            expected_body = owner.encode({
-                "schema": 1, "campaign": owner.CAMPAIGN, "repository_id": owner.REPO_ID, "workflow": owner.WORKFLOW,
-                "branch": owner.BRANCH, "head": OLD_HEAD, "genesis": genesis, "release_id": transfer.RELEASE_ID,
-                "origin_run": FAILED_RUN, "producer_attempt": 1, "ticket_asset_id": ticket_id, "ticket_sha": ticket_sha,
-                "collector_ack_asset_id": ack_id, "collector_ack_sha": ack_sha,
-                "collector_registration_id": ticket["collector_registration_id"],
-                "destination_commitment": owner.DESTINATION_HASH, "recipient": owner.RECIPIENT,
-                "resume": owner.cold.SELECTOR, "prior_claim_asset_id": ack["precompile_origin"]["claim_asset_id"]})
-            expected_path = f"{api.BASE}/releases/{transfer.RELEASE_ID}/assets?name={owner.CAMPAIGN}-after-{parent}-claim.json"
-            # The immutable claim belongs to the authenticated historical producer. Only its real
-            # actor, head, ref and known dispatch inputs are replayed for the physical owner ticket.
-            env = dict(os.environ, GITHUB_REF="refs/heads/" + run["head_branch"], GITHUB_SHA=run["head_sha"],
-                       GITHUB_RUN_ID=str(FAILED_RUN), GITHUB_RUN_ATTEMPT=str(run["run_attempt"]), GITHUB_EVENT_NAME=run["event"])
-            event = {"repository": run["repository"], "sender": run["actor"],
-                     "inputs": {"mode": "build-apk", "resume": json.dumps(owner.cold.SELECTOR),
-                                "ticket_id": "lookup", "ticket_sha": ticket_sha, "owner_alias_sha": OWNER_ALIAS_V7}}
-            # Storage must inspect this actual, currently running CI job, including all current
-            # competing run states, real capacity, permissions, and current grant/retention times.
-            live_admission = owner.storage.admit
-            real_run = os.environ["GITHUB_RUN_ID"]
-            check(real_run.isdecimal() and int(real_run) > 0 and int(real_run) != FAILED_RUN)
-            live_calls = []
-            def live_storage(get_metadata, config, *args, **kwargs):
-                check(config["GITHUB_RUN_ID"] == str(FAILED_RUN))
-                result = live_admission(get_metadata, {**config, "GITHUB_RUN_ID": real_run}, *args, **kwargs)
-                live_calls.append(kwargs["stage"])
-                return result
+            PHASE = "previous_claim_and_recovery_inventory"
+            # The canonical cold-parent method is GET-only, including its compute-path availability checks.
+            with redirect_stdout(io.StringIO()):
+                old_claim = owner.cold_parent(api, draft, ticket, ack, genesis, HEAD, now(), created, verify_only=False)
+            require(old_claim == ack["precompile_origin"]["claim_asset_id"])
+            blocked_outputs = api.metadata(f"{api.BASE}/actions/runs/{BLOCKED}/artifacts?per_page=100&page=1")
+            require(blocked_outputs["total_count"] == 0 and blocked_outputs["artifacts"] == [])
 
-            owner.storage.admit = live_storage
-            STAGE = "read_only_admission"
-            try:
-                owner.bind(api, env, event, "lookup", ticket_sha, genesis)
-            except ClaimBoundary:
-                check(live_calls == ["lease"])
-            else:
-                raise AssertionError("A claim already exists or admission did not reach the protected write boundary")
+            PHASE = "free_runner_storage_and_capacity"
+            owner.storage.draft_room(draft, env, claim=True)
+            inventory = []
+            ordinary_rows = owner.storage.receipt_rows
+            def count_returned(*args, **kwargs):
+                rows = ordinary_rows(*args, **kwargs)
+                inventory.append((len(rows), sum(row[0] for row in rows.values())))
+                return rows
+            owner.storage.receipt_rows = count_returned
+            for retry in (0, 8, 16):
+                if retry:
+                    time.sleep(retry)
+                window()
+                journal = io.StringIO()
+                try:
+                    with redirect_stdout(journal):
+                        verdict = owner.storage.admit(api.metadata, env, owner.storage.lease_size(env),
+                                                     1, stage="lease", lead=owner.SEGMENT)
+                    break
+                except owner.storage.StorageUnconfirmed as error:
+                    if retry == 16 or "inventory" not in str(error).lower():
+                        raise
+            owner.storage.receipt_rows = ordinary_rows
+            require(verdict == "admitted" and inventory)
+            lines = journal.getvalue().splitlines()
+            receipt, = [json.loads(s.removeprefix("R28_ARTIFACT_ADMISSION ")) for s in lines if s.startswith("R28_ARTIFACT_ADMISSION ")]
+            count, total = inventory[-1]
+            require(total == receipt["known_repository_bytes"])
+            PHASE = "final_head_alias_and_claim_state"
+            check_head_and_runs()
+            final = api.draft(api.RELEASE_ID)
+            no_other_claim(final)
+            for name, ident, sha, doc in ((ticket_name, ticket_id, ticket_sha, ticket),
+                                           (ack_name, ack_id, ack_sha, ack)):
+                require(owner.doc(api, final, name, ident, sha, created)[1] == doc)
+            owner.storage.draft_room(final, env, claim=True)
+            owner.storage.check_active_runs(api.metadata, env)
+            window()
+            return dict(measured_at=now().isoformat(timespec="seconds"), production_head=HEAD,
+                        production_runs=len(PREVIOUS), draft_assets=len(final["assets"]),
+                        repository_artifacts=count, repository_artifact_bytes=receipt["known_repository_bytes"],
+                        projected_peak_bytes=receipt["peak_bytes"], ceiling_bytes=ceiling,
+                        latest_start_epoch=latest, storage_until_epoch=until, result="pass")
 
 
         if __name__ == "__main__":
             try:
-                verify(*sys.argv[1:])
-            except Exception as error:
-                code = str(error)
-                if STAGE == "release_metadata" and code in ("GitHub metadata GET returned 403",
-                                                            "GitHub metadata GET returned 404"):
-                    print(f"GET-only diagnostic: physical draft HTTP {code[-3:]} (visibility unconfirmed).", file=sys.stderr)
-                else:
-                    # Expose only known descriptions, never the service body, destination, nonce or URLs.
-                    reason = next((label for text, label in (
-                        ("inventory", "incomplete inventory"), ("Another run", "competing execution"),
-                        ("coverage is too short", "owner coverage"), ("policy expired", "storage grant"),
-                        ("storage ceiling", "storage ceiling"), ("different generation", "generation binding"),
-                        ("permalink differs", "owner digest"), ("Original claim", "origin claim"),
-                        ("Missing or duplicate owner document", "owner document selection"))
-                        if text.lower() in code.lower()), "")
-                    status = re.fullmatch(r"(GitHub metadata GET|Asset retrieval) returned ([1-5][0-9]{2})", code)
-                    if status:
-                        reason = f"{status[1]} HTTP {status[2]}"
-                    print("GET-only diagnostic failed at " + STAGE + (" (" + reason + ")" if reason else ""), file=sys.stderr)
+                print(json.dumps(preissue(), sort_keys=True))
+            except Exception as e:
+                # Only controlled labels/status may appear on the public repository.
+                status = re.fullmatch(r"(GitHub metadata GET|Asset retrieval) returned ([1-5][0-9]{2})", str(e))
+                print("Read-only preissue failed at " + PHASE + (": HTTP " + status[2] if status else ""), file=sys.stderr)
                 sys.exit(1)
-        PY
-    - name: Compare prior rejection and fixed admission against real service bytes
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        set -euo pipefail
-        umask 077
-        python3 -I "$RUNNER_TEMP/check.py" negative prior "$RUNNER_TEMP/prior" >/dev/null
-        echo 'Previous production version rejected the actual release alias.'
-        python3 -I "$RUNNER_TEMP/check.py" positive fixed "$RUNNER_TEMP/fixed" >/dev/null
-        echo 'Fixed client rejected the wrong owner digest and accepted the independent observation. Both original receipts and the registered historical admission reached the protected claim boundary.'
+        PYTHON
+        python3 -I "$RUNNER_TEMP/current-preissue.py"
