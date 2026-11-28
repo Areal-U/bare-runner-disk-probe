@@ -146,7 +146,7 @@ def close():
     tar = ['tar', '--sort=name', '--hard-dereference','--format=posix',
            '--pax-option=delete=atime,delete=ctime','-cf','-', 'out/Bare']
     pack(WORK/'next.tar.zst', 'auto', estimate['archive_input_estimate_bytes'], tar,
-         deadline=int(os.environ['R209_SENDER_UNTIL'])-15*60)
+         deadline=int(os.environ['R209_SENDER_UNTIL'])-int(os.environ['R209_FALLBACK_SECONDS']))
     (WORK/'kind').write_text('checkpoint')
 
 

@@ -286,6 +286,9 @@ def bind(api, env, event, ticket_id, ticket_sha, genesis, *, verify_only=False, 
         storage.public_host(api.metadata(api.BASE), cfg.get('RUNNER_ENVIRONMENT'))
     else:
         storage.draft_room(release, cfg, claim=not verify_only)
+        from checkpoint_packets import max_draft_assets
+        require(len(release['assets']) + max_draft_assets() + (0 if verify_only else 2) <= 1000,
+                'Private Draft cannot hold the sealed transfer and its verified canonical checkpoint')
         for index, pause in enumerate((0, 8, 16)):
             if pause:
                 time.sleep(pause)

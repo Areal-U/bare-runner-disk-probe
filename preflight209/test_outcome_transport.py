@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import zipfile
 
 import test_checkpoint209
@@ -49,6 +49,27 @@ class OutcomeTransport(unittest.TestCase):
 
     def command(self, *args):
         subprocess.run([sys.executable, BRIDGE / 'normal.py', *args], check=True, capture_output=True)
+
+    def test_transient_packet_read_preserves_both_outcome_routes(self):
+        descriptor = normal.context() | normal.sender_times(int(time.time()), 23)
+        (self.normal/'input.json').write_text(json.dumps(descriptor))
+        artifact = dict(id=77, workflow_run={'id': 17}, expired=False, size_in_bytes=400,
+                        expires_at='2099-01-01T00:00:00Z')
+        for partial, expected in ((False, {'id': 77}), (True, {'packets_ready': 'true'})):
+            reader = Mock()
+            reader.outcome = normal.context() if partial else None
+            reader.poll.side_effect = [bridge.TransientReadError('503'), True]
+            with self.subTest(partial=partial), patch('packet_receiver.Receiver', return_value=reader), \
+                 patch.object(normal.artifact_poll,'lookup',side_effect=[None, None if partial else artifact]), \
+                 patch.object(normal,'ordinary_job',return_value=None), patch.object(time,'sleep'), \
+                 patch.object(bridge,'output') as output:
+                normal.wait('outcome')
+                output.assert_called_once_with(**expected)
+        reader = Mock(outcome=normal.context())
+        with patch('packet_receiver.Receiver',return_value=reader), \
+             patch.object(normal.artifact_poll,'lookup',return_value=artifact), \
+             self.assertRaisesRegex(ValueError,'both match'):
+            normal.wait('outcome')
 
     def accepted(self, candidate=False, **changes):
         items = [self.normal / 'outcome.json']

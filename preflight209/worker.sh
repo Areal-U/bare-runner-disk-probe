@@ -18,8 +18,15 @@ if ! command -v age >/dev/null; then
 fi
 install -m 0755 "$(command -v age)" "$ex/age"
 export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0 PYTHONDONTWRITEBYTECODE=1
+worker_start=$(cat "$RUNNER_TEMP/bare-probe-start")
+[[ $R209_FALLBACK_SECONDS =~ ^[1-9][0-9]{0,4}$ ]]
+(( R209_FALLBACK_SECONDS >= 15*60 && R209_FALLBACK_SECONDS < 350*60 ))
+# Both VMs must still exist while the cache confirmation is outstanding.
+worker_cutoff=$(( worker_start + 350*60 ))
+(( R209_SENDER_UNTIL <= worker_cutoff )) || export R209_SENDER_UNTIL=$worker_cutoff
 ctx=(docker compose exec -T -w /work/chromium/src -e DEPOT_TOOLS_UPDATE -e DEPOT_TOOLS_METRICS -e PYTHONDONTWRITEBYTECODE
-     -e GITHUB_RUN_ID -e R28_SLOT -e R28_HEAD_SHA -e R28_PARENT_SHA -e R209_GENESIS -e R28_COLLECTION_CLAIM -e R209_SENDER_UNTIL)
+     -e GITHUB_RUN_ID -e R28_SLOT -e R28_HEAD_SHA -e R28_PARENT_SHA -e R209_GENESIS -e R28_COLLECTION_CLAIM
+     -e R209_SENDER_UNTIL -e R209_FALLBACK_SECONDS)
 args=()
 if (( R28_SLOT > 1 )); then
   python3 -c 'import json,sys; json.dump(json.load(open(sys.argv[1]))["source"],sys.stdout)' "$RUNNER_TEMP/r28-normal/input.json" > "$stage/parent.json"
@@ -30,10 +37,7 @@ bash "$repo/preflight209/transfer_access.sh" input
 "${ctx[@]}" chromium-builder python3 /exchange/r209/segment.py prepare "${args[@]}"
 # Both VMs' actual hosted starts bound the tail. Never take packing, upload
 # retry, acquisition or independent full readback minutes for compilation.
-worker_start=$(cat "$RUNNER_TEMP/bare-probe-start")
-end=$(( worker_start + (350 - 60)*60 ))
-peer_end=$(( R209_SENDER_UNTIL - 60*60 ))
-(( end <= peer_end )) || end=$peer_end
+end=$(( R209_SENDER_UNTIL - 45*60 - R209_FALLBACK_SECONDS ))
 remaining=$(( end - $(date +%s) ))
 (( remaining >= 600 ))
 phase=seed

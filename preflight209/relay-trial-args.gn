@@ -1,0 +1,32 @@
+target_os = "android"
+target_cpu = "arm64"
+is_desktop_android = true
+is_official_build = true
+is_debug = false
+is_java_debug = false
+is_component_build = false
+dcheck_always_on = false
+android_static_analysis = "off"
+symbol_level = 0
+blink_symbol_level = 0
+v8_symbol_level = 0
+use_remoteexec = false
+use_reclient = false
+
+proprietary_codecs = true
+ffmpeg_branding = "Chrome"
+
+use_mlkit_for_aicore = false
+enable_glic_internal_resources = false
+enable_reporting = false
+enable_service_discovery = false
+enable_mdns = false
+enable_arcore = false
+enable_cardboard = false
+enable_openxr = false
+
+disable_fieldtrial_testing_config = true
+
+chrome_public_manifest_package = "org.barebrowser.personal"
+android_override_version_code = "802000915"
+android_override_version_name = "2.0.9"
