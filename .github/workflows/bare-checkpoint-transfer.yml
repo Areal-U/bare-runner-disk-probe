@@ -73,7 +73,7 @@ jobs:
     needs: admit
     permissions:
       contents: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
       owner_alias_sha: ${{ inputs.owner_alias_sha }}
@@ -93,7 +93,7 @@ jobs:
     if: ${{ needs.slot01.outputs.kind == 'checkpoint' }}
     permissions:
       contents: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
       owner_alias_sha: ${{ inputs.owner_alias_sha }}
@@ -113,7 +113,7 @@ jobs:
     if: ${{ needs.slot02.outputs.kind == 'checkpoint' }}
     permissions:
       contents: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
       owner_alias_sha: ${{ inputs.owner_alias_sha }}
@@ -133,7 +133,7 @@ jobs:
     if: ${{ needs.slot03.outputs.kind == 'checkpoint' }}
     permissions:
       contents: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
       owner_alias_sha: ${{ inputs.owner_alias_sha }}
@@ -153,7 +153,7 @@ jobs:
     if: ${{ needs.slot04.outputs.kind == 'checkpoint' }}
     permissions:
       contents: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
       owner_alias_sha: ${{ inputs.owner_alias_sha }}
@@ -173,7 +173,7 @@ jobs:
     if: ${{ needs.slot05.outputs.kind == 'checkpoint' }}
     permissions:
       contents: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
       owner_alias_sha: ${{ inputs.owner_alias_sha }}
@@ -193,7 +193,7 @@ jobs:
     if: ${{ needs.slot06.outputs.kind == 'checkpoint' }}
     permissions:
       contents: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
       owner_alias_sha: ${{ inputs.owner_alias_sha }}
@@ -213,7 +213,7 @@ jobs:
     if: ${{ needs.slot07.outputs.kind == 'checkpoint' }}
     permissions:
       contents: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
       owner_alias_sha: ${{ inputs.owner_alias_sha }}
@@ -233,7 +233,7 @@ jobs:
     if: ${{ needs.slot08.outputs.kind == 'checkpoint' }}
     permissions:
       contents: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
       owner_alias_sha: ${{ inputs.owner_alias_sha }}
@@ -253,7 +253,7 @@ jobs:
     if: ${{ needs.slot09.outputs.kind == 'checkpoint' }}
     permissions:
       contents: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
       owner_alias_sha: ${{ inputs.owner_alias_sha }}
@@ -273,7 +273,7 @@ jobs:
     if: ${{ needs.slot10.outputs.kind == 'checkpoint' }}
     permissions:
       contents: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
       owner_alias_sha: ${{ inputs.owner_alias_sha }}
@@ -293,7 +293,7 @@ jobs:
     if: ${{ needs.slot11.outputs.kind == 'checkpoint' }}
     permissions:
       contents: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
       owner_alias_sha: ${{ inputs.owner_alias_sha }}

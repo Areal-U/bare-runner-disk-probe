@@ -2,6 +2,10 @@ name: Bare Personal 2.0.9 physical interval
 'on':
   workflow_call:
     inputs:
+      relay_trial:
+        type: boolean
+        required: false
+        default: false
       ordinal:
         type: string
         required: true
@@ -49,6 +53,7 @@ name: Bare Personal 2.0.9 physical interval
         value: ${{ jobs.certify.outputs.artifact }}
 permissions: {}
 env:
+  R209_RELAY_TRIAL: ${{ inputs.relay_trial }}
   BARE_GENERATION: 2.0.9
   R209_DRAFT_ALIAS_SHA: ${{ inputs.owner_alias_sha }}
   R28_HEAD_SHA: ${{ github.sha }}
@@ -89,11 +94,16 @@ jobs:
         GH_TOKEN: ${{ github.token }}
         TICKET: ${{ inputs.ticket_id }}
         TICKET_SHA: ${{ inputs.ticket_sha }}
-      run: python3 preflight209/owner.py lease --ticket-id "$TICKET" --ticket-sha "$TICKET_SHA" --genesis "$R209_GENESIS"
+      run: |
+        if [[ "$R209_RELAY_TRIAL" == true ]]; then
+          python3 preflight209/relay_trial.py lease
+        else
+          python3 preflight209/owner.py lease --ticket-id "$TICKET" --ticket-sha "$TICKET_SHA" --genesis "$R209_GENESIS"
+        fi
   compile-probe:
     needs: lease
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    timeout-minutes: ${{ inputs.relay_trial && 37 || 350 }}
     env:
       R28_COLLECTION_CLAIM: ${{ needs.lease.outputs.claim }}
       R28_STORAGE_CEILING: ${{ needs.lease.outputs.storage_ceiling }}
@@ -195,14 +205,31 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: python3 preflight28/bridge/normal.py acquire
+    - name: Verify checkpoint buffer capacity and reserve its transfer time
+      id: packet_preflight
+      timeout-minutes: 5
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        python3 preflight209/checkpoint_packets.py stage-tools
+        python3 preflight209/checkpoint_send.py preflight
     - name: Prepare pinned Chromium, official patches, tools and Personal resources
       timeout-minutes: 80
+      if: ${{ !inputs.relay_trial }}
       run: bash preflight209/setup.sh
     - name: Compile on the reviewed normal entry and freeze its actual frontier
       id: worker
       env:
+        TRIAL_READ_TOKEN: ${{ inputs.relay_trial && github.token || '' }}
         R209_SENDER_UNTIL: ${{ steps.peer_acquire.outputs.sender_outcome_deadline }}
-      run: bash preflight209/worker.sh
+        R209_FALLBACK_SECONDS: ${{ steps.packet_preflight.outputs.fallback_seconds }}
+      run: |
+        if [[ "$R209_RELAY_TRIAL" == true ]]; then
+          GH_TOKEN="$TRIAL_READ_TOKEN" python3 preflight209/relay_trial.py candidate
+        else
+          bash preflight209/worker.sh
+        fi
     - name: Verify storage at terminal upload
       env:
         GH_TOKEN: ${{ github.token }}
@@ -311,7 +338,20 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
         R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
-      run: python3 preflight28/bridge/outcome_relay.py plan
+      run: |
+        if [[ "$R209_RELAY_TRIAL" == true ]]; then
+          python3 preflight209/relay_trial.py route
+        else
+          python3 preflight28/bridge/outcome_relay.py plan
+        fi
+    - name: Transfer the sealed outcome through the bounded cache buffer
+      id: packet_send
+      if: ${{ !cancelled() && steps.peer_capacity.outputs.decision == 'packets' }}
+      uses: ./preflight209/packet_action
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        mode: send
     - name: Deposit outcome in this run
       id: peer_put_outcome
       uses: ./preflight28/bridge/normal_upload
@@ -362,7 +402,7 @@ jobs:
       run: python3 preflight28/bridge/outcome_relay.py resolve --round 2
     - name: Record the final transfer decision for this slot
       id: relay_final
-      if: ${{ always() && !cancelled() && steps.peer_capacity.outcome == 'success' }}
+      if: ${{ always() && !cancelled() && steps.peer_capacity.outcome == 'success' && steps.peer_capacity.outputs.decision != 'packets' }}
       env:
         RELAY_STATE: ${{ steps.resolve_relay_2.outputs.decision || steps.resolve_relay_1.outputs.decision || steps.peer_capacity.outputs.decision
           }}
@@ -371,7 +411,7 @@ jobs:
   draft-publisher:
     needs: lease
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    timeout-minutes: ${{ inputs.relay_trial && 37 || 350 }}
     env:
       R28_COLLECTION_CLAIM: ${{ needs.lease.outputs.claim }}
       R28_STORAGE_CEILING: ${{ needs.lease.outputs.storage_ceiling }}
@@ -381,7 +421,7 @@ jobs:
     name: Receive private checkpoint slot ${{ inputs.ordinal }}
     permissions:
       contents: write
-      actions: read
+      actions: write
     outputs:
       peer_status: ${{ steps.publish.outputs.peer_status }}
       checkpoint_manifest_id: ${{ steps.publish.outputs.checkpoint_manifest_id }}
@@ -404,7 +444,10 @@ jobs:
       id: peer_names
       run: python3 preflight28/bridge/normal.py names
     - name: Stage the fixed owner-Draft interface
-      run: python3 preflight28/transport/prepare.py tools
+      run: |
+        set -euo pipefail
+        python3 preflight28/transport/prepare.py tools
+        python3 preflight209/checkpoint_packets.py stage-tools
     - name: Create an ephemeral limited transfer key
       id: peer_key
       timeout-minutes: 4
@@ -457,9 +500,11 @@ jobs:
     - name: Discover exact peer outcome
       id: peer_wait_outcome
       timeout-minutes: 315
+      uses: ./preflight209/packet_action
+      with:
+        mode: receive
       env:
         GH_TOKEN: ${{ github.token }}
-      run: python3 preflight28/bridge/normal.py wait outcome
     - name: Fetch authenticated outcome by immutable artifact ID
       uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
       timeout-minutes: 10
@@ -474,7 +519,7 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: python3 preflight28/bridge/normal.py publish
-      if: ${{ steps.peer_wait_outcome.outputs.id != '' }}
+      if: ${{ steps.peer_wait_outcome.outputs.id != '' || steps.peer_wait_outcome.outputs.packets_ready == 'true' }}
   certify:
     name: Certify exact private result
     needs:

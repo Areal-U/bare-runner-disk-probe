@@ -3,6 +3,18 @@ name: Bare runner disk probe
 on:
   workflow_dispatch:
     inputs:
+      checkpoint_trial:
+        description: Verify the two-packet private checkpoint relay, without building Chromium
+        type: boolean
+        default: false
+      expected_head:
+        description: Exact reviewed production HEAD for a relay trial
+        type: string
+        required: false
+      owner_alias_sha:
+        description: Owner-observed private Draft alias SHA-256 for a relay trial
+        type: string
+        required: false
       reclaim:
         description: Measure again after removing listed unused tools from the temporary runner
         type: boolean
@@ -11,8 +23,16 @@ on:
 permissions: {}
 
 jobs:
+  relay-trial:
+    if: ${{ inputs.checkpoint_trial }}
+    permissions:
+      contents: write
+      actions: write
+    uses: ./.github/workflows/bare-209-relay-trial.yml
+    with:
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
   measure:
-    if: ${{ toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' }}
+    if: ${{ !inputs.checkpoint_trial && toJSON(github.event.repository.private) == 'false' && toJSON(github.event.repository.fork) == 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
