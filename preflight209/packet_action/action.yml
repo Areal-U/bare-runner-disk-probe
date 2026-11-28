@@ -1,0 +1,18 @@
+name: Transfer an exact signed checkpoint packet
+description: Supply the Actions cache runtime to the limited producer or receiver
+inputs:
+  mode:
+    description: send or receive
+    required: true
+outputs:
+  packets_sent:
+    description: All private packet ACKs and final cache release were verified
+  packets_ready:
+    description: The receiver assembled the complete outcome for ordinary publication
+  id:
+    description: Original outcome artifact ID when the standard transport succeeded
+  outcome_absent:
+    description: The ordinary wait observed absence
+runs:
+  using: node24
+  main: index.cjs
