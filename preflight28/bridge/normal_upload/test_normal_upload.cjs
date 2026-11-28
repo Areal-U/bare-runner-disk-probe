@@ -15,6 +15,7 @@ function fixture() {
   const cipher = path.join(normal, 'checkpoint.cms');
   const env = {
     ...process.env,
+    GITHUB_REF: 'refs/heads/bare-coexist-v2.0.4', BARE_GENERATION: '',
     GITHUB_REPOSITORY: 'Areal-U/bare-runner-disk-probe', GITHUB_RUN_ID: '45508307820', GITHUB_RUN_ATTEMPT: '1',
     GITHUB_JOB: 'compile-probe', R28_SLOT: '2', R28_HEAD_SHA: '3'.repeat(40),
     RUNNER_TEMP: temp, GITHUB_OUTPUT: path.join(temp, 'real-output'),
@@ -47,6 +48,29 @@ test('only fixed attempt, ordinal, name, canonical paths, retention and unchange
     fs.writeFileSync(f.outcome, JSON.stringify({...f.record, status: 'verify-only'}));
     assert.doesNotThrow(() => validateScope({...f.env, INPUT_PATH: f.outcome}));
     assert.throws(() => validateScope(f.env));
+  } finally { f.close(); }
+});
+
+test('the generation selects the artifact name, key, schema and allowed checkpoint slot together', () => {
+  const f = fixture();
+  try {
+    const parent = '5'.repeat(64);
+    const env = {...f.env, GITHUB_REF: 'refs/heads/bare-coexist-v2.0.9', BARE_GENERATION: '2.0.9',
+      GITHUB_SHA: f.env.R28_HEAD_SHA, GITHUB_EVENT_NAME: 'workflow_dispatch',
+      R28_PARENT_SHA: parent, R28_PARENT_IDENTITY: parent};
+    for (const slot of [1, 12, 13, 99, 100]) {
+      env.R28_SLOT = String(slot);
+      env.INPUT_NAME = `r209-${env.GITHUB_RUN_ID}-a1-s${String(slot).padStart(2,'0')}-outcome`;
+      const record = {...f.record, schema:'bare-personal-209-checkpoint-v1', ordinal:slot,
+        key:`bare-personal-209-${env.GITHUB_RUN_ID}-1-checkpoint-s${slot}`,
+        parent_sha:parent, parent_identity:parent};
+      fs.writeFileSync(f.outcome, JSON.stringify(record));
+      if (slot < 100) assert.doesNotThrow(() => validateScope(env));
+      else assert.throws(() => validateScope(env));
+      assert.throws(() => validateScope({...env, INPUT_NAME:env.INPUT_NAME.replace('r209-','r28-')}));
+      fs.writeFileSync(f.outcome, JSON.stringify({...record, key:f.record.key}));
+      assert.throws(() => validateScope(env));
+    }
   } finally { f.close(); }
 });
 
