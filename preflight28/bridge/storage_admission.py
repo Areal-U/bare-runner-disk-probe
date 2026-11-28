@@ -34,6 +34,10 @@ class StorageFull(ValueError):
     """The measured working set exceeds the owner-approved byte ceiling."""
 
 
+class IncompleteArtifactInventory(StorageUnconfirmed):
+    """Repository list layouts could not account for all advertised artifacts."""
+
+
 def require(check, reason):
     if not check:
         raise StorageUnconfirmed(reason)
@@ -210,8 +214,8 @@ def receipt_rows(get, *, run_id=None):
                 return rows
             previous = rows
             consecutive = True
-        raise StorageUnconfirmed("Incomplete repository Artifact inventory: no two consecutive independent "
-                                 f"complete layouts agreed ({len(observed)} distinct observed IDs)")
+        raise IncompleteArtifactInventory("Incomplete repository Artifact inventory: no two consecutive independent "
+                                          f"complete layouts agreed ({len(observed)} distinct observed IDs)")
     finally:
         if install_alarm:
             signal.setitimer(signal.ITIMER_REAL, 0)

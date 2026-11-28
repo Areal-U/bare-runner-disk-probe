@@ -54,6 +54,24 @@ def stem(number=None, *, run_id=None):
     return f"{prefix}-{run}-a1-s{slot() if number is None else number:02}"
 
 
+def private_stem(number=None, *, run_id=None):
+    name = stem(number, run_id=run_id)
+    if os.environ.get("R209_RELAY_TRIAL") != "true":
+        return name
+    # A synthetic archive never gets a production manifest, including when
+    # a follow-up caller later supplies its immutable ID and SHA.
+    env = os.environ
+    ref = "refs/heads/bare-coexist-v2.0.9"
+    event = json.loads(Path(env["GITHUB_EVENT_PATH"]).read_bytes())
+    b.require(R209 and env["GITHUB_REPOSITORY"] == b.REPO and env["GITHUB_REF"] == ref and
+              env["GITHUB_WORKFLOW_REF"] == b.REPO + "/.github/workflows/bare-disk-probe.yml@" + ref and
+              event["repository"]["id"] == 1450926240 and event["sender"]["id"] == 292261483 and
+              event["inputs"]["checkpoint_trial"] == "true" and event["inputs"]["expected_head"] == env["GITHUB_SHA"]
+              and env["GITHUB_EVENT_NAME"] == "workflow_dispatch" and env["GITHUB_RUN_ATTEMPT"] == "1" and
+              (run_id is None or run_id == b.env_int("GITHUB_RUN_ID")), "Invalid diagnostic Draft namespace")
+    return "trial-" + name
+
+
 def parent_read_run():
     """A replacement may read its admitted predecessor. All output names stay local."""
     current = b.env_int("GITHUB_RUN_ID")
@@ -183,6 +201,12 @@ def wait(kind):
     cutoff = sender_deadline(info()) if kind == "outcome" else None
     deadline=start+(cutoff-time.time() if cutoff is not None else 20*60)
     get=b.api_before(deadline)
+    packet_receiver = None
+    if R209 and kind == "outcome":
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]/"preflight209"))
+        from packet_receiver import Receiver
+        packet_receiver = Receiver()
     observed_done=None
     stable_absence = False
     polls = 0
@@ -201,6 +225,8 @@ def wait(kind):
             stable_absence = False
             observed_done = None
         if a:
+            b.require(packet_receiver is None or packet_receiver.outcome is None,
+                      "An Artifact and a partial private transfer both match this slot")
             if cutoff is not None:
                 time_left(cutoff, 0, "outcome download")
             bound=b.CAP+32*1024**2 if kind=="outcome" else 256*1024
@@ -210,7 +236,19 @@ def wait(kind):
             b.output(id=a["id"])
             print(f"found {tag} artifact={a['id']} bytes={a['size_in_bytes']} expires_at={a['expires_at']}",flush=True)
             return
-        if peer and peer["status"]=="completed":
+        if packet_receiver is not None and stable_absence:
+            try:
+                ready = packet_receiver.poll()
+            except b.TransientReadError:
+                stable_absence = False
+                peer = None
+                ready = False
+            if ready:
+                time_left(cutoff, 0, "completed checkpoint buffer readback")
+                b.output(packets_ready="true")
+                return
+        partial = packet_receiver is not None and packet_receiver.outcome is not None
+        if peer and peer["status"]=="completed" and not partial:
             if observed_done is None:
                 observed_done=time.monotonic()
             if time.monotonic()-observed_done>=75 and peer["conclusion"]=="success":
@@ -219,7 +257,7 @@ def wait(kind):
             b.require(time.monotonic()-observed_done<75,"Ordinary job terminated without a durable outcome")
         else:
             observed_done=None
-        pause = min(artifact_poll.backoff(polls), max(0,deadline-time.monotonic()))
+        pause = min(5 if partial else artifact_poll.backoff(polls), max(0,deadline-time.monotonic()))
         now = time.monotonic()
         if now >= next_log:
             print(f"waiting for {tag} inventory={'absent' if stable_absence else 'unsettled'}"
@@ -227,7 +265,7 @@ def wait(kind):
             next_log = now + 300
         polls += 1
         time.sleep(pause)
-    if kind=="outcome" and stable_absence:
+    if kind=="outcome" and stable_absence and (packet_receiver is None or packet_receiver.outcome is None):
         # Only an explicit, matching ordinary stop is accepted by the caller.
         # Absence here never creates a readable checkpoint or triggers another slot.
         b.output(outcome_absent="true")
@@ -270,7 +308,7 @@ def get_manifest(mid, expected_sha, number, *, run_id=None):
     api=b.auth_api()
     rel=list_private(api)
     row,=[r for r in rel["assets"] if r["id"]==mid]
-    b.require(row["name"] in (stem(number, run_id=run)+"-manifest.json",stem(number, run_id=run)+"-manifest.json-retry1")
+    b.require(row["name"] in (private_stem(number, run_id=run)+"-manifest.json",private_stem(number, run_id=run)+"-manifest.json-retry1")
               and sha_check(expected_sha) and 0<row["size"]<32768,"Unrecognized private manifest")
     api.asset_info(rel,row["name"],row["size"],expected_sha,mid)
     buf=io.BytesIO()
@@ -445,7 +483,7 @@ class Section:
 
 
 def put(suffix,file,offset,length,digest,*,origin_prefix=None):
-    api=b.auth_api();base=(origin_prefix or stem())+"-"+suffix
+    api=b.auth_api();base=(origin_prefix or private_stem())+"-"+suffix
     def find(name, *, before_write=False):
         assets=list_private(api)["assets"]
         rows=[r for r in assets if r["name"]==name]
@@ -548,7 +586,7 @@ def put_json(suffix, record, *, origin_prefix=None):
 
 
 def existing(rel, suffix, *, origin_prefix=None):
-    base=(origin_prefix or stem())+"-"+suffix
+    base=(origin_prefix or private_stem())+"-"+suffix
     found=[row for row in rel["assets"] if row["name"] in (base,base+"-retry1") and row["state"]=="uploaded"]
     b.require(len(found)<=1,"Ambiguous private generation intent or committed object")
     return found[0] if found else None

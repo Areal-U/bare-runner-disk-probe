@@ -196,6 +196,58 @@ def check_saved_origin(service_receipt, artifact_id, run, ordinal, head, parent_
               and b.sha(service_receipt.get("zip_sha256","")), "Wrong service receipt or recovery attempt")
 
 
+def check_candidate(n, *, run, ordinal, head, parent_sha):
+    new = os.environ.get("BARE_GENERATION") == "2.0.9"
+    schema = "bare-personal-209-checkpoint-v1" if new else "bare-r28-checkpoint-private-v1"
+    key = f"bare-personal-209-{run}-1-checkpoint-s{ordinal}" if new else f"bare-coexist-204-{run}-1-checkpoint-production-s{ordinal}"
+    b.require(n["schema"]==schema and n["attempt"]==1 and n["run"]==run
+              and n["ordinal"]==ordinal and n["producer_sha"]==head and n["parent_sha"]==parent_sha
+              and n["key"]==key and n["status"]=="candidate"
+              and all(b.sha(n[k]) for k in ("sha256","sealed_sha","proof_sha","identity","parent_identity","recipient_fpr"))
+              and n["sha256"]!=parent_sha and type(n["bytes"]) is int and 0<n["bytes"]<=b.CAP
+              and n["bytes"]<n["sealed_bytes"]<=n["bytes"]+16*1024**2, "Invalid normal outcome")
+    return new
+
+
+def decrypt_checkpoint(work, n, age_identity_path, cipher, dest, *, run, ordinal, head, parent_sha, claim_id):
+    """Open an exact owner-wrapped CMS after independent verification of its source and outer bytes."""
+    new = check_candidate(n,run=run,ordinal=ordinal,head=head,parent_sha=parent_sha)
+    b.require(cipher.stat().st_size==n['sealed_bytes'] and b.digest(cipher)==n['sealed_sha'],
+              'Sealed content length or SHA differs')
+    expected,encrypted=checked(n["owner_recovery"],n,RECIPIENT,claim_id,n["recipient_fpr"])
+    private=subprocess.run(["age","-d","-i",str(age_identity_path)],input=encrypted,stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE,timeout=20,check=True).stdout
+    row=json.loads(private)
+    b.require(all(row.get(k)==v for k,v in expected.items()),"Decrypted wrapper belongs to another generation")
+    for name,field in (("key.pem","private"),("public.pem","cert")):
+        raw=row[field].encode("ascii")
+        b.require(0<len(raw)<8192,"Invalid recovery key length")
+        fd=os.open(work/name,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+        with os.fdopen(fd,"wb") as f:f.write(raw)
+    b.require(b.fingerprint(work/"public.pem")==n["recipient_fpr"],"Certificate differs from original recipient")
+    candidate=work/"verified.tar.zst"
+    original=b.ROOT
+    try:
+        b.ROOT=work
+        frames.receive(cipher,candidate,n["bytes"],n["sha256"])
+    finally:b.ROOT=original
+    if new:
+        sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"preflight209"))
+        from checkpoint209 import check_archive
+        check_archive(candidate,n)
+    else:
+        verify_payload(candidate,n)
+    candidate.chmod(0o600)
+    try:
+        os.link(candidate,dest)
+    except FileExistsError:
+        st = dest.lstat()
+        b.require(stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid() and not st.st_mode & 0o077
+                  and b.digest(dest)==n["sha256"],
+                  "Recovery destination contains a different object")
+    return n["sha256"]
+
+
 def open_saved(zip_path, service_receipt, age_identity_path, dest, *, artifact_id, run, ordinal, head, parent_sha, claim_id):
     check_saved_origin(service_receipt,artifact_id,run,ordinal,head,parent_sha,claim_id)
     zst=zip_path.lstat()
@@ -211,54 +263,17 @@ def open_saved(zip_path, service_receipt, age_identity_path, dest, *, artifact_i
         meta=z.getinfo("outcome.json")
         b.require(0<meta.file_size<=65536,"Unbounded outcome receipt")
         outcome=json.loads(z.read(meta))
-        n=outcome
-        new = os.environ.get("BARE_GENERATION") == "2.0.9"
-        schema = "bare-personal-209-checkpoint-v1" if new else "bare-r28-checkpoint-private-v1"
-        key = f"bare-personal-209-{run}-1-checkpoint-s{ordinal}" if new else f"bare-coexist-204-{run}-1-checkpoint-production-s{ordinal}"
-        b.require(n["schema"]==schema and n["attempt"]==1 and n["run"]==run
-                  and n["ordinal"]==ordinal and n["producer_sha"]==head and n["parent_sha"]==parent_sha
-                  and n["key"]==key and n["status"]=="candidate"
-                  and all(b.sha(n[k]) for k in ("sha256","sealed_sha","proof_sha","identity","parent_identity","recipient_fpr"))
-                  and n["sha256"]!=parent_sha and type(n["bytes"]) is int and 0<n["bytes"]<=b.CAP
-                  and n["bytes"]<n["sealed_bytes"]<=n["bytes"]+16*1024**2, "Invalid normal outcome")
-        expected,encrypted=checked(n["owner_recovery"],n,RECIPIENT,claim_id,n["recipient_fpr"])
-        private=subprocess.run(["age","-d","-i",str(age_identity_path)],input=encrypted,stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE,timeout=20,check=True).stdout
-        row=json.loads(private)
-        b.require(all(row.get(k)==v for k,v in expected.items()),"Decrypted wrapper belongs to another generation")
-        for name,field in (("key.pem","private"),("public.pem","cert")):
-            raw=row[field].encode("ascii")
-            b.require(0<len(raw)<8192,"Invalid recovery key length")
-            fd=os.open(work/name,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
-            with os.fdopen(fd,"wb") as f:f.write(raw)
-        b.require(b.fingerprint(work/"public.pem")==n["recipient_fpr"],"Certificate differs from original recipient")
+        check_candidate(outcome,run=run,ordinal=ordinal,head=head,parent_sha=parent_sha)
         ct=z.getinfo("checkpoint.cms")
-        b.require(ct.file_size==n["sealed_bytes"],"Wrong sealed content length")
+        b.require(0<ct.file_size<=b.CAP+16*1024**2 and ct.file_size==outcome["sealed_bytes"],
+                  "Wrong sealed content length")
         cipher=work/"checkpoint.cms"
         with z.open(ct) as src,cipher.open("xb") as target:
             shutil.copyfileobj(src,target,length=1024**2)
-        b.require(b.digest(cipher)==n["sealed_sha"],"Sealed content SHA differs")
-        candidate=work/"verified.tar.zst"
-        original=b.ROOT
-        try:
-            b.ROOT=work
-            frames.receive(cipher,candidate,n["bytes"],n["sha256"])
-        finally:b.ROOT=original
-        if new:
-            sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"preflight209"))
-            from checkpoint209 import check_archive
-            check_archive(candidate,n)
-        else:
-            verify_payload(candidate,n)
-        try:
-            os.link(candidate,dest)
-        except FileExistsError:
-            st = dest.lstat()
-            b.require(stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid() and not st.st_mode & 0o077
-                      and b.digest(dest)==n["sha256"],
-                      "Recovery destination contains a different object")
-        print(f"verified_owner_checkpoint artifact_id={artifact_id} sha256={n['sha256']} bytes={n['bytes']}")
-        return n["sha256"]
+        digest=decrypt_checkpoint(work,outcome,age_identity_path,cipher,dest,run=run,ordinal=ordinal,head=head,
+                                  parent_sha=parent_sha,claim_id=claim_id)
+        print(f"verified_owner_checkpoint artifact_id={artifact_id} sha256={digest} bytes={outcome['bytes']}")
+        return digest
 
 
 if __name__=="__main__":

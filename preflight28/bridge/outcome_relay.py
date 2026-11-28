@@ -118,7 +118,21 @@ def resolve(round_no, sdk, returned_id, returned_digest, *, api, sleep, clock):
 def plan():
     try:
         record,size=payload()
-        n.capacity()
+        try:
+            n.capacity()
+        except (n.storage.IncompleteArtifactInventory, n.RelayCapacityExceeded) as error:
+            if not n.R209:
+                raise
+            # Only this pre-upload decision may select the other transport.
+            # Never change transports after even one ambiguous Artifact PUT.
+            n.b.require(not (n.ROOT/"first-upload.json").exists(), "An Artifact upload was already prepared")
+            original = settled(n.stem()+"-outcome",size,"","",api=n.b.api_json,sleep=time.sleep,clock=time.time)
+            if original:
+                return {"decision":"present","id":str(original["id"]),"digest":original["digest"],
+                        "expires_at":original["expires_at"]}
+            n.time_left(deadline(), 0, "checkpoint buffer admission")
+            print("Using the independently admitted checkpoint buffer:", type(error).__name__, flush=True)
+            return {"decision":"packets"}
         # Even a zero-byte-status relay needs a checked first admission. A repo-wide
         # capacity listing cannot establish canonical absence for this run and name.
         existing = settled(n.stem()+"-outcome",size,"","",api=n.b.api_json,sleep=time.sleep,clock=time.time,absence_samples=1)
