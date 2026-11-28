@@ -1,324 +1,227 @@
-name: Bare Personal 2.0.9 ARM64
-run-name: Bare Personal 2.0.9 ARM64 build
-'on':
-  workflow_dispatch:
-    inputs:
-      mode:
-        type: choice
-        description: Create the personal ARM64 APK
-        options:
-        - build-apk
-        default: build-apk
-      ticket_id:
-        type: string
-        description: Immutable owner ticket asset ID or lookup by verified digest
-        required: true
-      ticket_sha:
-        type: string
-        description: Owner ticket SHA-256
-        required: true
-      resume:
-        type: string
-        description: Empty for cold build, or a verified prior 2.0.9 recovery selector
-        required: false
+name: Bare private Draft compatibility check
+run-name: Read the existing Bare owner Draft
+on: workflow_dispatch
 permissions: {}
-concurrency:
-  group: bare-personal-209-production
-  cancel-in-progress: false
 jobs:
-  admit:
-    name: Verify new generation and bind owner registration
+  verify:
+    if: github.repository == 'Areal-U/bare-runner-disk-probe' && github.ref == 'refs/heads/bare-209-private-draft-check-20261128' && github.run_attempt == '1'
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    permissions:
-      contents: write
-      actions: read
+    timeout-minutes: 5
     env:
       BARE_GENERATION: 2.0.9
-      R28_HEAD_SHA: ${{ github.sha }}
-    outputs:
-      ordinal: ${{ steps.source.outputs.ordinal }}
-      parent: ${{ steps.source.outputs.parent }}
-      parent_identity: ${{ steps.source.outputs.parent_identity }}
-      origin: ${{ steps.source.outputs.origin }}
-      manifest: ${{ steps.source.outputs.manifest }}
-      manifest_sha: ${{ steps.source.outputs.manifest_sha }}
-      genesis: ${{ steps.source.outputs.genesis }}
+      R209_DRAFT_ALIAS_SHA: 2790fdb38a07380c623f48a20730426ec3eb4f0c71d465cdae58112236bc1a55
+    permissions:
+      contents: read
+      actions: read
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       with:
-        ref: ${{ github.sha }}
+        ref: '888cb5b20d3470131a1d77f9a08b7010e09a4110'
+        path: prior
         persist-credentials: false
-    - name: Stage pinned private transfer client
-      run: python3 preflight28/transport/prepare.py tools
-    - name: Select fresh source or independently re-read approved private predecessor
-      id: source
-      env:
-        GH_TOKEN: ${{ github.token }}
-        R209_RESUME: ${{ inputs.resume }}
-      run: python3 preflight209/campaign.py start
-    - name: Bind the independently registered private destination
-      env:
-        GH_TOKEN: ${{ github.token }}
-        TICKET: ${{ inputs.ticket_id }}
-        TICKET_SHA: ${{ inputs.ticket_sha }}
-        R209_GENESIS: ${{ steps.source.outputs.genesis }}
-      run: python3 preflight209/owner.py bind --ticket-id "$TICKET" --ticket-sha "$TICKET_SHA" --genesis "$R209_GENESIS"
-  slot01:
-    needs: admit
-    permissions:
-      contents: write
-      actions: read
-    uses: ./.github/workflows/bare-personal209-slot.yml
-    with:
-      ticket_id: ${{ inputs.ticket_id }}
-      ticket_sha: ${{ inputs.ticket_sha }}
-      genesis: ${{ needs.admit.outputs.genesis }}
-      ordinal: ${{ needs.admit.outputs.ordinal }}
-      parent: ${{ needs.admit.outputs.parent }}
-      parent_identity: ${{ needs.admit.outputs.parent_identity }}
-      origin: ${{ needs.admit.outputs.origin }}
-      manifest: ${{ needs.admit.outputs.manifest }}
-      manifest_sha: ${{ needs.admit.outputs.manifest_sha }}
-  slot02:
-    needs:
-    - admit
-    - slot01
-    if: ${{ needs.slot01.outputs.kind == 'checkpoint' }}
-    permissions:
-      contents: write
-      actions: read
-    uses: ./.github/workflows/bare-personal209-slot.yml
-    with:
-      ticket_id: ${{ inputs.ticket_id }}
-      ticket_sha: ${{ inputs.ticket_sha }}
-      genesis: ${{ needs.admit.outputs.genesis }}
-      ordinal: ${{ needs.slot01.outputs.next_slot }}
-      parent: ${{ needs.slot01.outputs.parent }}
-      parent_identity: ${{ needs.slot01.outputs.parent_identity }}
-      origin: ''
-      manifest: ${{ needs.slot01.outputs.manifest }}
-      manifest_sha: ${{ needs.slot01.outputs.manifest_sha }}
-  slot03:
-    needs:
-    - admit
-    - slot02
-    if: ${{ needs.slot02.outputs.kind == 'checkpoint' }}
-    permissions:
-      contents: write
-      actions: read
-    uses: ./.github/workflows/bare-personal209-slot.yml
-    with:
-      ticket_id: ${{ inputs.ticket_id }}
-      ticket_sha: ${{ inputs.ticket_sha }}
-      genesis: ${{ needs.admit.outputs.genesis }}
-      ordinal: ${{ needs.slot02.outputs.next_slot }}
-      parent: ${{ needs.slot02.outputs.parent }}
-      parent_identity: ${{ needs.slot02.outputs.parent_identity }}
-      origin: ''
-      manifest: ${{ needs.slot02.outputs.manifest }}
-      manifest_sha: ${{ needs.slot02.outputs.manifest_sha }}
-  slot04:
-    needs:
-    - admit
-    - slot03
-    if: ${{ needs.slot03.outputs.kind == 'checkpoint' }}
-    permissions:
-      contents: write
-      actions: read
-    uses: ./.github/workflows/bare-personal209-slot.yml
-    with:
-      ticket_id: ${{ inputs.ticket_id }}
-      ticket_sha: ${{ inputs.ticket_sha }}
-      genesis: ${{ needs.admit.outputs.genesis }}
-      ordinal: ${{ needs.slot03.outputs.next_slot }}
-      parent: ${{ needs.slot03.outputs.parent }}
-      parent_identity: ${{ needs.slot03.outputs.parent_identity }}
-      origin: ''
-      manifest: ${{ needs.slot03.outputs.manifest }}
-      manifest_sha: ${{ needs.slot03.outputs.manifest_sha }}
-  slot05:
-    needs:
-    - admit
-    - slot04
-    if: ${{ needs.slot04.outputs.kind == 'checkpoint' }}
-    permissions:
-      contents: write
-      actions: read
-    uses: ./.github/workflows/bare-personal209-slot.yml
-    with:
-      ticket_id: ${{ inputs.ticket_id }}
-      ticket_sha: ${{ inputs.ticket_sha }}
-      genesis: ${{ needs.admit.outputs.genesis }}
-      ordinal: ${{ needs.slot04.outputs.next_slot }}
-      parent: ${{ needs.slot04.outputs.parent }}
-      parent_identity: ${{ needs.slot04.outputs.parent_identity }}
-      origin: ''
-      manifest: ${{ needs.slot04.outputs.manifest }}
-      manifest_sha: ${{ needs.slot04.outputs.manifest_sha }}
-  slot06:
-    needs:
-    - admit
-    - slot05
-    if: ${{ needs.slot05.outputs.kind == 'checkpoint' }}
-    permissions:
-      contents: write
-      actions: read
-    uses: ./.github/workflows/bare-personal209-slot.yml
-    with:
-      ticket_id: ${{ inputs.ticket_id }}
-      ticket_sha: ${{ inputs.ticket_sha }}
-      genesis: ${{ needs.admit.outputs.genesis }}
-      ordinal: ${{ needs.slot05.outputs.next_slot }}
-      parent: ${{ needs.slot05.outputs.parent }}
-      parent_identity: ${{ needs.slot05.outputs.parent_identity }}
-      origin: ''
-      manifest: ${{ needs.slot05.outputs.manifest }}
-      manifest_sha: ${{ needs.slot05.outputs.manifest_sha }}
-  slot07:
-    needs:
-    - admit
-    - slot06
-    if: ${{ needs.slot06.outputs.kind == 'checkpoint' }}
-    permissions:
-      contents: write
-      actions: read
-    uses: ./.github/workflows/bare-personal209-slot.yml
-    with:
-      ticket_id: ${{ inputs.ticket_id }}
-      ticket_sha: ${{ inputs.ticket_sha }}
-      genesis: ${{ needs.admit.outputs.genesis }}
-      ordinal: ${{ needs.slot06.outputs.next_slot }}
-      parent: ${{ needs.slot06.outputs.parent }}
-      parent_identity: ${{ needs.slot06.outputs.parent_identity }}
-      origin: ''
-      manifest: ${{ needs.slot06.outputs.manifest }}
-      manifest_sha: ${{ needs.slot06.outputs.manifest_sha }}
-  slot08:
-    needs:
-    - admit
-    - slot07
-    if: ${{ needs.slot07.outputs.kind == 'checkpoint' }}
-    permissions:
-      contents: write
-      actions: read
-    uses: ./.github/workflows/bare-personal209-slot.yml
-    with:
-      ticket_id: ${{ inputs.ticket_id }}
-      ticket_sha: ${{ inputs.ticket_sha }}
-      genesis: ${{ needs.admit.outputs.genesis }}
-      ordinal: ${{ needs.slot07.outputs.next_slot }}
-      parent: ${{ needs.slot07.outputs.parent }}
-      parent_identity: ${{ needs.slot07.outputs.parent_identity }}
-      origin: ''
-      manifest: ${{ needs.slot07.outputs.manifest }}
-      manifest_sha: ${{ needs.slot07.outputs.manifest_sha }}
-  slot09:
-    needs:
-    - admit
-    - slot08
-    if: ${{ needs.slot08.outputs.kind == 'checkpoint' }}
-    permissions:
-      contents: write
-      actions: read
-    uses: ./.github/workflows/bare-personal209-slot.yml
-    with:
-      ticket_id: ${{ inputs.ticket_id }}
-      ticket_sha: ${{ inputs.ticket_sha }}
-      genesis: ${{ needs.admit.outputs.genesis }}
-      ordinal: ${{ needs.slot08.outputs.next_slot }}
-      parent: ${{ needs.slot08.outputs.parent }}
-      parent_identity: ${{ needs.slot08.outputs.parent_identity }}
-      origin: ''
-      manifest: ${{ needs.slot08.outputs.manifest }}
-      manifest_sha: ${{ needs.slot08.outputs.manifest_sha }}
-  slot10:
-    needs:
-    - admit
-    - slot09
-    if: ${{ needs.slot09.outputs.kind == 'checkpoint' }}
-    permissions:
-      contents: write
-      actions: read
-    uses: ./.github/workflows/bare-personal209-slot.yml
-    with:
-      ticket_id: ${{ inputs.ticket_id }}
-      ticket_sha: ${{ inputs.ticket_sha }}
-      genesis: ${{ needs.admit.outputs.genesis }}
-      ordinal: ${{ needs.slot09.outputs.next_slot }}
-      parent: ${{ needs.slot09.outputs.parent }}
-      parent_identity: ${{ needs.slot09.outputs.parent_identity }}
-      origin: ''
-      manifest: ${{ needs.slot09.outputs.manifest }}
-      manifest_sha: ${{ needs.slot09.outputs.manifest_sha }}
-  slot11:
-    needs:
-    - admit
-    - slot10
-    if: ${{ needs.slot10.outputs.kind == 'checkpoint' }}
-    permissions:
-      contents: write
-      actions: read
-    uses: ./.github/workflows/bare-personal209-slot.yml
-    with:
-      ticket_id: ${{ inputs.ticket_id }}
-      ticket_sha: ${{ inputs.ticket_sha }}
-      genesis: ${{ needs.admit.outputs.genesis }}
-      ordinal: ${{ needs.slot10.outputs.next_slot }}
-      parent: ${{ needs.slot10.outputs.parent }}
-      parent_identity: ${{ needs.slot10.outputs.parent_identity }}
-      origin: ''
-      manifest: ${{ needs.slot10.outputs.manifest }}
-      manifest_sha: ${{ needs.slot10.outputs.manifest_sha }}
-  slot12:
-    needs:
-    - admit
-    - slot11
-    if: ${{ needs.slot11.outputs.kind == 'checkpoint' }}
-    permissions:
-      contents: write
-      actions: read
-    uses: ./.github/workflows/bare-personal209-slot.yml
-    with:
-      ticket_id: ${{ inputs.ticket_id }}
-      ticket_sha: ${{ inputs.ticket_sha }}
-      genesis: ${{ needs.admit.outputs.genesis }}
-      ordinal: ${{ needs.slot11.outputs.next_slot }}
-      parent: ${{ needs.slot11.outputs.parent }}
-      parent_identity: ${{ needs.slot11.outputs.parent_identity }}
-      origin: ''
-      manifest: ${{ needs.slot11.outputs.manifest }}
-      manifest_sha: ${{ needs.slot11.outputs.manifest_sha }}
-  result:
-    name: Check terminal certificate
-    needs:
-    - admit
-    - slot01
-    - slot02
-    - slot03
-    - slot04
-    - slot05
-    - slot06
-    - slot07
-    - slot08
-    - slot09
-    - slot10
-    - slot11
-    - slot12
-    if: ${{ always() }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 4
-    permissions: {}
-    steps:
-    - name: Require one recovered encrypted terminal and no failed slot
-      env:
-        SLOTS: ${{ toJSON(needs) }}
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: 'dc91d054c06cfa2c722db51e19db14616120d7f8'
+        path: fixed
+        persist-credentials: false
+    - name: Stage verified transfer helpers from both immutable commits
       run: |
-        python3 - <<'PYTHON'
-        import json, os
-        j=json.loads(os.environ['SLOTS'])
-        finished=[i['outputs'].get('artifact') for i in j.values() if i['result']=='success' and i['outputs'].get('kind')=='apk']
-        if any(i['result'] not in ('success','skipped') for i in j.values()) or len(finished)!=1 or not finished[0].isdigit():
-            raise SystemExit('No unique fully received APK. Retain the latest immutable checkpoint and diagnostic receipts.')
-        print('Encrypted terminal artifact for independent owner signing:',finished[0])
-        PYTHON
+        set -euo pipefail
+        umask 077
+        [ "$(git -C prior rev-parse HEAD)" = '888cb5b20d3470131a1d77f9a08b7010e09a4110' ]
+        [ "$(git -C fixed rev-parse HEAD)" = 'dc91d054c06cfa2c722db51e19db14616120d7f8' ]
+        [ "$(git -C fixed rev-parse 'HEAD^{tree}')" = '957099393e951b250cc1a2cdc5906aea170f39c8' ]
+        for side in prior fixed; do
+          mkdir "$RUNNER_TEMP/$side"
+          (cd "$side"; RUNNER_TEMP="$RUNNER_TEMP/$side" GITHUB_WORKSPACE="$PWD" python3 preflight28/transport/prepare.py tools >/dev/null)
+        done
+        cat >"$RUNNER_TEMP/check.py" <<'PY'
+        """Read-only service replay of the exact owner-admission failure; emit only stage labels."""
+        import hashlib
+        import json
+        import os
+        import re
+        from pathlib import Path
+        import sys
+        from urllib.parse import urlsplit
+
+        OLD_HEAD = "888cb5b20d3470131a1d77f9a08b7010e09a4110"
+        FAILED_RUN = 46088654643
+        # Independent observation after registration, outside the Actions execution.
+        OWNER_ALIAS_V7 = "2790fdb38a07380c623f48a20730426ec3eb4f0c71d465cdae58112236bc1a55"
+        # SHA256("v7\\n" + SHA256(exact ticket bytes) + "\\n" + SHA256(exact ACK bytes) + "\\n").
+        OWNER_PAIR_V7 = "ec3a89fb4c22389dc3b506790f68604c7c6bb8cc724c2beaf92e32d83012d1fd"
+        STAGE = "initialize"
+
+
+        def check(value):
+            if not value:
+                raise ValueError("Diagnostic assertion")
+
+
+        class ClaimBoundary(Exception):
+            """The verified production claim reached the network boundary; no POST is sent."""
+
+
+        def verify(mode, checkout, stage):
+            global STAGE
+            checkout = Path(checkout).resolve()
+            sys.path[:0] = [str(Path(stage).resolve()), str(checkout / "preflight209")]
+            import transfer
+            import owner
+            import r28_verified_draft as anchor
+
+            actual_request = transfer.request
+            expected_body = None
+            expected_path = None
+
+            def get(host, method, path, **kwargs):
+                if method == "POST":
+                    check(STAGE == "read_only_admission" and expected_body is not None and
+                          host == transfer.UPLOAD and path == expected_path and kwargs == {
+                              "auth": True, "body": expected_body, "length": len(expected_body),
+                              "content_type": "application/json"})
+                    raise ClaimBoundary()
+                check(method == "GET" and host in {transfer.API, *transfer.CDNS} and
+                      not kwargs.get("body") and not kwargs.get("length") and
+                      (host == transfer.API or not kwargs.get("auth")))
+                return actual_request(host, method, path, **kwargs)
+
+            transfer.request = get
+            actual_download = transfer.download
+            seen = set()
+
+            def small(asset_id, length, sha, sink):
+                check(type(length) is int and 0 < length <= 16384)
+                actual_download(asset_id, length, sha, sink)
+                seen.add((asset_id, length, sha))
+
+            transfer.download = small
+            STAGE = "release_metadata"
+            release = transfer.metadata(f"{transfer.BASE}/releases/{transfer.RELEASE_ID}")
+            check(release["id"] == transfer.RELEASE_ID and release["draft"] is True and
+                  release["published_at"] is None and transfer.is_owner(release["author"]))
+            alias = urlsplit(release["html_url"]).path.rsplit("/", 1)[-1]
+            alias_hash = hashlib.sha256(alias.encode()).hexdigest()
+            STAGE = "independent_observation"
+            check(alias_hash == OWNER_ALIAS_V7 and os.environ.get("R209_DRAFT_ALIAS_SHA") == OWNER_ALIAS_V7 and
+                  os.environ.get("BARE_GENERATION") == "2.0.9")
+
+            def rejection(message):
+                try:
+                    transfer.draft(transfer.RELEASE_ID)
+                except ValueError as exc:
+                    check(str(exc) == message)
+                else:
+                    raise AssertionError("Expected the exact compatibility rejection")
+
+            if mode == "negative":
+                STAGE = "reproduce_old_alias_rejection"
+                check(not anchor.is_observed_rotation(alias_hash) and alias_hash != transfer.DRAFT_TAG_SHA256)
+                rejection("Rotated owner Draft alias did not match its immutable receipts")
+                return
+            check(mode == "positive")
+            STAGE = "reject_wrong_digest"
+            os.environ["R209_DRAFT_ALIAS_SHA"] = "0" * 64
+            try:
+                rejection("Owner Draft permalink differs from the registered dispatch digest")
+            finally:
+                os.environ["R209_DRAFT_ALIAS_SHA"] = OWNER_ALIAS_V7
+
+            STAGE = "fixed_paged_release"
+            api = owner.PagedOwnerDraft(transfer)
+            draft = api.draft(transfer.RELEASE_ID)
+            check(draft["html_url"] == release["html_url"] and
+                  all((aid, size, sha) in seen for _, aid, size, sha in anchor.CLAIMS))
+            STAGE = "failed_production_attempt"
+            run = api.metadata(f"{api.BASE}/actions/runs/{FAILED_RUN}/attempts/1")
+            check(run["id"] == FAILED_RUN and run["run_attempt"] == 1 and run["head_sha"] == OLD_HEAD and
+                  run["event"] == "workflow_dispatch" and run["path"] == owner.WORKFLOW and
+                  run["head_branch"] == owner.BRANCH and run["status"] == "completed" and run["conclusion"] == "failure" and
+                  run["repository"]["id"] == run["head_repository"]["id"] == owner.REPO_ID and owner.owner_account(run["actor"]))
+            STAGE = "owner_ticket_and_ack"
+            parent = owner.cold.SELECTOR["origin_run"]
+            name = f"{owner.CAMPAIGN}-{OLD_HEAD}-after-{parent}-ticket.json"
+            row, = [a for a in draft["assets"] if a["name"] == name]
+            check(row["digest"].startswith("sha256:"))
+            ticket_sha = row["digest"][7:]
+            cutoff = owner.instant(run["created_at"])
+            ticket_id, ticket = owner.doc(api, draft, name, row["id"], ticket_sha, cutoff)
+            ack_sha = ticket["collector_ack_sha"]
+            ack_id, ack = owner.doc(api, draft, f'{owner.CAMPAIGN}-ack-{ticket["registration_nonce"]}.json',
+                                    ticket["collector_ack_asset_id"], ack_sha, cutoff)
+            check(hashlib.sha256(f"v7\n{ticket_sha}\n{ack_sha}\n".encode("ascii")).hexdigest() == OWNER_PAIR_V7)
+
+            STAGE = "prepare_claim_boundary"
+            genesis = hashlib.sha256((checkout / "preflight209" / "upstream-lock.json").read_bytes()).hexdigest()
+            expected_body = owner.encode({
+                "schema": 1, "campaign": owner.CAMPAIGN, "repository_id": owner.REPO_ID, "workflow": owner.WORKFLOW,
+                "branch": owner.BRANCH, "head": OLD_HEAD, "genesis": genesis, "release_id": transfer.RELEASE_ID,
+                "origin_run": FAILED_RUN, "producer_attempt": 1, "ticket_asset_id": ticket_id, "ticket_sha": ticket_sha,
+                "collector_ack_asset_id": ack_id, "collector_ack_sha": ack_sha,
+                "collector_registration_id": ticket["collector_registration_id"],
+                "destination_commitment": owner.DESTINATION_HASH, "recipient": owner.RECIPIENT,
+                "resume": owner.cold.SELECTOR, "prior_claim_asset_id": ack["precompile_origin"]["claim_asset_id"]})
+            expected_path = f"{api.BASE}/releases/{transfer.RELEASE_ID}/assets?name={owner.CAMPAIGN}-after-{parent}-claim.json"
+            # The immutable claim belongs to the authenticated historical producer. Only its real
+            # actor, head, ref and known dispatch inputs are replayed for the physical owner ticket.
+            env = dict(os.environ, GITHUB_REF="refs/heads/" + run["head_branch"], GITHUB_SHA=run["head_sha"],
+                       GITHUB_RUN_ID=str(FAILED_RUN), GITHUB_RUN_ATTEMPT=str(run["run_attempt"]), GITHUB_EVENT_NAME=run["event"])
+            event = {"repository": run["repository"], "sender": run["actor"],
+                     "inputs": {"mode": "build-apk", "resume": json.dumps(owner.cold.SELECTOR),
+                                "ticket_id": "lookup", "ticket_sha": ticket_sha, "owner_alias_sha": OWNER_ALIAS_V7}}
+            # Storage must inspect this actual, currently running CI job, including all current
+            # competing run states, real capacity, permissions, and current grant/retention times.
+            live_admission = owner.storage.admit
+            real_run = os.environ["GITHUB_RUN_ID"]
+            check(real_run.isdecimal() and int(real_run) > 0 and int(real_run) != FAILED_RUN)
+            live_calls = []
+            def live_storage(get_metadata, config, *args, **kwargs):
+                check(config["GITHUB_RUN_ID"] == str(FAILED_RUN))
+                result = live_admission(get_metadata, {**config, "GITHUB_RUN_ID": real_run}, *args, **kwargs)
+                live_calls.append(kwargs["stage"])
+                return result
+
+            owner.storage.admit = live_storage
+            STAGE = "read_only_admission"
+            try:
+                owner.bind(api, env, event, "lookup", ticket_sha, genesis)
+            except ClaimBoundary:
+                check(live_calls == ["lease"])
+            else:
+                raise AssertionError("A claim already exists or admission did not reach the protected write boundary")
+
+
+        if __name__ == "__main__":
+            try:
+                verify(*sys.argv[1:])
+            except Exception as error:
+                code = str(error)
+                if STAGE == "release_metadata" and code in ("GitHub metadata GET returned 403",
+                                                            "GitHub metadata GET returned 404"):
+                    print(f"GET-only diagnostic: physical draft HTTP {code[-3:]} (visibility unconfirmed).", file=sys.stderr)
+                else:
+                    # Expose only known descriptions, never the service body, destination, nonce or URLs.
+                    reason = next((label for text, label in (
+                        ("inventory", "incomplete inventory"), ("Another run", "competing execution"),
+                        ("coverage is too short", "owner coverage"), ("policy expired", "storage grant"),
+                        ("storage ceiling", "storage ceiling"), ("different generation", "generation binding"),
+                        ("permalink differs", "owner digest"), ("Original claim", "origin claim"),
+                        ("Missing or duplicate owner document", "owner document selection"))
+                        if text.lower() in code.lower()), "")
+                    status = re.fullmatch(r"(GitHub metadata GET|Asset retrieval) returned ([1-5][0-9]{2})", code)
+                    if status:
+                        reason = f"{status[1]} HTTP {status[2]}"
+                    print("GET-only diagnostic failed at " + STAGE + (" (" + reason + ")" if reason else ""), file=sys.stderr)
+                sys.exit(1)
+        PY
+    - name: Compare prior rejection and fixed admission against real service bytes
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        umask 077
+        python3 -I "$RUNNER_TEMP/check.py" negative prior "$RUNNER_TEMP/prior" >/dev/null
+        echo 'Previous production version rejected the actual release alias.'
+        python3 -I "$RUNNER_TEMP/check.py" positive fixed "$RUNNER_TEMP/fixed" >/dev/null
+        echo 'Fixed client rejected the wrong owner digest and accepted the independent observation. Both original receipts and the registered historical admission reached the protected claim boundary.'
