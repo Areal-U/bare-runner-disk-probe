@@ -14,7 +14,7 @@ import precompile_cold as cold
 from test_owner import Service
 
 
-FIXED = json.loads((Path(__file__).with_name('testdata') / 'precompile-45996971462.json').read_text())
+FIXED = json.loads(Path(__file__).with_name('precompile-45996971462.json').read_text())
 
 
 class ServiceWithOrigin(Service):
@@ -42,6 +42,7 @@ class ServiceWithOrigin(Service):
                      collector_registration_id=self.ack['collector_registration_id'],
                      recipient=owner.RECIPIENT, destination_commitment=owner.sha(owner.encode(self.dest)))
         self.put(self.origin_claim, owner.CLAIM, owner.encode(prior), '2026-11-27T12:15:00Z')
+        self.assets[-1]['uploader'] = {'login':'github-actions[bot]', 'id':41898282}
         self.proof = dict(claim_asset_id=self.origin_claim, claim_sha256=owner.sha(self.bytes[self.origin_claim]),
                           ledger_sha256=cold.CLOSED_LEDGER_SHA256, ledger_state='closed-no-apk',
                           intermediate_outcome_pickup=True)
@@ -75,6 +76,10 @@ class PrecompileCold(unittest.TestCase):
         self.event = dict(sender=owner.OWNER, repository={'id':owner.REPO_ID},
                           inputs=dict(mode='build-apk', resume=json.dumps(cold.SELECTOR)))
         self.enterContext(patch.object(owner, 'DESTINATION_HASH', owner.sha(owner.encode(self.s.dest))))
+        # Private production references are not test fixtures. Bind the
+        # synthetic pair independently, as the closed owner ledger does.
+        self.enterContext(patch.object(cold, 'ORIGIN_CLAIM_COMMITMENT',
+                                       cold.claim_commitment(self.s.origin_claim, self.s.proof['claim_sha256'])))
         self.now = owner.instant(self.s.run['created_at']) + timedelta(seconds=20)
 
     def bind(self, *, lease=False):
@@ -112,6 +117,10 @@ class PrecompileCold(unittest.TestCase):
             (self.s.old, {'head_sha':self.s.run['head_sha']}), (self.s.old, {'run_attempt':2}),
             (self.s.old, {'conclusion':'success'}), (self.s.jobs, {'total_count':17}),
             (worker, {'id':171}), (compile_step, {'conclusion':'success'}),
+            (next(a for a in self.s.assets if a['id'] == self.s.origin_claim),
+             {'uploader': {'login':'github-actions[bot]', 'id':17}}),
+            (next(a for a in self.s.assets if a['id'] == self.s.ack_id),
+             {'uploader': {'login':'github-actions[bot]', 'id':41898282}}),
             (self.s.prior_artifacts[0], {'digest':'sha256:' + '0'*64}),
             (self.s.negative_cache, {'total_count':1})):
             with self.subTest(fields=fields), patch.dict(obj, fields), self.assertRaises(ValueError):
@@ -146,6 +155,24 @@ class PrecompileCold(unittest.TestCase):
         self.s.deposit()
         with self.assertRaises(ValueError):
             self.bind()
+
+    def test_matching_replacement_claim_in_release_and_both_documents(self):
+        for change_id, change_bytes in ((True, False), (False, True), (True, True)):
+            with self.subTest(change_id=change_id, change_bytes=change_bytes):
+                self.s = ServiceWithOrigin()
+                original = next(a for a in self.s.assets if a['id'] == self.s.origin_claim)
+                body = self.s.bytes.pop(self.s.origin_claim)
+                new_id = self.s.origin_claim + int(change_id)
+                if change_bytes:
+                    body += b' '
+                original.update(id=new_id, size=len(body), digest='sha256:' + owner.sha(body))
+                self.s.bytes[new_id] = body
+                for doc in (self.s.ticket, self.s.ack):
+                    doc['precompile_origin'].update(claim_asset_id=new_id, claim_sha256=owner.sha(body))
+                self.s.deposit()
+                with self.assertRaisesRegex(ValueError, 'original claim'):
+                    self.bind()
+                self.assertEqual(self.s.posts, 0)
 
     def test_fixed_selector(self):
         for bad in ('null','[]','{"kind":"precompile-cold","origin_run":6}',

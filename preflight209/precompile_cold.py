@@ -1,4 +1,5 @@
 """Permit one cold successor of the physically verified, pre-compile 2.0.9 failure."""
+import hashlib
 import json
 import re
 from urllib.parse import urlencode
@@ -10,6 +11,7 @@ HEAD = 'a17316eecfdc92f77db46e5f48604e65ad41508c'
 # The independently retrieved, closed owner ledger for this physical attempt.
 # Its private contents and destination identifiers are retained by its owner.
 CLOSED_LEDGER_SHA256 = 'c6d070a24ba8c187e90498b9bedf308de517671a37a4f5a0713937df07c36dd3'
+ORIGIN_CLAIM_COMMITMENT = '982821680b01820702b9032c822ae0865bfe452239d47643b4b0ad25fa297d04'
 SELECTOR = {'kind': 'precompile-cold', 'origin_run': RUN}
 PUBLISHER = 140499020591
 WORKER = 140499020631
@@ -106,12 +108,19 @@ def unavailable_outputs(api, release, now, branch, storage, instant):
             'Prior run has a sealed cache or an incomplete cache inventory')
 
 
+def claim_commitment(asset_id, digest):
+    require(type(asset_id) is int and asset_id > 0 and isinstance(digest, str)
+            and re.fullmatch('[0-9a-f]{64}', digest), 'Invalid original claim physical reference')
+    return hashlib.sha256(f'{asset_id}:{digest}'.encode('ascii')).hexdigest()
+
+
 def owner_proof(ticket, ack, claim_id, claim_sha):
     proof = ack.get('precompile_origin')
     require(isinstance(proof, dict) and ticket.get('precompile_origin') == proof
             and set(proof) == {'claim_asset_id', 'claim_sha256', 'ledger_sha256', 'ledger_state',
                                'intermediate_outcome_pickup'}
             and proof['claim_asset_id'] == claim_id and proof['claim_sha256'] == claim_sha
+            and claim_commitment(claim_id, claim_sha) == ORIGIN_CLAIM_COMMITMENT
             and proof['ledger_state'] == 'closed-no-apk' and proof['intermediate_outcome_pickup'] is True
             and proof['ledger_sha256'] == CLOSED_LEDGER_SHA256,
             'Independent closure, original claim or intermediate pickup coverage missing')

@@ -5,7 +5,7 @@ export LC_ALL=C
 snapshot=https://snapshot.ubuntu.com/ubuntu/20261112T093000Z
 apt_helper=/usr/lib/apt/apt-helper
 transport=(-o Acquire::https::CAInfo=/tmp/bare-ci-apt-ca.pem -o Acquire::https::AllowRedirect=false
-           -o Acquire::http::AllowRedirect=false -o Acquire::Retries=0 -o Acquire::https::Timeout=30)
+           -o Acquire::http::AllowRedirect=false -o Acquire::Retries=1 -o Acquire::https::Timeout=40)
 
 die() { echo "Bare bootstrap: $*" >&2; exit 1; }
 
@@ -28,10 +28,12 @@ fetch_one() {
     fi
     local -a urls=("https://archive.ubuntu.com/ubuntu/$path"
                    "https://security.ubuntu.com/ubuntu/$path" "$snapshot/$path")
-    if [[ "$path $package $version $arch $size $sha" == \
-        "pool/main/e/expat/libexpat1_2.4.7-1ubuntu0.9_amd64.deb libexpat1 2.4.7-1ubuntu0.9 amd64 96926 0ee31596316d2275ab351d11290c63e7547fff0ecd7f431e56855cb7c5f18588" ]]; then
-        urls+=("https://launchpadlibrarian.net/877865687/libexpat1_2.4.7-1ubuntu0.9_amd64.deb")
-    fi
+    case "$path $package $version $arch $size $sha" in
+        "pool/main/e/expat/libexpat1_2.4.7-1ubuntu0.9_amd64.deb libexpat1 2.4.7-1ubuntu0.9 amd64 96926 0ee31596316d2275ab351d11290c63e7547fff0ecd7f431e56855cb7c5f18588")
+            urls+=("https://launchpadlibrarian.net/877865687/${path##*/}");;
+        "pool/main/libs/libssh/libssh-4_0.9.6-2ubuntu0.22.04.8_amd64.deb libssh-4 0.9.6-2ubuntu0.22.04.8 amd64 188616 ebeff6b7c3777c5ae0a2fd4200c3a946f3e866d102d7c56d46c997af8ebc2138")
+            urls+=("https://launchpadlibrarian.net/874600094/${path##*/}");;
+    esac
     for url in "${urls[@]}"; do
         tmp=$(mktemp -d "$cache/partial/bare.XXXXXXXX")
         if "$apt_helper" "${transport[@]}" download-file "$url" "$tmp/item.deb"; then

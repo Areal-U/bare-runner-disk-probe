@@ -51,14 +51,19 @@ def pick(receipt, fields):
     return {k: receipt[k] for k in fields}
 
 
-def doc(api, release, name, aid, digest, created):
+def doc(api, release, name, aid, digest, created, *, producer_claim=False):
     require((aid == 'lookup' or (type(aid) is int and aid > 0)) and isinstance(digest, str) and
             re.fullmatch('[0-9a-f]{64}', digest), 'Invalid immutable owner document selector or digest')
     rows = [a for a in release['assets'] if a['name'] == name]
     require(len(rows) == 1, 'Missing or duplicate owner document')
     row = rows[0]
+    # The binder writes the origin claim with GITHUB_TOKEN. Owner-authored
+    # tickets and ACKs use the independent personal identity.
+    uploader = row['uploader']
+    from_ci = producer_claim and name == CLAIM and (uploader.get('login'), uploader.get('id')) == (
+        'github-actions[bot]', 41898282)
     require(type(row['id']) is int and row['id'] > 0 and (aid == 'lookup' or aid == row['id']) and type(row['size']) is int and 0 < row['size'] <= 16 * 1024 and
-            owner_account(row['uploader']) and instant(row['created_at']) <= created,
+            (owner_account(uploader) or from_ci) and instant(row['created_at']) <= created,
             'Wrong owner document, source or timing')
     aid = row['id']  # Resolved service ID is persisted in the immutable claim, including name+digest selection.
     api.asset_info(release, name, row['size'], digest, aid)
@@ -94,7 +99,8 @@ def cold_parent(api, release, ticket, ack, genesis, head, now, created, *, verif
     rows = [row for row in release['assets'] if row['name'] == CLAIM]
     require(len(rows) == 1 and re.fullmatch('sha256:[0-9a-f]{64}', rows[0]['digest']), 'Missing original claim')
     claim_sha = rows[0]['digest'][7:]
-    claim_id, claim = doc(api, release, CLAIM, rows[0]['id'], claim_sha, instant(prior['updated_at']))
+    claim_id, claim = doc(api, release, CLAIM, rows[0]['id'], claim_sha, instant(prior['updated_at']),
+                          producer_claim=True)
     original = dict(schema=1, campaign=CAMPAIGN, repository_id=REPO_ID, release_id=RELEASE_ID, branch=BRANCH,
                     workflow=WORKFLOW, head=cold.HEAD, genesis=genesis, producer_attempt=1, origin_run=cold.RUN,
                     recipient=RECIPIENT, destination_commitment=DESTINATION_HASH)
