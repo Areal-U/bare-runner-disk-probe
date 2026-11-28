@@ -198,8 +198,10 @@ def tree(path):
             'scan_seconds': time.monotonic() - wall, 'scan_cpu_seconds': time.thread_time() - cpu}
 
 
-def pressure(sample, fs, terminal):
-    byte_margin = min(OUT_CAP - sample['estimate'], fs['free_bytes'] - FLOOR)
+def pressure(sample, fs, terminal, floor=FLOOR):
+    if floor < FLOOR:
+        raise ValueError('Production disk floor cannot be lowered')
+    byte_margin = min(OUT_CAP - sample['estimate'], fs['free_bytes'] - floor)
     inode_margin = min(ENTRY_CAP - sample['entries'], fs['free_inodes'] - INODE_FLOOR)
     if byte_margin <= STOP_MARGIN or inode_margin <= STOP_ENTRIES:
         return 'stop', 5
