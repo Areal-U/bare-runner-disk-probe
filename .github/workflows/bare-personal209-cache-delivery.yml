@@ -2,6 +2,9 @@ name: Receive original sealed APK cache in the owner's Draft
 'on':
   workflow_call:
     inputs:
+      owner_alias_sha:
+        type: string
+        required: true
       ticket_id:
         required: true
         type: string
@@ -53,6 +56,7 @@ jobs:
       actions: read
     env:
       BARE_GENERATION: 2.0.9
+      R209_DRAFT_ALIAS_SHA: ${{ inputs.owner_alias_sha }}
       R28_SLOT: ${{ inputs.ordinal }}
       R28_PARENT_SHA: ${{ inputs.parent }}
       CLAIM: ${{ inputs.claim }}

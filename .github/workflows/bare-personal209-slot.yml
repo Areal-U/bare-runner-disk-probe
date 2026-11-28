@@ -20,6 +20,9 @@ name: Bare Personal 2.0.9 physical interval
       manifest_sha:
         type: string
         required: true
+      owner_alias_sha:
+        type: string
+        required: true
       ticket_id:
         type: string
         required: true
@@ -47,6 +50,7 @@ name: Bare Personal 2.0.9 physical interval
 permissions: {}
 env:
   BARE_GENERATION: 2.0.9
+  R209_DRAFT_ALIAS_SHA: ${{ inputs.owner_alias_sha }}
   R28_HEAD_SHA: ${{ github.sha }}
   R28_SLOT: ${{ inputs.ordinal }}
   R28_PARENT_SHA: ${{ inputs.parent }}
@@ -528,6 +532,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/bare-personal209-cache-delivery.yml
     with:
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
       ticket_id: ${{ inputs.ticket_id }}
       ticket_sha: ${{ inputs.ticket_sha }}
       genesis: ${{ inputs.genesis }}
