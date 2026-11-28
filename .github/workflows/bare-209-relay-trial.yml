@@ -52,35 +52,48 @@ jobs:
       manifest_sha: ''
   restore-trial:
     needs: [fixture, trial]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
     permissions:
       contents: write
-      actions: read
-    env:
-      R209_RELAY_TRIAL: 'true'
-      BARE_GENERATION: 2.0.9
-      R28_HEAD_SHA: ${{ github.sha }}
-      R209_GENESIS: ${{ needs.fixture.outputs.genesis }}
-      R28_PARENT_SHA: ${{ needs.fixture.outputs.genesis }}
-      R28_PARENT_IDENTITY: ${{ needs.fixture.outputs.genesis }}
-      R28_SLOT: '1'
-      R209_DRAFT_ALIAS_SHA: ${{ inputs.owner_alias_sha }}
+      actions: write
+    uses: ./.github/workflows/bare-personal209-slot.yml
+    with:
+      relay_trial: true
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
+      ticket_id: ''
+      ticket_sha: ''
+      genesis: ${{ needs.fixture.outputs.genesis }}
+      ordinal: '2'
+      parent: ${{ needs.trial.outputs.parent }}
+      parent_identity: ${{ needs.trial.outputs.parent_identity }}
+      origin: ''
+      manifest: ${{ needs.trial.outputs.manifest }}
+      manifest_sha: ${{ needs.trial.outputs.manifest_sha }}
+  verify:
+    needs: [trial, restore-trial]
+    if: ${{ !cancelled() }}
+    permissions: {}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
     steps:
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      with:
-        ref: ${{ github.sha }}
-        persist-credentials: false
-    - name: Open the original private Draft client and restore the exact certified bytes
+    - name: Require the original certificate and separate read-only restore certificate
       env:
-        GH_TOKEN: ${{ github.token }}
-        KIND: ${{ needs.trial.outputs.kind }}
-        MANIFEST: ${{ needs.trial.outputs.manifest }}
-        MANIFEST_SHA: ${{ needs.trial.outputs.manifest_sha }}
-        PARENT: ${{ needs.trial.outputs.parent }}
+        SENT: ${{ needs.trial.result }}
+        RESTORED: ${{ needs.restore-trial.result }}
+        FIRST: ${{ needs.trial.outputs.kind }}
+        NEXT: ${{ needs.restore-trial.outputs.kind }}
+        MID: ${{ needs.trial.outputs.manifest }}
+        CONFIRMED_MID: ${{ needs.restore-trial.outputs.manifest }}
+        SHA: ${{ needs.trial.outputs.manifest_sha }}
+        CONFIRMED_SHA: ${{ needs.restore-trial.outputs.manifest_sha }}
+        ARCHIVE: ${{ needs.trial.outputs.parent }}
+        CONFIRMED_ARCHIVE: ${{ needs.restore-trial.outputs.parent }}
         IDENTITY: ${{ needs.trial.outputs.parent_identity }}
+        CONFIRMED_IDENTITY: ${{ needs.restore-trial.outputs.parent_identity }}
       run: |
         set -euo pipefail
-        test "$KIND" = checkpoint
-        python3 preflight28/transport/prepare.py tools
-        python3 preflight209/relay_trial.py restore
+        [[ $SENT == success && $RESTORED == success && $FIRST == checkpoint && $NEXT == trial-restored ]]
+        [[ $MID =~ ^[1-9][0-9]*$ && $MID == "$CONFIRMED_MID" ]]
+        [[ $SHA =~ ^[0-9a-f]{64}$ && $SHA == "$CONFIRMED_SHA" ]]
+        [[ $ARCHIVE =~ ^[0-9a-f]{64}$ && $ARCHIVE == "$CONFIRMED_ARCHIVE" ]]
+        [[ $IDENTITY =~ ^[0-9a-f]{64}$ && $IDENTITY == "$CONFIRMED_IDENTITY" ]]
+        echo "R209_PRIVATE_RELAY_TRIAL_VERIFIED head=$GITHUB_SHA run=$GITHUB_RUN_ID manifest=$MID sha=$SHA archive=$ARCHIVE identity=$IDENTITY"

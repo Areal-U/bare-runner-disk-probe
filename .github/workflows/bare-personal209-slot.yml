@@ -103,7 +103,7 @@ jobs:
   compile-probe:
     needs: lease
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ inputs.relay_trial && 37 || 350 }}
+    timeout-minutes: ${{ inputs.relay_trial && 50 || 350 }}
     env:
       R28_COLLECTION_CLAIM: ${{ needs.lease.outputs.claim }}
       R28_STORAGE_CEILING: ${{ needs.lease.outputs.storage_ceiling }}
@@ -115,8 +115,12 @@ jobs:
       contents: read
       actions: read
     outputs:
+      trial_manifest: ${{ steps.worker.outputs.trial_manifest }}
+      trial_manifest_sha: ${{ steps.worker.outputs.trial_manifest_sha }}
+      trial_sha: ${{ steps.worker.outputs.trial_sha }}
+      trial_identity: ${{ steps.worker.outputs.trial_identity }}
       kind: ${{ steps.worker.outputs.kind }}
-      terminal: ${{ steps.terminal_1.outputs.artifact_id || steps.terminal_2.outputs.artifact_id }}
+      terminal: ${{ steps.terminal_1.outputs.artifact_id || steps.terminal_2.outputs.artifact_id || steps.terminal_final.outputs.artifact_id }}
       cache_key: ${{ steps.cache_pre.outputs.cache_key }}
       seal_sha: ${{ steps.cache_pre.outputs.seal_sha }}
       cipher_sha: ${{ steps.cache_pre.outputs.cipher_sha }}
@@ -224,9 +228,11 @@ jobs:
         TRIAL_READ_TOKEN: ${{ inputs.relay_trial && github.token || '' }}
         R209_SENDER_UNTIL: ${{ steps.peer_acquire.outputs.sender_outcome_deadline }}
         R209_FALLBACK_SECONDS: ${{ steps.packet_preflight.outputs.fallback_seconds }}
+        R209_COMPILE_DISK_FLOOR: ${{ steps.packet_preflight.outputs.compile_disk_floor }}
       run: |
         if [[ "$R209_RELAY_TRIAL" == true ]]; then
-          GH_TOKEN="$TRIAL_READ_TOKEN" python3 preflight209/relay_trial.py candidate
+          if [[ "$R28_SLOT" == 1 ]]; then trial_op=candidate; else trial_op=restore; fi
+          GH_TOKEN="$TRIAL_READ_TOKEN" python3 preflight209/relay_trial.py "$trial_op"
         else
           bash preflight209/worker.sh
         fi
@@ -298,6 +304,7 @@ jobs:
       continue-on-error: true
     - name: Preserve sealed bytes after failed terminal delivery, within the live free cache ceiling
       id: cache_pre
+      continue-on-error: true
       env:
         GH_TOKEN: ${{ github.token }}
       if: ${{ !cancelled() && steps.worker.outputs.kind == 'apk' && !steps.terminal_1.outputs.artifact_id && !steps.terminal_2.outputs.artifact_id
@@ -312,34 +319,44 @@ jobs:
       with:
         path: .r209-owner-cache
         key: ${{ steps.cache_pre.outputs.cache_key }}
+    - name: Reconcile original APK after fallback preservation
+      id: terminal_final
+      continue-on-error: true
+      if: ${{ !cancelled() && steps.worker.outputs.kind == 'apk' && !steps.terminal_1.outputs.artifact_id && !steps.terminal_2.outputs.artifact_id }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+        R209_FIRST_UPLOAD: ${{ format('{0},{1},{2},{3}', steps.terminal_gate.outcome, steps.sealed.outcome, steps.terminal_1.outputs.decision, steps.sealed.outputs.artifact-id) }}
+        R209_RETRY_UPLOAD: ${{ format('{0},{1},{2},{3}', steps.terminal_retry_gate.outcome, steps.sealed_retry.outcome, steps.terminal_2.outputs.decision, steps.sealed_retry.outputs.artifact-id) }}
+      run: python3 preflight209/terminal.py resolve-final "$RUNNER_TEMP/bare-official/exchange/slot209/owner"
     - name: Find the exact physical immutable cache after the save attempt
       id: cache_receipt
       env:
         GH_TOKEN: ${{ github.token }}
-        R209_PRIMARY_ABSENT: ${{ steps.terminal_1.outputs.decision == 'absent' && steps.terminal_2.outputs.decision == 'absent' }}
-      if: ${{ !cancelled() && (steps.cache_save.outcome == 'success' || steps.cache_save.outcome == 'failure') }}
+        R209_PRIMARY_ABSENT: ${{ steps.terminal_final.outputs.decision == 'absent' }}
+      if: ${{ !cancelled() && !steps.terminal_final.outputs.artifact_id && (steps.cache_save.outcome == 'success' || steps.cache_save.outcome == 'failure') }}
       run: python3 preflight209/terminal.py cache-receipt "$RUNNER_TEMP/bare-official/exchange/slot209/owner"
     - name: Publish a terminal or failed stop for the independent receiver
       id: peer_stop
       env:
         JOB_STATUS: ${{ job.status }}
         KIND: ${{ steps.worker.outputs.kind }}
-        TERMINAL: ${{ steps.terminal_1.outputs.artifact_id || steps.terminal_2.outputs.artifact_id || (steps.cache_receipt.outputs.terminal_status
+        TERMINAL: ${{ steps.terminal_1.outputs.artifact_id || steps.terminal_2.outputs.artifact_id || steps.terminal_final.outputs.artifact_id || (steps.cache_receipt.outputs.terminal_status
           == 'cache' && steps.cache_receipt.outputs.cache_id) }}
       if: ${{ always() && !cancelled() && steps.peer_acquire.outcome == 'success' && steps.worker.outputs.kind != 'checkpoint' }}
       run: |
         reason=failed
         if [[ $JOB_STATUS == success && $KIND == apk && -n $TERMINAL ]]; then reason=apk; fi
+        if [[ $JOB_STATUS == success && $KIND == trial-restored && $R209_RELAY_TRIAL == true && $R28_SLOT == 2 ]]; then reason=verify-only; fi
         python3 preflight28/bridge/normal.py stop --reason "$reason"
     - name: Measure retained relay bytes before uploading the sealed checkpoint
       id: peer_capacity
       if: ${{ always() && !cancelled() && (steps.peer_stop.outcome == 'success' || steps.worker.outputs.kind == 'checkpoint') }}
-      timeout-minutes: 3
+      timeout-minutes: 4
       env:
         GH_TOKEN: ${{ github.token }}
         R28_RELAY_BYTE_CEILING: ${{ vars.R28_RELAY_BYTE_CEILING }}
       run: |
-        if [[ "$R209_RELAY_TRIAL" == true ]]; then
+        if [[ "$R209_RELAY_TRIAL" == true && "$R28_SLOT" == 1 ]]; then
           python3 preflight209/relay_trial.py route
         else
           python3 preflight28/bridge/outcome_relay.py plan
@@ -411,7 +428,7 @@ jobs:
   draft-publisher:
     needs: lease
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ inputs.relay_trial && 37 || 350 }}
+    timeout-minutes: ${{ inputs.relay_trial && 50 || 350 }}
     env:
       R28_COLLECTION_CLAIM: ${{ needs.lease.outputs.claim }}
       R28_STORAGE_CEILING: ${{ needs.lease.outputs.storage_ceiling }}
@@ -549,6 +566,11 @@ jobs:
       env:
         WRITER_HEADROOM: ${{ needs.draft-publisher.outputs.checkpoint_can_resume }}
         HEADROOM: ${{ needs.compile-probe.outputs.headroom }}
+        TRIAL_MANIFEST: ${{ needs.compile-probe.outputs.trial_manifest }}
+        TRIAL_MANIFEST_SHA: ${{ needs.compile-probe.outputs.trial_manifest_sha }}
+        TRIAL_SHA: ${{ needs.compile-probe.outputs.trial_sha }}
+        TRIAL_IDENTITY: ${{ needs.compile-probe.outputs.trial_identity }}
+        TRIAL_READ_TOKEN: ${{ inputs.relay_trial && github.token || '' }}
         WORKER: ${{ needs.compile-probe.outputs.kind }}
         TERMINAL: ${{ needs.compile-probe.outputs.terminal }}
         PEER: ${{ needs.draft-publisher.outputs.peer_status }}
@@ -562,7 +584,11 @@ jobs:
         RECEIPT_SHA: ${{ needs.deliver-cached-apk.outputs.receipt_sha }}
         CIPHER_ID: ${{ needs.deliver-cached-apk.outputs.cipher_id }}
       run: |-
-        python3 preflight209/campaign.py certify
+        if [[ "$R209_RELAY_TRIAL" == true && "$R28_SLOT" == 2 ]]; then
+          GH_TOKEN="$TRIAL_READ_TOKEN" python3 preflight209/relay_trial.py certify
+        else
+          python3 preflight209/campaign.py certify
+        fi
         echo "next_slot=$(( R28_SLOT + 1 ))" >> "$GITHUB_OUTPUT"
     if: ${{ !cancelled() && needs.compile-probe.result == 'success' && needs.draft-publisher.result == 'success' && (needs.deliver-cached-apk.result
       == 'success' || needs.deliver-cached-apk.result == 'skipped') }}
