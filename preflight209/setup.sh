@@ -49,6 +49,7 @@ install -m 0644 "$RUNNER_TEMP"/verified-six/{*.deb,receipts.json,receive_six.py}
 python3 -I "$repo/preflight209/builder_environment.py" installer \
     "$RUNNER_TEMP/round26-pool-install.py" exchange/install-transaction.py
 install -m 0644 /etc/ssl/certs/ca-certificates.crt docker/bare-ci-apt-ca.pem
+install -m 0644 "$repo/preflight209/apt_bootstrap.sh" docker/bare-bootstrap.sh
 python3 -I "$repo/preflight209/builder_environment.py" dockerfile docker/Dockerfile docker/Dockerfile
 bash builder.sh build
 bash builder.sh start

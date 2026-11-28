@@ -32,11 +32,12 @@ def dockerfile(source):
     install = "RUN apt-get update " + "\\" + "\n    && apt-get install"
     bootstrap = (
         "RUN --mount=type=bind,source=bare-ci-apt-ca.pem,target=/tmp/bare-ci-apt-ca.pem "
+        "--mount=type=bind,source=bare-bootstrap.sh,target=/tmp/bare-bootstrap.sh "
         f"sed -Ei 's@http://(archive|security)\\.ubuntu\\.com/ubuntu/?@{SNAPSHOT}/@g' /etc/apt/sources.list"
         f" && grep -qF 'deb {SNAPSHOT}/ jammy-security ' /etc/apt/sources.list"
         f" && grep -qF 'deb {SNAPSHOT}/ jammy-updates ' /etc/apt/sources.list"
         f" && apt-get {options} -o APT::Update::Error-Mode=any update"
-        f" && apt-get {options} install"
+        " && /bin/bash /tmp/bare-bootstrap.sh"
     )
     return replace_once(source, install, bootstrap)
 

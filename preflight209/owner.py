@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'preflight28' / part) for part in ('control', 'bridge')]
 from admission import PagedOwnerDraft, RELEASE_ID, REPO, REPO_ID, admit, encode, require
 import storage_admission as storage
+import precompile_cold as cold
 
 BRANCH = 'bare-coexist-v2.0.9'
 WORKFLOW = '.github/workflows/bare-checkpoint-transfer.yml'
@@ -78,16 +79,46 @@ def validate_identity(env, event, run, head):
 
 
 def resume_input(event):
-    value = event['inputs'].get('resume')
-    if value in (None, ''):
-        return None
-    record = json.loads(value)
-    require(isinstance(record, dict) and set(record) == {'origin_run', 'ordinal', 'manifest_id', 'manifest_sha'},
-            'Incomplete continuation reference')
-    require(all(type(record[k]) is int and record[k] > 0 for k in ('origin_run', 'ordinal', 'manifest_id')) and
-            record['ordinal'] <= 98 and bool(re.fullmatch('[0-9a-f]{64}', record['manifest_sha'])),
-            'Invalid continuation identity or ordinal')
-    return record
+    return cold.parse_selector(event['inputs'].get('resume'))
+
+
+def cold_parent(api, release, ticket, ack, genesis, head, now, created, *, verify_only):
+    prior = api.metadata(f'{api.BASE}/actions/runs/{cold.RUN}')
+    require(prior['id'] == cold.RUN and prior['run_attempt'] == 1 and
+            prior['head_sha'] == cold.HEAD and head != cold.HEAD and prior['head_branch'] == BRANCH and
+            prior['path'] == WORKFLOW and prior['event'] == 'workflow_dispatch' and
+            prior['repository']['id'] == prior['head_repository']['id'] == REPO_ID and owner_account(prior['actor']) and
+            prior['status'] == 'completed' and prior['conclusion'] == 'failure' and
+            instant(prior['updated_at']) <= instant(ack['observed_at']) <= created,
+            'Origin is not the final precompile failure or owner acknowledgement predates closure')
+    rows = [row for row in release['assets'] if row['name'] == CLAIM]
+    require(len(rows) == 1 and re.fullmatch('sha256:[0-9a-f]{64}', rows[0]['digest']), 'Missing original claim')
+    claim_sha = rows[0]['digest'][7:]
+    claim_id, claim = doc(api, release, CLAIM, rows[0]['id'], claim_sha, instant(prior['updated_at']))
+    original = dict(schema=1, campaign=CAMPAIGN, repository_id=REPO_ID, release_id=RELEASE_ID, branch=BRANCH,
+                    workflow=WORKFLOW, head=cold.HEAD, genesis=genesis, producer_attempt=1, origin_run=cold.RUN,
+                    recipient=RECIPIENT, destination_commitment=DESTINATION_HASH)
+    require(all(claim.get(key) == value for key, value in original.items()) and 'resume' not in claim,
+            'Original claim does not bind the initial run and genesis')
+    cold.owner_proof(ticket, ack, claim_id, claim_sha)
+    cutoff = instant(prior['created_at'])
+    _, old_ticket = doc(api, release, f'{CAMPAIGN}-{cold.HEAD}-ticket.json', claim['ticket_asset_id'],
+                        claim['ticket_sha'], cutoff)
+    nonce = old_ticket['registration_nonce']
+    _, old_ack = doc(api, release, f'{CAMPAIGN}-ack-{nonce}.json', claim['collector_ack_asset_id'],
+                     claim['collector_ack_sha'], cutoff)
+    require(nonce == old_ack['registration_nonce'] != ticket['registration_nonce'] and
+            old_ticket['collector_registration_id'] == old_ack['collector_registration_id'] ==
+            claim['collector_registration_id'] != ticket['collector_registration_id'] and
+            old_ticket['collector_ack_sha'] == claim['collector_ack_sha'] and
+            old_ticket['head'] == old_ack['head'] == cold.HEAD and
+            old_ticket['genesis'] == old_ack['genesis'] == genesis and
+            old_ticket['resume'] is None and old_ack['resume'] is None and
+            old_ticket['destinations'] == old_ack['destinations'] == ticket['destinations'],
+            'Independent successor must preserve the original destination and use a fresh finite registration')
+    if not verify_only:
+        cold.unavailable_outputs(api, release, now, BRANCH, storage, instant)
+    return claim_id
 
 
 def parent_run(api, release, resume, head, genesis, now_run, created):
@@ -217,7 +248,11 @@ def bind(api, env, event, ticket_id, ticket_sha, genesis, *, verify_only=False, 
     name = CLAIM
     if resume:
         holder['resume'] = resume
-        holder['prior_claim_asset_id'] = parent_run(api, release, resume, head, genesis, rid, created)
+        if resume == cold.SELECTOR:
+            holder['prior_claim_asset_id'] = cold_parent(api, release, ticket, ack, genesis, head, clock(), created,
+                                                       verify_only=verify_only)
+        else:
+            holder['prior_claim_asset_id'] = parent_run(api, release, resume, head, genesis, rid, created)
         name = f"{CAMPAIGN}{suffix}-claim.json"
     window()
     claim = admit('recover' if verify_only else 'compute', holder, api, name=name, before_write=window)
