@@ -168,6 +168,7 @@ class Admission(unittest.TestCase):
             log=testtime+' R209_PRIVATE_TERMINAL '+json.dumps(out)+'\n';(d/'recovery.log').write_text(log)
             rows=[dict(id=r['id'],name=r['name'],size=r['bytes'],digest='sha256:'+r['sha256'],state='uploaded') for r in (a,b,c)]
             rel=dict(id=owner.RELEASE_ID,draft=True,url=f'https://api.github.com/repos/{owner.REPO}/releases/{owner.RELEASE_ID}',assets=rows)
+            rel.update(tag_name="untagged-"+"a"*20,html_url=f"https://github.com/{owner.REPO}/releases/tag/untagged-"+"a"*20)
             save('release.json',rel); save('assets.json',rows); save('private.json',{})
             args=context(inputs=d,ledger=d/'private.json',ticket=d/'private.json',out=d/'pickup')
             with patch.object(qc,'route',return_value=dict(owner_destination_id='test')):
@@ -175,9 +176,16 @@ class Admission(unittest.TestCase):
                 self.assertEqual(result['schema'],qc.DRAFT_SOURCE_SCHEMA)
                 self.assertNotIn('artifact_id',result)
                 self.assertEqual(qc.sha(args.out/qc.CIPHER),seal['sha'])
+                # This independent receiver binds the physical recovery job, fixed Release API ID,
+                # and all three downloaded terminal objects after a subsequent owner editor save.
+                fresh = "untagged-"+"b"*20
+                save('release.json',dict(rel,tag_name=fresh,html_url=f"https://github.com/{owner.REPO}/releases/tag/{fresh}"))
+                args.out=d/'rotated'
+                self.assertEqual(draft.take(args),result)
                 args.out=d/'fail'
-                for why in ('public','wrong-claim','failed-job','wrong-step-record','two-cipher-ids','incomplete-source','cipher-bytes'):
-                    save('release.json',dict(rel,draft=False) if why=='public' else rel)
+                for why in ('public','moved-release','wrong-claim','failed-job','wrong-step-record','two-cipher-ids','incomplete-source','cipher-bytes'):
+                    release = dict(rel,draft=False) if why=='public' else rel
+                    save('release.json',dict(release,url=release['url']+'/foreign') if why=='moved-release' else release)
                     save('recovery.json',dict(recover,conclusion='failure') if why=='failed-job' else recover)
                     (d/'recovery.log').write_text(log.replace('R209_PRIVATE_TERMINAL','ignored') if why=='wrong-step-record' else log)
                     args.claim=2 if why=='wrong-claim' else ctx['claim']
