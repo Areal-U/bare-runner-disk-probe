@@ -32,11 +32,12 @@ def dockerfile(source):
     install = "RUN apt-get update " + "\\" + "\n    && apt-get install"
     bootstrap = (
         "RUN --mount=type=bind,source=bare-ci-apt-ca.pem,target=/tmp/bare-ci-apt-ca.pem "
+        "--mount=type=bind,source=bare-bootstrap.sh,target=/tmp/bare-bootstrap.sh "
         f"sed -Ei 's@http://(archive|security)\\.ubuntu\\.com/ubuntu/?@{SNAPSHOT}/@g' /etc/apt/sources.list"
         f" && grep -qF 'deb {SNAPSHOT}/ jammy-security ' /etc/apt/sources.list"
         f" && grep -qF 'deb {SNAPSHOT}/ jammy-updates ' /etc/apt/sources.list"
         f" && apt-get {options} -o APT::Update::Error-Mode=any update"
-        f" && apt-get {options} install"
+        " && /bin/bash /tmp/bare-bootstrap.sh"
     )
     return replace_once(source, install, bootstrap)
 
@@ -51,10 +52,25 @@ def installer(source):
                           '    if not packages:\n'
                           '        fail("Empty Chromium dependency transaction")\n'
                           '    else:\n')
+    source = replace_once(source, 'def download(host, path, record, dest):',
+                          Path(__file__).with_name("apt_librarian.py").read_text()
+                          + '\n\ndef download(host, path, record, dest):')
+    source = replace_once(source, '            con.request("GET",url,',
+                          '            if host == "launchpadlibrarian.net":\n'
+                          '                url = librarian_path(path, record)\n'
+                          '                if url is None:\n'
+                          '                    fail("No immutable Ubuntu pin for " + path)\n'
+                          '            con.request("GET",url,')
+    source = replace_once(source,
+                          '    for host in ("archive.ubuntu.com", "security.ubuntu.com", "snapshot.ubuntu.com"):',
+                          '    hosts = ["archive.ubuntu.com", "security.ubuntu.com", "snapshot.ubuntu.com"]\n'
+                          '    if librarian_path(path, record) is not None:\n'
+                          '        hosts.append("launchpadlibrarian.net")\n'
+                          '    for host in hosts:')
     return replace_once(source, '    return records\n',
                         '    canonical = json.dumps(records, sort_keys=True, separators=(",", ":")).encode("ascii")\n'
                         '    actual = sha256(canonical).hexdigest()\n'
-                        f'    if actual != "{APT_PLAN_SHA}":\n'
+                        f'    if len(records) != 809 or actual != "{APT_PLAN_SHA}":\n'
                         '        fail(f"Different signed Chromium dependency transaction: {len(records)} records, SHA256 {actual}")\n'
                         '    return records\n')
 
