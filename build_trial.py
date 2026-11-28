@@ -574,7 +574,7 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
             return result
         if production:
             level, _ = guard['pressure']({'estimate': snapshot['archive_input_estimate_bytes'],
-                                          'entries': snapshot['entries']}, guard['disk'](source_root), False)
+                                          'entries': snapshot['entries']}, guard['disk'](source_root), False, min_free_bytes)
             if level == 'stop' or (deadline is not None and time.monotonic() >= deadline):
                 result['reason'] = 'preflight-resource-or-time'
                 return result
@@ -635,7 +635,7 @@ def run_trial(source_root, phase, result_path, log_path, seconds=180,
                         stats["min_free_bytes"] = min(fs["free_bytes"], stats["min_free_bytes"])
                         level, sample_seconds = guard['pressure'](
                             {'estimate': last_guard_sample['archive_input_estimate_bytes'],
-                             'entries': last_guard_sample['entries']}, fs, bool(progress.get('terminal_actions')))
+                             'entries': last_guard_sample['entries']}, fs, bool(progress.get('terminal_actions')), min_free_bytes)
                         if level == 'stop':
                             reason = 'disk-limit' if fs['free_bytes']-min_free_bytes <= guard['STOP_MARGIN'] or fs['free_inodes']-PRODUCTION_MIN_FREE_INODES <= guard['STOP_ENTRIES'] else 'output-limit'
                     sample_due = now - last_sample >= sample_seconds
