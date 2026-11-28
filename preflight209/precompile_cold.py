@@ -5,6 +5,7 @@ import re
 from urllib.parse import urlencode
 
 from checkpoint209 import require
+import unpublished_cold
 
 RUN = 45996971462
 HEAD = 'a17316eecfdc92f77db46e5f48604e65ad41508c'
@@ -38,7 +39,8 @@ def parse_selector(raw):
     value = json.loads(raw, object_pairs_hook=unique)
     require(isinstance(value, dict), 'Recovery selector must be an object')
     if 'kind' in value:
-        require(type(value.get('origin_run')) is int and value == SELECTOR, 'Wrong precompile-cold origin')
+        require(type(value.get('origin_run')) is int and value in (SELECTOR, unpublished_cold.SELECTOR),
+                'Wrong cold recovery selector or origin')
     else:
         require(set(value) == {'origin_run', 'ordinal', 'manifest_id', 'manifest_sha'}
                 and all(type(value[k]) is int and value[k] > 0 for k in ('origin_run', 'ordinal', 'manifest_id'))

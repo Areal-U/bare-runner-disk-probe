@@ -1,0 +1,216 @@
+{
+ "run": {
+  "id": 46092059335,
+  "head_sha": "6e3f7c7e38f07a1d2a012f0717318e5f45af68b9",
+  "run_attempt": 1,
+  "created_at": "2026-11-28T01:14:04Z",
+  "updated_at": "2026-11-28T05:36:29Z",
+  "path": ".github/workflows/bare-checkpoint-transfer.yml",
+  "head_branch": "bare-coexist-v2.0.9",
+  "event": "workflow_dispatch",
+  "status": "completed",
+  "conclusion": "failure"
+ },
+ "tree": "957099393e951b250cc1a2cdc5906aea170f39c8",
+ "jobs": [
+  {
+   "id": 140815007898,
+   "name": "Verify new generation and bind owner registration",
+   "conclusion": "success",
+   "steps": [
+    [1, "Set up job", "success"],
+    [2, "Run actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", "success"],
+    [3, "Stage pinned private transfer client", "success"],
+    [4, "Select fresh source or independently re-read approved private predecessor", "success"],
+    [5, "Bind the independently registered private destination", "success"],
+    [10, "Post Run actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", "success"],
+    [11, "Complete job", "success"]
+   ]
+  },
+  {
+   "id": 140815095471,
+   "name": "slot01 / Check owner lease, retention and free storage before interval",
+   "conclusion": "success",
+   "steps": [
+    [1, "Set up job", "success"],
+    [2, "Run actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", "success"],
+    [3, "Stage pinned transport code", "success"],
+    [4, "Verify current reservation and immutable claim", "success"],
+    [8, "Post Run actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", "success"],
+    [9, "Complete job", "success"]
+   ]
+  },
+  {
+   "id": 140815176633,
+   "name": "slot01 / Compile APK slot 1",
+   "conclusion": "success",
+   "steps": [
+    [1, "Set up job", "success"],
+    [2, "Run actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", "success"],
+    [3, "Recheck actual start against finite owner lease", "success"],
+    [4, "Establish actual job start", "success"],
+    [5, "Reserve the relay peak before acquiring a large peer artifact", "success"],
+    [6, "Stage the pinned standard uploader before compiling", "success"],
+    [7, "Bind peer artifacts to this run and logical slot", "success"],
+    [8, "Create an ephemeral ordinary transfer key", "success"],
+    [9, "Deposit key in this run", "success"],
+    [10, "Discover exact peer descriptor", "success"],
+    [11, "Fetch authenticated descriptor by immutable artifact ID", "success"],
+    [12, "Acquire the exact predecessor or cold genesis", "success"],
+    [13, "Prepare pinned Chromium, official patches, tools and Personal resources", "success"],
+    [14, "Compile on the reviewed normal entry and freeze its actual frontier", "success"],
+    [15, "Verify storage at terminal upload", "skipped"],
+    [16, "Publish owner-encrypted APK only", "skipped"],
+    [17, "Download exact encrypted artifact and compare all bytes", "skipped"],
+    [18, "Recheck admission for the same encrypted bytes", "skipped"],
+    [19, "Retry same encrypted upload once after a complete negative receipt", "skipped"],
+    [20, "Reconcile retry by immutable ID and encrypted content", "skipped"],
+    [21, "Preserve sealed bytes after failed terminal delivery, within the live free cache ceiling", "skipped"],
+    [22, "Save exact original ciphertext and seal for independent fallback", "skipped"],
+    [23, "Find the exact physical immutable cache after the save attempt", "skipped"],
+    [24, "Publish a terminal or failed stop for the independent receiver", "skipped"],
+    [25, "Measure retained relay bytes before uploading the sealed checkpoint", "success"],
+    [26, "Deposit outcome in this run", "skipped"],
+    [27, "Reconcile sealed outcome upload number 1", "skipped"],
+    [28, "Retry the same sealed files at the same immutable name once", "skipped"],
+    [29, "Reconcile sealed outcome upload number 2", "skipped"],
+    [30, "Record the final transfer decision for this slot", "success"],
+    [60, "Post Run actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", "success"],
+    [61, "Complete job", "success"]
+   ]
+  },
+  {
+   "id": 140815176684,
+   "name": "slot01 / Receive private checkpoint slot 1",
+   "conclusion": "success",
+   "steps": [
+    [1, "Set up job", "success"],
+    [2, "Run actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", "success"],
+    [3, "Recheck actual start against finite owner lease", "success"],
+    [4, "Reserve the relay peak before acquiring a large peer artifact", "success"],
+    [5, "Bind peer artifacts to this run and logical slot", "success"],
+    [6, "Stage the fixed owner-Draft interface", "success"],
+    [7, "Create an ephemeral limited transfer key", "success"],
+    [8, "Discover exact peer key", "success"],
+    [9, "Fetch authenticated key by immutable artifact ID", "success"],
+    [10, "Issue time-limited parent read descriptors bound to the peer", "success"],
+    [11, "Deposit descriptor in this run", "success"],
+    [12, "Discover exact peer outcome", "success"],
+    [13, "Fetch authenticated outcome by immutable artifact ID", "skipped"],
+    [14, "Receive bounded ciphertext and independently verify fixed private publication", "skipped"],
+    [28, "Post Run actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", "success"],
+    [29, "Complete job", "success"]
+   ]
+  },
+  {
+   "id": 140879443990,
+   "name": "slot01 / Recover original owner ciphertext from exact cache",
+   "conclusion": "skipped",
+   "steps": []
+  },
+  {
+   "id": 140880018405,
+   "name": "slot01 / Certify exact private result",
+   "conclusion": "failure",
+   "steps": [
+    [1, "Set up job", "success"],
+    [2, "Run actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", "success"],
+    [3, "Require ordinary and independent consumer evidence", "failure"],
+    [6, "Post Run actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", "success"],
+    [7, "Complete job", "success"]
+   ]
+  },
+  {
+   "id": 140880066534,
+   "name": "slot02",
+   "conclusion": "skipped",
+   "steps": []
+  },
+  {
+   "id": 140880066804,
+   "name": "slot03",
+   "conclusion": "skipped",
+   "steps": []
+  },
+  {
+   "id": 140880067341,
+   "name": "slot04",
+   "conclusion": "skipped",
+   "steps": []
+  },
+  {
+   "id": 140880067670,
+   "name": "slot06",
+   "conclusion": "skipped",
+   "steps": []
+  },
+  {
+   "id": 140880067712,
+   "name": "slot05",
+   "conclusion": "skipped",
+   "steps": []
+  },
+  {
+   "id": 140880067745,
+   "name": "slot07",
+   "conclusion": "skipped",
+   "steps": []
+  },
+  {
+   "id": 140880067802,
+   "name": "Check terminal certificate",
+   "conclusion": "failure",
+   "steps": [
+    [1, "Set up job", "success"],
+    [2, "Require one recovered encrypted terminal and no failed slot", "failure"],
+    [3, "Complete job", "success"]
+   ]
+  },
+  {
+   "id": 140880068008,
+   "name": "slot08",
+   "conclusion": "skipped",
+   "steps": []
+  },
+  {
+   "id": 140880068125,
+   "name": "slot11",
+   "conclusion": "skipped",
+   "steps": []
+  },
+  {
+   "id": 140880068532,
+   "name": "slot09",
+   "conclusion": "skipped",
+   "steps": []
+  },
+  {
+   "id": 140880068577,
+   "name": "slot10",
+   "conclusion": "skipped",
+   "steps": []
+  },
+  {
+   "id": 140880068729,
+   "name": "slot12",
+   "conclusion": "skipped",
+   "steps": []
+  }
+ ],
+ "artifacts": [
+  {
+   "id": 15241643121,
+   "name": "r209-46092059335-a1-s01-descriptor",
+   "size_in_bytes": 10196,
+   "digest": "sha256:54436a451dda706fa9a3bd1028e69a9d509f2b9ed6e847d2ce929c442ce925e9",
+   "expires_at": "2026-11-29T01:17:28Z"
+  },
+  {
+   "id": 15241179443,
+   "name": "r209-46092059335-a1-s01-key",
+   "size_in_bytes": 2285,
+   "digest": "sha256:fd6c911585635c6a5e811f65d73ac00c7c76b35f6a36eb5916a4a431e9ca8802",
+   "expires_at": "2026-11-29T01:16:47Z"
+  }
+ ]
+}

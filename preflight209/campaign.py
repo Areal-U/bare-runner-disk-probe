@@ -9,7 +9,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'preflight28/bridge'))
 import normal as n
 from checkpoint209 import digest, require, valid_hex
-from precompile_cold import SELECTOR as COLD_SUCCESSOR, parse_selector
+from precompile_cold import parse_selector
 
 def start():
     genesis = digest(Path(__file__).with_name('upstream-lock.json'))
@@ -21,7 +21,7 @@ def start():
     raw = os.environ.get('R209_RESUME','')
     first = dict(ordinal=1, parent=genesis, parent_identity=genesis, origin='', manifest='', manifest_sha='')
     v = parse_selector(raw)
-    if v and v != COLD_SUCCESSOR:
+    if v and 'kind' not in v:
         i = v['ordinal']
         os.environ.update(R28_PARENT_RUN=str(v['origin_run']), R28_SLOT=str(i+1))
         origin = n.parent_read_run()

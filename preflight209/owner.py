@@ -16,6 +16,7 @@ sys.path[:0] = [str(ROOT / 'preflight28' / part) for part in ('control', 'bridge
 from admission import PagedOwnerDraft, RELEASE_ID, REPO, REPO_ID, admit, encode, require
 import storage_admission as storage
 import precompile_cold as cold
+import unpublished_cold as unpublished
 
 BRANCH = 'bare-coexist-v2.0.9'
 WORKFLOW = '.github/workflows/bare-checkpoint-transfer.yml'
@@ -60,7 +61,8 @@ def doc(api, release, name, aid, digest, created, *, producer_claim=False):
     # The binder writes the origin claim with GITHUB_TOKEN. Owner-authored
     # tickets and ACKs use the independent personal identity.
     uploader = row['uploader']
-    from_ci = producer_claim and name == CLAIM and (uploader.get('login'), uploader.get('id')) == (
+    claim_names = (CLAIM, f'{CAMPAIGN}-after-{cold.RUN}-claim.json')
+    from_ci = producer_claim and name in claim_names and (uploader.get('login'), uploader.get('id')) == (
         'github-actions[bot]', 41898282)
     require(type(row['id']) is int and row['id'] > 0 and (aid == 'lookup' or aid == row['id']) and type(row['size']) is int and 0 < row['size'] <= 16 * 1024 and
             (owner_account(uploader) or from_ci) and instant(row['created_at']) <= created,
@@ -87,7 +89,7 @@ def resume_input(event):
     return cold.parse_selector(event['inputs'].get('resume'))
 
 
-def cold_parent(api, release, ticket, ack, genesis, head, now, created, *, verify_only):
+def cold_parent(api, release, ticket, ack, genesis, head, now, created, *, verify_only, newest_ticket=None):
     prior = api.metadata(f'{api.BASE}/actions/runs/{cold.RUN}')
     require(prior['id'] == cold.RUN and prior['run_attempt'] == 1 and
             prior['head_sha'] == cold.HEAD and head != cold.HEAD and prior['head_branch'] == BRANCH and
@@ -122,8 +124,58 @@ def cold_parent(api, release, ticket, ack, genesis, head, now, created, *, verif
             old_ticket['resume'] is None and old_ack['resume'] is None and
             old_ticket['destinations'] == old_ack['destinations'] == ticket['destinations'],
             'Independent successor must preserve the original destination and use a fresh finite registration')
+    if newest_ticket is not None:
+        require(nonce != newest_ticket['registration_nonce']
+                and old_ticket['collector_registration_id'] != newest_ticket['collector_registration_id'],
+                'Latest collector reuses the original closed registration')
     if not verify_only:
         cold.unavailable_outputs(api, release, now, BRANCH, storage, instant)
+    return claim_id
+
+
+def unpublished_parent(api, release, ticket, ack, genesis, head, now, created, *, verify_only):
+    prior = api.metadata(f'{api.BASE}/actions/runs/{unpublished.RUN}')
+    unpublished.check_run(prior, REPO_ID, owner_account)
+    closed = instant(prior['updated_at'])
+    require(head not in (cold.HEAD, unpublished.HEAD) and closed <= instant(ack['observed_at']) <= created,
+            'A reviewed replacement head and owner closure before dispatch are required')
+    proof = ack.get('unpublished_origin')
+    required_fields = {'claim_asset_id', 'claim_sha256', 'ledger_sha256', 'ledger_state',
+                       'intermediate_outcome_pickup'}
+    require(isinstance(proof, dict) and set(proof) == required_fields and proof == ticket.get('unpublished_origin')
+            and proof['ledger_state'] == 'closed-no-apk' and proof['intermediate_outcome_pickup'] is True
+            and proof['ledger_sha256'] == unpublished.CLOSED_LEDGER_SHA256
+            and cold.claim_commitment(proof['claim_asset_id'], proof['claim_sha256']) == unpublished.CLAIM_COMMITMENT,
+            'New receipts do not bind the actual closed ledger and unpublished origin claim')
+
+    name = f'{CAMPAIGN}-after-{cold.RUN}-claim.json'
+    claim_id, claim = doc(api, release, name, proof['claim_asset_id'], proof['claim_sha256'], closed,
+                          producer_claim=True)
+    expected = dict(schema=1, campaign=CAMPAIGN, repository_id=REPO_ID, release_id=RELEASE_ID, branch=BRANCH,
+                    workflow=WORKFLOW, head=unpublished.HEAD, genesis=genesis, producer_attempt=1,
+                    origin_run=unpublished.RUN, recipient=RECIPIENT, destination_commitment=DESTINATION_HASH,
+                    resume=cold.SELECTOR)
+    require(all(claim.get(k) == value for k, value in expected.items()), 'Unexpected prior checkpoint claim')
+    cutoff = instant(prior['created_at'])
+    _, old_ticket = doc(api, release, f'{CAMPAIGN}-{unpublished.HEAD}-after-{cold.RUN}-ticket.json',
+                          claim['ticket_asset_id'], claim['ticket_sha'], cutoff)
+    nonce = old_ticket['registration_nonce']
+    aid, old_ack = doc(api, release, f'{CAMPAIGN}-ack-{nonce}.json',
+                       claim['collector_ack_asset_id'], claim['collector_ack_sha'], cutoff)
+    validate_route(old_ticket, old_ack, head=unpublished.HEAD, genesis=genesis, created=cutoff, now=cutoff,
+                   resume=cold.SELECTOR)
+    require(old_ticket['collector_ack_asset_id'] in ('lookup', aid)
+            and old_ticket['collector_ack_sha'] == claim['collector_ack_sha']
+            and old_ticket['collector_registration_id'] == claim['collector_registration_id']
+            and old_ticket['destinations'] == ticket['destinations']
+            and old_ticket['registration_nonce'] != ticket['registration_nonce']
+            and old_ticket['collector_registration_id'] != ticket['collector_registration_id'],
+            'Unpublished origin had a different receipt chain, owner or reused registration')
+    original_id = cold_parent(api, release, old_ticket, old_ack, genesis, unpublished.HEAD, now, cutoff,
+                              verify_only=True, newest_ticket=ticket)
+    require(original_id == claim['prior_claim_asset_id'], 'Original genesis claim is not the exact ancestor')
+    if not verify_only:
+        unpublished.unavailable_outputs(api, release, now, BRANCH, storage, instant, REPO_ID)
     return claim_id
 
 
@@ -257,6 +309,9 @@ def bind(api, env, event, ticket_id, ticket_sha, genesis, *, verify_only=False, 
         if resume == cold.SELECTOR:
             holder['prior_claim_asset_id'] = cold_parent(api, release, ticket, ack, genesis, head, clock(), created,
                                                        verify_only=verify_only)
+        elif resume == unpublished.SELECTOR:
+            holder['prior_claim_asset_id'] = unpublished_parent(api, release, ticket, ack, genesis, head, clock(),
+                                                               created, verify_only=verify_only)
         else:
             holder['prior_claim_asset_id'] = parent_run(api, release, resume, head, genesis, rid, created)
         name = f"{CAMPAIGN}{suffix}-claim.json"
