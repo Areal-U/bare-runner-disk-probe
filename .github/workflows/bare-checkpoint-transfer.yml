@@ -41,6 +41,7 @@ jobs:
         python3 preflight28/transport/prepare.py tools >/dev/null
         cat >"$RUNNER_TEMP/current-preissue.py" <<'PYTHON'
         """Read the new production receipt and live inputs without creating a run claim."""
+        from ast import literal_eval
         from contextlib import redirect_stdout
         from datetime import datetime, timezone
         import hashlib
@@ -68,6 +69,79 @@ jobs:
 
         def now():
             return datetime.now(timezone.utc)
+
+
+        def evidence(label, **fields):
+            print(label + " " + json.dumps(fields, sort_keys=True), file=sys.stderr, flush=True)
+
+
+        def safe_failure(exc):
+            # Public constants only. Raw provider messages, unknown field names, URLs and values never leave this process.
+            message = str(exc)
+            for prefix, name in (
+                ("Incomplete repository Artifact inventory", "incomplete_artifact_views"),
+                ("Artifact inventory still settling between complete layouts", "unequal_complete_views"),
+                ("Complete Artifact layouts omit", "omitted_previously_observed_ids"),
+                ("Invalid Artifact pagination", "invalid_pagination"), ("Invalid Artifact ID", "invalid_asset_id"),
+                ("Invalid Artifact inventory", "invalid_inventory"), ("Invalid Artifact size", "invalid_artifact_fields"),
+                ("Artifact inventory deadline", "inventory_timeout"), ("Artifact inventory did not terminate", "page_limit"),
+                ("Artifact observation exceeds", "artifact_limit"), ("Another run ", "other_active_run"),
+                ("Active-run inventory recheck exceeded", "active_run_deadline"),
+                ("Active-run inventory recheck incomplete", "inconsistent_active_count"),
+                ("Active-run inventory rechecks differ", "active_states_changed"),
+                ("Another deadline is active", "concurrent_deadline"),
+                ("Candidate exceeds configured", "capacity_exceeded"), ("Storage policy expire", "policy_expiry"),
+                ("Insufficient private Release asset slots", "draft_slots_exhausted"),
+                ("Public non-fork", "runner_or_repository"), ("Unexpectedly large metadata", "metadata_size_limit")):
+                if message.startswith(prefix):
+                    details = {}
+                    if name == "other_active_run":
+                        matched = re.match(r"Another run ([0-9]+) in state=(in_progress|queued|waiting|pending|requested) ", message)
+                        if matched:
+                            details.update(run=int(matched[1]), state=matched[2])
+                    if name in ("incomplete_artifact_views", "inventory_timeout"):
+                        observed = re.search(r"([0-9]+) (?:distinct )?observed IDs", message)
+                        if observed:
+                            details["observed"] = int(observed[1])
+                    if name == "unequal_complete_views":
+                        for key in ("missing", "unbound additions"):
+                            group = re.search(re.escape(key) + r"=\[([0-9, ]*)\]", message)
+                            if group:
+                                details[key.replace(" ", "_")] = [int(i) for i in group[1].split(",") if i.strip()][:5]
+                    return dict(reason=name, **details)
+            changed = re.fullmatch(r"Artifact inventory still settling: ID ([0-9]+) changed metadata (\[.*?\]) at per_page=([0-9]+) page=([0-9]+)", message)
+            if changed:
+                fields = literal_eval(changed[2])
+                known = {"id", "node_id", "name", "size_in_bytes", "digest", "expired", "created_at", "updated_at",
+                         "expires_at", "url", "archive_download_url", "workflow_run"}
+                return dict(reason="artifact_metadata_changed", artifact_id=int(changed[1]), per_page=int(changed[3]),
+                            page=int(changed[4]), fields=sorted(known.intersection(fields)), other_fields=len(set(fields)-known))
+            status = re.fullmatch(r"(?:GitHub metadata GET|Asset retrieval) returned ([1-5][0-9]{2})", message)
+            if status:
+                return dict(reason="http_status", status=int(status[1]))
+            return {"reason": {ValueError: "local_verification", KeyError: "missing_response_field",
+                               TimeoutError: "timeout", IndexError: "missing_result"}.get(type(exc), "unclassified_failure")}
+
+
+        def print_storage_records(journal):
+            admission = []
+            for line in journal.getvalue().splitlines():
+                tag, _, text = line.partition(" ")
+                if tag not in ("R28_ARTIFACT_VIEW", "R28_ARTIFACT_ADMISSION"):
+                    continue
+                row = json.loads(text)
+                names = ("per_page", "pages", "first_total", "last_total", "unique", "last_page_rows", "complete") if tag.endswith("VIEW") else (
+                    "known_repository_bytes", "candidate_zip_ceiling_bytes", "concurrent_control_bytes", "peak_bytes",
+                    "ceiling_bytes", "expired_still_visible_bytes", "policy_until", "latest_retained_expiry_epoch")
+                summary = {k: row[k] for k in names if type(row.get(k)) in (int, bool)}
+                if tag.endswith("VIEW"):
+                    summary["duplicate_ids"] = [n for n in row.get("duplicates", []) if type(n) is int][:5]
+                    summary["count_changes"] = [pair for pair in row.get("count_changes", []) if
+                                                isinstance(pair, list) and len(pair) == 2 and all(type(x) is int for x in pair)][:5]
+                else:
+                    admission.append(summary)
+                evidence(tag, **summary)
+            return admission
 
 
         def preissue():
@@ -149,7 +223,9 @@ jobs:
             blocked_outputs = api.metadata(f"{api.BASE}/actions/runs/{BLOCKED}/artifacts?per_page=100&page=1")
             require(blocked_outputs["total_count"] == 0 and blocked_outputs["artifacts"] == [])
 
-            PHASE = "free_runner_storage_and_capacity"
+            PHASE = "private_draft_room"
+            evidence("CAPACITY_WINDOW", measured_epoch=int(now().timestamp()), latest_start_epoch=latest, storage_until_epoch=until,
+                     ceiling_bytes=ceiling, draft_assets=len(draft["assets"]))
             owner.storage.draft_room(draft, env, claim=True)
             inventory = []
             ordinary_rows = owner.storage.receipt_rows
@@ -157,24 +233,47 @@ jobs:
                 rows = ordinary_rows(*args, **kwargs)
                 inventory.append((len(rows), sum(row[0] for row in rows.values())))
                 return rows
+            def public_get(path):
+                global PHASE
+                artifact = re.fullmatch(re.escape(api.BASE) + r"/actions/artifacts\?per_page=([0-9]+)&page=([0-9]+)", path)
+                active = re.fullmatch(re.escape(api.BASE) + r"/actions/runs\?status=(in_progress|queued|waiting|pending|requested)&per_page=2", path)
+                PHASE = "artifact_page" if artifact else "active_runs" if active else "public_repository"
+                result = api.metadata(path)
+                if active:
+                    reported, rows = result.get("total_count"), result.get("workflow_runs")
+                    count = len(rows) if isinstance(rows,list) else -1
+                    if count or reported != count:
+                        ids = [r["id"] for r in rows if isinstance(r,dict) and type(r.get("id")) is int][:2] if isinstance(rows,list) else []
+                        evidence("ACTIVE_RUN_VIEW", state=active[1], reported=reported if type(reported) is int else -1, rows=count, ids=ids)
+                PHASE = "artifact_inventory" if artifact else "active_run_inventory" if active else "standard_runner"
+                return result
             owner.storage.receipt_rows = count_returned
-            for retry in (0, 8, 16):
-                if retry:
-                    time.sleep(retry)
-                window()
-                journal = io.StringIO()
-                try:
-                    with redirect_stdout(journal):
-                        verdict = owner.storage.admit(api.metadata, env, owner.storage.lease_size(env),
-                                                     1, stage="lease", lead=owner.SEGMENT)
-                    break
-                except owner.storage.StorageUnconfirmed as error:
-                    if retry == 16 or "inventory" not in str(error).lower():
+            try:
+                for attempt, retry in enumerate((0, 8, 16), 1):
+                    if retry:
+                        time.sleep(retry)
+                    PHASE = "lease_window"
+                    window()
+                    PHASE = "storage_policy"
+                    journal = io.StringIO()
+                    try:
+                        with redirect_stdout(journal):
+                            verdict = owner.storage.admit(public_get, env, owner.storage.lease_size(env),
+                                                         1, stage="lease", lead=owner.SEGMENT)
+                    except Exception as error:
+                        print_storage_records(journal)
+                        details = safe_failure(error)
+                        evidence("STORAGE_REJECT", attempt=attempt, phase=PHASE, **details)
+                        if attempt < 3 and isinstance(error, owner.storage.StorageUnconfirmed) and "inventory" in str(error).lower():
+                            continue
                         raise
-            owner.storage.receipt_rows = ordinary_rows
-            require(verdict == "admitted" and inventory)
-            lines = journal.getvalue().splitlines()
-            receipt, = [json.loads(s.removeprefix("R28_ARTIFACT_ADMISSION ")) for s in lines if s.startswith("R28_ARTIFACT_ADMISSION ")]
+                    admission = print_storage_records(journal)
+                    break
+            finally:
+                owner.storage.receipt_rows = ordinary_rows
+            PHASE = "aggregate_confirmation"
+            require(verdict == "admitted" and inventory and len(admission) == 1)
+            receipt = admission[0]
             count, total = inventory[-1]
             require(total == receipt["known_repository_bytes"])
             PHASE = "final_head_alias_and_claim_state"
@@ -198,9 +297,7 @@ jobs:
             try:
                 print(json.dumps(preissue(), sort_keys=True))
             except Exception as e:
-                # Only controlled labels/status may appear on the public repository.
-                status = re.fullmatch(r"(GitHub metadata GET|Asset retrieval) returned ([1-5][0-9]{2})", str(e))
-                print("Read-only preissue failed at " + PHASE + (": HTTP " + status[2] if status else ""), file=sys.stderr)
+                evidence("PREISSUE_FAILURE", phase=PHASE, **safe_failure(e))
                 sys.exit(1)
         PYTHON
         python3 -I "$RUNNER_TEMP/current-preissue.py"
