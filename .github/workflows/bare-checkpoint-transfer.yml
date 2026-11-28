@@ -9,6 +9,10 @@ run-name: Bare Personal 2.0.9 ARM64 build
         options:
         - build-apk
         default: build-apk
+      owner_alias_sha:
+        description: SHA-256 of the owner-observed Draft tag after saving this ticket
+        type: string
+        required: true
       ticket_id:
         type: string
         description: Immutable owner ticket asset ID or lookup by verified digest
@@ -35,6 +39,7 @@ jobs:
       actions: read
     env:
       BARE_GENERATION: 2.0.9
+      R209_DRAFT_ALIAS_SHA: ${{ inputs.owner_alias_sha }}
       R28_HEAD_SHA: ${{ github.sha }}
     outputs:
       ordinal: ${{ steps.source.outputs.ordinal }}
@@ -71,6 +76,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
       ticket_id: ${{ inputs.ticket_id }}
       ticket_sha: ${{ inputs.ticket_sha }}
       genesis: ${{ needs.admit.outputs.genesis }}
@@ -90,6 +96,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
       ticket_id: ${{ inputs.ticket_id }}
       ticket_sha: ${{ inputs.ticket_sha }}
       genesis: ${{ needs.admit.outputs.genesis }}
@@ -109,6 +116,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
       ticket_id: ${{ inputs.ticket_id }}
       ticket_sha: ${{ inputs.ticket_sha }}
       genesis: ${{ needs.admit.outputs.genesis }}
@@ -128,6 +136,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
       ticket_id: ${{ inputs.ticket_id }}
       ticket_sha: ${{ inputs.ticket_sha }}
       genesis: ${{ needs.admit.outputs.genesis }}
@@ -147,6 +156,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
       ticket_id: ${{ inputs.ticket_id }}
       ticket_sha: ${{ inputs.ticket_sha }}
       genesis: ${{ needs.admit.outputs.genesis }}
@@ -166,6 +176,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
       ticket_id: ${{ inputs.ticket_id }}
       ticket_sha: ${{ inputs.ticket_sha }}
       genesis: ${{ needs.admit.outputs.genesis }}
@@ -185,6 +196,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
       ticket_id: ${{ inputs.ticket_id }}
       ticket_sha: ${{ inputs.ticket_sha }}
       genesis: ${{ needs.admit.outputs.genesis }}
@@ -204,6 +216,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
       ticket_id: ${{ inputs.ticket_id }}
       ticket_sha: ${{ inputs.ticket_sha }}
       genesis: ${{ needs.admit.outputs.genesis }}
@@ -223,6 +236,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
       ticket_id: ${{ inputs.ticket_id }}
       ticket_sha: ${{ inputs.ticket_sha }}
       genesis: ${{ needs.admit.outputs.genesis }}
@@ -242,6 +256,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
       ticket_id: ${{ inputs.ticket_id }}
       ticket_sha: ${{ inputs.ticket_sha }}
       genesis: ${{ needs.admit.outputs.genesis }}
@@ -261,6 +276,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
       ticket_id: ${{ inputs.ticket_id }}
       ticket_sha: ${{ inputs.ticket_sha }}
       genesis: ${{ needs.admit.outputs.genesis }}
@@ -280,6 +296,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/bare-personal209-slot.yml
     with:
+      owner_alias_sha: ${{ inputs.owner_alias_sha }}
       ticket_id: ${{ inputs.ticket_id }}
       ticket_sha: ${{ inputs.ticket_sha }}
       genesis: ${{ needs.admit.outputs.genesis }}

@@ -24,6 +24,7 @@ def load(name,path):
 class AliasTests(unittest.TestCase):
     def setUp(self):
         self.stack=contextlib.ExitStack();self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.dict(os.environ, BARE_GENERATION="", R209_DRAFT_ALIAS_SHA=""))
         work=Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         env=dict(os.environ,RUNNER_TEMP=str(work),GITHUB_WORKSPACE=str(ROOT))
         subprocess.run([sys.executable,str(ROOT/"preflight28/transport/prepare.py"),"tools"],env=env,
@@ -97,6 +98,66 @@ class AliasTests(unittest.TestCase):
                 self.lookup()
         with patch.dict(self.assets[0],id=67),self.assertRaises(self.helper.Invalid):self.lookup()
         with patch.dict(self.assets[-1],id=78),self.assertRaises(self.helper.Invalid):self.lookup()
+
+    def test_209_reads_both_physical_claims_on_each_editor_save_and_each_new_read(self):
+        self.stack.enter_context(patch.dict(os.environ, BARE_GENERATION="2.0.9"))
+        self.release["url"] = f"https://api.github.com{self.helper.BASE}/releases/{self.helper.RELEASE_ID}"
+        # The initial API Release response need not contain either original claim.
+        self.release["assets"] = self.assets[:2]
+        for char in ("1", "a"):
+            current = "untagged-" + char * 20
+            self.url(current)
+            os.environ["R209_DRAFT_ALIAS_SHA"] = hashlib.sha256(current.encode()).hexdigest()
+            for api_tag in (None, "", current):
+                self.release["tag_name"] = api_tag
+                self.assertEqual(self.lookup()["assets"], self.assets)
+                self.assertEqual([c.args[0] for c in self.get.call_args_list[-2:]],
+                                 [c[1] for c in self.anchor.CLAIMS])
+        self.assertEqual(self.get.call_count, 12)
+        for name, aid, size, sha in self.anchor.CLAIMS:
+            # Identical metadata, including ID and SHA; same length, different bytes.
+            with self.subTest(claim=name), patch.dict(self.claim_bytes, {aid: bytes(size)}), self.assertRaises(ValueError):
+                self.lookup()
+
+    def test_209_rejects_wrong_provider_paths_receipts_and_legacy_tag_shortcut(self):
+        self.stack.enter_context(patch.dict(os.environ, BARE_GENERATION="2.0.9"))
+        self.release["url"] = f"https://api.github.com{self.helper.BASE}/releases/{self.helper.RELEASE_ID}"
+        for tag in (OLD, NEW, "refs/tags/untagged-" + "a"*20, "untagged-" + "A"*20,
+                    "untagged-" + "f"*19, "untagged-" + "f"*21, "untagged-" + "g"*20):
+            self.url(tag)
+            digest = hashlib.sha256(tag.encode()).hexdigest()
+            with self.subTest(tag=tag), patch.dict(os.environ, R209_DRAFT_ALIAS_SHA=digest), self.assertRaises(ValueError):
+                self.lookup()
+        self.url("untagged-" + "b"*20)
+        errors = (ValueError, self.helper.Invalid)
+        checksum = hashlib.sha256(self.release["tag_name"].encode()).hexdigest()
+        for supplied in ("", "x"*64, checksum.upper(), "0"*64, hashlib.sha256(("untagged-"+"a"*20).encode()).hexdigest()):
+            with self.subTest(supplied=supplied), patch.dict(os.environ, R209_DRAFT_ALIAS_SHA=supplied), self.assertRaises(ValueError):
+                self.lookup()
+        os.environ["R209_DRAFT_ALIAS_SHA"] = checksum
+        for other_generation in ("", "2.0.4", "2.0.10"):
+            with self.subTest(generation=other_generation), patch.dict(os.environ, BARE_GENERATION=other_generation), self.assertRaises(self.helper.Invalid):
+                self.lookup()
+        url = self.release["html_url"]
+        for override in (dict(tag_name=OLD), dict(html_url=url+"?query"), dict(html_url=url+"#other"),
+                         dict(html_url=url.replace("github.com/", "github.com.evil.invalid/")),
+                         dict(url=self.release["url"].replace("/repos/", "/other/")), dict(id=self.helper.RELEASE_ID+1),
+                         dict(draft=False), dict(published_at="2026-11-28"), dict(target_commitish="other"),
+                         dict(name="wrong"), dict(author=dict(id=1,login=self.helper.OWNER))):
+            with self.subTest(fields=list(override)), patch.dict(self.release, override), self.assertRaises(errors):
+                self.lookup()
+        for index in (0, 1, 2, 3):
+            for override in (dict(id=98765), dict(size=1), dict(digest="sha256:"+"0"*64), dict(state="starter")):
+                with self.subTest(row=index, fields=list(override)), patch.dict(self.assets[index], override), self.assertRaises(errors):
+                    self.lookup()
+        for override in (dict(name="wrong-name.json"), dict(digest="sha256:"+"f"*64)):
+            stale = [dict(self.assets[0], **override)]
+            with patch.dict(self.release, assets=stale), self.assertRaises(ValueError):
+                self.lookup()
+        duplicate = dict(self.assets[2], id=123456789)
+        self.assets.append(duplicate)
+        with self.assertRaises(ValueError):
+            self.lookup()
 
 
 if __name__=="__main__":unittest.main()

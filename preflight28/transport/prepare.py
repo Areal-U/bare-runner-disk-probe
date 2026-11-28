@@ -40,14 +40,17 @@ def once(script, old, new):
 def stage_tools():
     for name in ("archive_helpers.sh", "draft_transfer.sh"):
         shell(recipe(name))
-    # The owner saved the same untagged Draft and GitHub assigned a new permalink.
-    # Retain every historical check and require the previously read claim bytes for that exact alias.
+    # GitHub assigns another temporary permalink when the owner saves an untagged Draft.
     transfer_source = TEMP / "transfer.py"
     old_gate = '''    require(pinned_tag(tag) or (tag in (None, "") and pinned_tag(permalink_tag)),
             "Draft tag or permalink differs from the independently verified owner draft")'''
-    alias_gate = '''    if not (pinned_tag(tag) or (tag in (None, "") and pinned_tag(permalink_tag))):
+    alias_gate = '''    generation_209 = os.environ.get("BARE_GENERATION") == "2.0.9"
+    observed_sha = os.environ.get("R209_DRAFT_ALIAS_SHA")
+    require(generation_209 or not observed_sha, "Owner Draft dispatch digest supplied for a different generation")
+    if generation_209 or not (pinned_tag(tag) or (tag in (None, "") and pinned_tag(permalink_tag))):
         from r28_verified_draft import validate
-        validate(record, release_id, tag, permalink_tag, BASE, metadata, asset_info, download)'''
+        record = validate(record, release_id, tag, permalink_tag, BASE, metadata, asset_info, download,
+                          generation_209=generation_209, observed_alias_sha=observed_sha)'''
     transfer_source.write_text(once(transfer_source.read_text(), old_gate, alias_gate))
     (TEMP / "r28_verified_draft.py").write_bytes(Path(__file__).with_name("draft_anchor.py").read_bytes())
     import importlib
