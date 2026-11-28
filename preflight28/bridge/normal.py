@@ -29,6 +29,10 @@ JOB_MINUTES = 350
 DOWNLOAD_MINUTES = 10
 PUBLISH_MINUTES = 20
 SENDER_MARGIN_MINUTES = 5
+if R209 and os.environ.get("R209_RELAY_TRIAL") == "true":
+    # The diagnostic slot is a physical 50-minute job. Its two measured
+    # packets, one archive part and immutable manifest have smaller tails.
+    JOB_MINUTES, DOWNLOAD_MINUTES, PUBLISH_MINUTES, SENDER_MARGIN_MINUTES = 50, 4, 7, 3
 UPLOAD_MINUTES = 4
 VISIBILITY_MINUTES = 2
 # Pinned GitHub HTTP client uses a 150s socket timeout per anonymous GET.
@@ -326,7 +330,7 @@ def get_manifest(mid, expected_sha, number, *, run_id=None):
                   (r30_parent.SHA, r30_parent.IDENTITY, r30_parent.PROOF, r30_parent.SIZE, r30_parent.S2),
                   "Pinned S1 manifest disagrees with the validated checkpoint")
     for i,p in enumerate(m["parts"]):
-        name=stem(number, run_id=run)+f"-p{i:02}"
+        name=private_stem(number, run_id=run)+f"-p{i:02}"
         b.require(p["name"] in (name,name+"-retry1") and p["bytes"]==min(PART,m["bytes"]-i*PART)
                   and sha_check(p["sha256"]),"Unbound checkpoint part")
         api.asset_info(rel,p["name"],p["bytes"],p["sha256"],p["id"])
