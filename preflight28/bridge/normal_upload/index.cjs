@@ -24,11 +24,17 @@ function regular(file, maxSize) {
 function validateScope(env) {
   const run = env.GITHUB_RUN_ID;
   const slot = Number(env.R28_SLOT);
+  const personal209 = env.BARE_GENERATION === '2.0.9';
+  const production209 = env.GITHUB_REF === 'refs/heads/bare-coexist-v2.0.9';
+  requireCondition((personal209 && production209 && env.GITHUB_SHA === env.R28_HEAD_SHA &&
+    env.GITHUB_EVENT_NAME === 'workflow_dispatch') || (!env.BARE_GENERATION && !production209),
+    'Unexpected workflow generation');
+  const maxCandidate = personal209 ? 99 : 12;
   requireCondition(env.GITHUB_REPOSITORY === 'Areal-U/bare-runner-disk-probe' &&
     env.GITHUB_JOB === 'compile-probe' && env.GITHUB_RUN_ATTEMPT === '1' &&
     /^[1-9]\d*$/.test(run) && Number.isSafeInteger(Number(run)) &&
-    /^(?:[1-9]|1[0-3])$/.test(env.R28_SLOT), 'Unexpected originating worker or slot');
-  const name = `r28-${run}-a1-s${String(slot).padStart(2, '0')}-outcome`;
+    /^[1-9]\d?$/.test(env.R28_SLOT) && slot <= (personal209 ? 99 : 13), 'Unexpected originating worker or slot');
+  const name = `${personal209 ? 'r209' : 'r28'}-${run}-a1-s${String(slot).padStart(2, '0')}-outcome`;
   requireCondition(env.INPUT_NAME === name && env.INPUT_OVERWRITE === 'false' &&
     env['INPUT_RETENTION-DAYS'] === '1' && env['INPUT_COMPRESSION-LEVEL'] === '0' &&
     env['INPUT_IF-NO-FILES-FOUND'] === 'error', 'Invalid immutable upload settings');
@@ -36,14 +42,22 @@ function validateScope(env) {
   const outcome = path.join(base, 'outcome.json');
   regular(outcome, 64 * 1024);
   const receipt = JSON.parse(fs.readFileSync(outcome, 'utf8'));
+  const key = personal209 ? `bare-personal-209-${run}-1-checkpoint-s${slot}` :
+    `bare-coexist-204-${run}-1-checkpoint-production-s${slot}`;
   requireCondition(receipt.run === Number(run) && receipt.attempt === 1 && receipt.ordinal === slot &&
-    receipt.key === `bare-coexist-204-${run}-1-checkpoint-production-s${slot}` &&
+    receipt.schema === (personal209 ? 'bare-personal-209-checkpoint-v1' : 'bare-r28-checkpoint-private-v1') &&
+    receipt.key === key &&
     receipt.producer_sha === env.R28_HEAD_SHA && /^[a-f0-9]{40}$/.test(receipt.producer_sha),
     'Outcome is not bound to this run, slot and source');
+  if (personal209) {
+    requireCondition(receipt.parent_sha === env.R28_PARENT_SHA && /^[0-9a-f]{64}$/.test(receipt.parent_sha) &&
+      receipt.parent_identity === env.R28_PARENT_IDENTITY && /^[0-9a-f]{64}$/.test(receipt.parent_identity),
+      'Outcome does not match the admitted parent');
+  }
   const paths = [outcome];
   if (receipt.status === 'candidate') {
     const sealed = path.join(base, 'checkpoint.cms');
-    requireCondition(slot <= 12 && Number.isSafeInteger(receipt.bytes) && receipt.bytes > 0 &&
+    requireCondition(slot <= maxCandidate && Number.isSafeInteger(receipt.bytes) && receipt.bytes > 0 &&
       receipt.bytes <= MAX_PLAIN && receipt.sealed_bytes > receipt.bytes &&
       receipt.sealed_bytes === regular(sealed, receipt.bytes + 16 * 1024 ** 2) &&
       /^[a-f0-9]{64}$/.test(receipt.sealed_sha), 'Invalid sealed checkpoint receipt');

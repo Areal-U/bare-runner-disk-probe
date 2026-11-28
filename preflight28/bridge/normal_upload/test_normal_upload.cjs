@@ -21,7 +21,7 @@ function fixture() {
     INPUT_NAME: 'r28-45508307820-a1-s02-outcome', INPUT_PATH: outcome + '\n' + cipher, INPUT_OVERWRITE: 'false',
     'INPUT_RETENTION-DAYS': '1', 'INPUT_COMPRESSION-LEVEL': '0', 'INPUT_IF-NO-FILES-FOUND': 'error',
   };
-  const record = {run: Number(env.GITHUB_RUN_ID), attempt: 1, ordinal: 2, producer_sha: env.R28_HEAD_SHA,
+  const record = {schema: 'bare-r28-checkpoint-private-v1', run: Number(env.GITHUB_RUN_ID), attempt: 1, ordinal: 2, producer_sha: env.R28_HEAD_SHA,
     key: 'bare-coexist-204-45508307820-1-checkpoint-production-s2', status: 'candidate',
     bytes: 12, sealed_bytes: 24, sealed_sha: '8'.repeat(64)};
   fs.writeFileSync(outcome, JSON.stringify(record));
