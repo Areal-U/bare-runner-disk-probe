@@ -85,6 +85,7 @@ class Receive(unittest.TestCase):
     make_candidate = original.OutcomeTransport.make_candidate
 
     def wire(self, outcome, sealed, *, cap, draft):
+        self.enterContext(patch.object(receiver.packet_space, "before_assembly"))
         svc = Service(self.tmp, outcome, sealed, cap)
         for method in ("key", "exact", "restore", "read_piece", "make_receipt", "save", "folder"):
             self.enterContext(patch.object(receiver.packets, method, getattr(svc, method)))
@@ -175,6 +176,7 @@ class Receive(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('age') and shutil.which('age-keygen'), 'requires age and age-keygen')
     def test_signed_packets_and_signed_ack_between_separate_keys(self):
+        self.enterContext(patch.object(receiver.packet_space, "before_assembly"))
         archive, publisher, _, draft = self.make_candidate()
         normal, bridge, packet = original.normal, original.bridge, receiver.packets
         sealed = (self.normal/"checkpoint.cms").read_bytes()

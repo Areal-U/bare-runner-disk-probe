@@ -70,6 +70,16 @@ class Capacity(unittest.TestCase):
         with patch.dict(os.environ,{'R28_RELAY_BYTE_CEILING':str(3*1024**3)}):
             with self.assertRaisesRegex(ValueError,'Full relay'): self.admit()
 
+    def test_missing_current_run_and_competing_run(self):
+        with patch.object(p.storage,'active_listing',return_value=((),[])),patch.object(time,'sleep'):
+            with self.assertRaisesRegex(ValueError,'Current run is missing'): self.admit()
+        def competing(path):
+            if '/actions/runs?status=in_progress' in path:
+                return dict(total_count=2,workflow_runs=[dict(id=123),dict(id=456)])
+            return self.get(path)
+        with patch.object(p,'get_before',return_value=competing):
+            with self.assertRaisesRegex(ValueError,'Another run 456'): self.admit()
+
     def test_maximum_size_measured_groups_and_delayed_credits(self):
         group,seconds=sender.plan(self.admit())
         self.assertGreaterEqual(group,1)
@@ -96,11 +106,11 @@ class Capacity(unittest.TestCase):
         row=dict(self.row,id=99)
         piece={'meter_barrier':True}
         with patch.object(p,'snapshot',side_effect=[({99:row},(0,0)),({99:row},(self.storage,1))]), \
-                patch.object(p,'pause') as wait:
+                patch.object(time,'sleep') as wait:
             p.before_delete(piece,row,self.deadline)
             self.assertEqual(wait.call_count,1)
         with patch.object(p,'exact',side_effect=[row,None,None]), \
-                patch.object(p,'snapshot',side_effect=[({},(self.storage,1)),({},(0,0))]),patch.object(p,'pause') as wait:
+                patch.object(p,'snapshot',side_effect=[({},(self.storage,1)),({},(0,0))]),patch.object(time,'sleep') as wait:
             sender.await_release(piece,row,self.deadline)
             self.assertEqual(wait.call_count,2)
         with patch.object(p,'snapshot',return_value=({},(0,0))):
@@ -150,6 +160,39 @@ class SafeTar(unittest.TestCase):
             self.assertNotEqual(self.create(info).returncode,0)
             self.assertFalse((self.root/'escaped').exists())
 
+    def test_existing_signed_private_ack_prevents_second_publication(self):
+        ctx = {'run':987,'ordinal':1,'attempt':1,'producer_sha':'c'*40}
+        ref = 'refs/heads/bare-coexist-v2.0.9'
+        with patch.dict(os.environ,{'GITHUB_REF':ref,'R28_COLLECTION_CLAIM':'876'}), \
+                patch.object(p.normal,'context',return_value=ctx),patch.object(p.normal,'R209',True), \
+                patch.object(p.normal,'ROOT',self.root),patch.object(p.normal,'private_stem',return_value='r209-987-a1-s01',create=True):
+            p.b.openssl('req','-new','-x509','-newkey','rsa:2048','-keyout',self.root/'key.pem',
+                        '-out',self.root/'writer.pem','-nodes','-subj','/CN=packet-receipt-test','-days','1')
+            directory=p.folder('packet')
+            piece={'index':0,'claim':876,'bytes':3,'sha256':p.sha(b'one'),'outcome':{'status':'candidate'},
+                   'meter_barrier':True}
+            row=dict(id=12,key=p.key(0),ref=ref,version=p.version('packet'),size_in_bytes=512)
+            stage=dict(id=543,name='r209-987-a1-s01-packet-000',bytes=3,sha256=p.sha(b'one'))
+            (directory/'piece.bin').write_bytes(b'one')
+            (directory/'piece.json').write_bytes(p.data(piece))
+            ack=p.make_receipt(piece,row,stage)
+            self.assertEqual(p.verify_receipt(piece,row),ack)
+            def prepare(spare,previous):
+                self.assertIsNone(spare)
+                self.assertEqual(previous,p.sha(p.data(piece)))
+            with patch.object(p,'exact',side_effect=[None,{'id':13}]),patch.object(p,'restore'), \
+                    patch.object(p,'capacity') as gate,patch.object(p,'sdk') as upload:
+                self.assertEqual(p.save('packet',0,time.time()+30,3,prepare=prepare),row)
+                upload.assert_not_called();gate.assert_not_called()
+            # A substituted physical ID must fail before considering the stale ACK.
+            with patch.object(p,'exact',side_effect=[dict(row,id=14),{'id':13}]),patch.object(p,'restore'), \
+                    patch.object(p,'sdk') as upload:
+                with self.assertRaisesRegex(ValueError,'physical ID changed'):
+                    p.save('packet',0,time.time()+30,3,prepare=prepare)
+                upload.assert_not_called()
+            (p.folder('receipt')/'receipt.json').write_bytes(p.data(dict(ack,index=1)))
+            with self.assertRaises(subprocess.CalledProcessError): p.verify_receipt(piece,row)
+
     def test_substituted_or_non_executable_hook_fails_closed(self):
         hook=p.checked_hook()
         hook.chmod(0o600)
@@ -186,6 +229,21 @@ const u = __nccwpck_require__(98299);
         self.assertEqual(proc.returncode,0,proc.stdout+proc.stderr)
         self.assertEqual((folder/'piece.bin').read_bytes(),b'piece.bin')
         self.assertIn(str(p.checked_hook()).encode(),proc.stdout)
+        # The real restore-only CLI writes three native GITHUB_OUTPUT records. Stub
+        # only the network restore result and check exact-key and wrong-key vectors.
+        entry_stub=b"""const cache = __nccwpck_require__(5116);
+cache.restoreCache = async () => process.env.RETURNED_KEY;
+(0, restoreImpl_1.restoreOnlyRun)(true);"""
+        local.write_bytes(blob.replace(entry,entry_stub))
+        out=self.root/'action-output'
+        env.update(GITHUB_OUTPUT=str(out),GITHUB_REF='refs/heads/production',ACTIONS_CACHE_URL='http://unused',
+                   ACTIONS_RESULTS_URL='http://unused',INPUT_PATH=str(p.PACKET_PATH),INPUT_KEY='the-exact-key',
+                   INPUT_ENABLECROSSOSARCHIVE='false')
+        for matched in ('the-exact-key','foreign-prefix'):
+            out.write_text('')
+            subprocess.run(cmd,cwd=self.ws,env=dict(env,RETURNED_KEY=matched),capture_output=True,check=True)
+            self.assertEqual(p.outputs(out.read_text()),{'cache-primary-key':'the-exact-key',
+                             'cache-matched-key':matched,'cache-hit':str(matched=='the-exact-key').lower()})
 
 
 if __name__=='__main__':

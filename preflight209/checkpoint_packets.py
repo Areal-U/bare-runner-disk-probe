@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -156,7 +157,7 @@ def inventory(get):
     seen = {}
     total = None
     for page in range(1,52):
-        value = get(f'{BASE}/actions/caches?per_page=100&page={page}')
+        value = get(f'{BASE}/actions/caches?per_page=100&page={page}&sort=created_at&direction=asc')
         rows, n = value['actions_caches'],value['total_count']
         REQUIRE(type(n) is int and 0<=n<=5000 and isinstance(rows,list) and
                 (total is None or total==n) and len(rows)==min(100,max(0,n-100*(page-1))),
@@ -193,6 +194,16 @@ def accounted(view):
     return usage==(sum(r['size_in_bytes'] for r in rows.values()),len(rows))
 
 
+def exclusive(get,env,deadline):
+    for delay in (0,2,4):
+        if delay:
+            time.sleep(min(delay,until(deadline)))
+        present,issues = storage.active_listing(get,int(env['GITHUB_RUN_ID']))
+        if not issues and present==('in_progress',):
+            return
+    raise storage.StorageUnconfirmed('Current run is missing from a stable sole active-run inventory')
+
+
 def capacity(required_bytes, pending_whole_bytes, latest_epoch, *, debt=0, lead=0):
     """Return additional unallocated bytes after this write and unsettled prior writes."""
     env = os.environ
@@ -202,7 +213,7 @@ def capacity(required_bytes, pending_whole_bytes, latest_epoch, *, debt=0, lead=
     get = get_before(latest_epoch)
     ceiling,expiry = storage.config(env)
     storage.public_host(get(BASE),env.get('RUNNER_ENVIRONMENT'))
-    storage.check_active_runs(get,env)
+    exclusive(get,env,latest_epoch)
     configured = storage.integer(get(BASE+'/actions/cache/storage-limit')['max_cache_size_gb'],'service cache limit')
     REQUIRE(configured<=10, 'Service permits cache growth beyond free capacity')
     REQUIRE(lead in (0,normal.JOB_MINUTES*60), 'Unknown storage lead')
@@ -211,7 +222,7 @@ def capacity(required_bytes, pending_whole_bytes, latest_epoch, *, debt=0, lead=
     count = math.ceil(pending_whole_bytes/PACKET_BYTES)
     REQUIRE(pending_whole_bytes+count*2*MIB<=ceiling, 'Full relay exceeds ticket byte ceiling')
     rows,usage = snapshot(latest_epoch)
-    storage.check_active_runs(get,env)
+    exclusive(get,env,latest_epoch)
     until(latest_epoch)
     # The finite owner Artifact policy bounds operations through independent readback.
     # Cache free capacity is separately service-enforced, including after interruption.
@@ -315,29 +326,63 @@ def sdk(mode,kind,index,deadline):
                         'R209_PACKET_KIND':kind})
             REQUIRE(shutil.which('tar',path=env['PATH'])==str(hook),'Safe cache extraction hook does not resolve')
         # R209_PACKET_NODE is set only by the local node24 action.
-        proc = subprocess.run([os.environ['R209_PACKET_NODE'],str(path)],cwd=os.environ['GITHUB_WORKSPACE'],
-                              env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
-                              timeout=min(300,until(deadline)))
+        remaining = min(300,until(deadline))
+        proc = subprocess.Popen([os.environ['R209_PACKET_NODE'],str(path)],cwd=os.environ['GITHUB_WORKSPACE'],
+                                env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+        try:
+            code = proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            # Stop any compression/extraction children too. A timed-out PUT is
+            # unresolved until its immutable service row or private ACK can be read.
+            try:
+                os.killpg(proc.pid,signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+            code = -1
+        print(f'R209_PACKET_SDK mode={mode} kind={kind} index={index} exit={code}',flush=True)
         if mode=='restore':
-            REQUIRE(proc.returncode==0 and regular(out,8192)>0, 'Official cache restore failed')
+            REQUIRE(code==0 and regular(out,8192)>0, 'Official cache restore failed')
             result = outputs(out.read_text())
             REQUIRE(result=={'cache-hit':'true','cache-primary-key':cache_key,'cache-matched-key':cache_key},
                     'Official cache restore did not return the exact primary key')
-        return proc.returncode
+        return code
 
 
-def save(kind,index,deadline,whole_bytes,*,debt=0):
-    measured = checked_files(kind,folder(kind))
-    bound = archive_bound((folder(kind)/'piece.bin').stat().st_size if kind=='packet' else 0)
+def save(kind,index,deadline,whole_bytes,*,debt=0,prepare=None):
+    directory = folder(kind)
+    if kind=='packet':
+        REQUIRE(prepare is not None,'A packet must be bound and signed at the admission decision')
+        bound = archive_bound(regular(directory/'piece.bin',PACKET_BYTES))
+    else:
+        checked_files(kind,directory)
+        bound = archive_bound(0)
     cache_key = key(index,kind)
     existing = exact(cache_key, deadline)
-    if existing:
-        # ACKs are deterministic and the restored signed content is checked by
-        # each endpoint. A lost PUT response cannot authorize another save.
-        REQUIRE(kind=='receipt', 'Unreconciled existing packet. Preserve it for recovery')
-        return existing
-    capacity(bound,whole_bytes,deadline,debt=debt)
-    sdk('save',kind,index,deadline)
+    if kind=='receipt' and existing:
+        return existing  # Both endpoints restore and verify the exact deterministic signed ACK.
+    if kind=='packet':
+        ack_key = key(index,'receipt')
+        ack = exact(ack_key,deadline)
+        if existing or ack:
+            # Never create a new physical ID for an acknowledged or unresolved earlier PUT.
+            ack = ack or wait_row(ack_key,deadline)
+            restore('receipt',index,ack,deadline)
+            record = read_json(folder('receipt')/'receipt.json',8192)
+            row = record['source']
+            REQUIRE(existing is None or existing==row,'Cached physical ID changed across private ACK')
+            prepare(None,record['piece_sha'])
+            piece = read_json(directory/'piece.json',64*1024)
+            verify_receipt(piece,row)
+            return row
+    spare = capacity(bound,whole_bytes,deadline,debt=debt)
+    if prepare is not None:
+        deadline = min(deadline,prepare(spare,None))
+    checked_files(kind,directory)
+    import packet_space
+    packet_space.before_save(checked_files(kind,directory))
+    reserve = min(30,until(deadline)/3)
+    sdk('save',kind,index,deadline-reserve)
     bound_end = min(deadline,time.time()+120)
     while True:
         row = exact(cache_key,bound_end)
@@ -361,6 +406,8 @@ def restore(kind,index,row,deadline):
     cache_key = key(index,kind)
     REQUIRE(exact(cache_key,deadline)==row,'Cache changed before restore')
     reset(kind)
+    import packet_space
+    packet_space.before_restore(row['size_in_bytes'],sum(BOUNDS[kind].values()))
     sdk('restore',kind,index,deadline)
     checked_files(kind,folder(kind))
     REQUIRE(exact(cache_key,deadline)==row,'Cache changed during restore')
@@ -462,7 +509,7 @@ def before_delete(piece,row,deadline):
         if accounted((rows,usage)):
             print(f'R209_PACKET_METER_HIGH id={row["id"]} bytes={usage[0]} count={usage[1]}',flush=True)
             return
-        pause(deadline)
+        time.sleep(min(30,until(deadline)))
 
 
 if __name__=='__main__':

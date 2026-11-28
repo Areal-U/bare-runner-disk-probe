@@ -14,12 +14,58 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'preflight28/bridge')
 import artifact_poll
 import bridge
 import storage_admission as storage
-from checkpoint209 import require, digest, valid_hex
+import owner
+from checkpoint209 import require, digest
+
+
+def final_history(env):
+    """Classify only uploads known to have run. A failed GET never certifies absence."""
+    first = env['R209_FIRST_UPLOAD'].split(',')
+    retry = env['R209_RETRY_UPLOAD'].split(',')
+    attempted, ids = [], set()
+    require(len(first) == len(retry) == 4, 'Missing upload history fields')
+    for gate, put, verdict, returned in (first, retry):
+        require(gate in ('skipped','success','failure') and put in ('skipped','success','failure') and
+                (put != 'skipped') == (gate == 'success') and verdict in ('','absent') and
+                (put != 'skipped' or not (verdict or returned)) and
+                (not returned or (verdict != 'absent' and returned.isascii() and returned.isdigit() and int(returned) > 0)),
+                'Unrecognized physical upload history')
+        if put != 'skipped':
+            attempted.append((verdict, returned))
+        if returned:
+            ids.add(int(returned))
+    require(first[0] != 'skipped' and ((retry[0] != 'skipped') == (first[2] == 'absent')) and
+            len(ids) <= 1, 'Conflicting physical upload attempts or IDs')
+    safe_absence = all(verdict == 'absent' and not returned for verdict, returned in attempted)
+    return bool(attempted), ids, safe_absence
+
+
+def observe(run, name, head, *, settled, get=None, clock=time.monotonic, sleep=time.sleep):
+    end = clock()+70
+    api = get if get is not None else bridge.api_before(end)
+    first_negative = None
+    while clock() < end:
+        try:
+            row = artifact_poll.lookup(run,name,api,repo=bridge.REPO,head=head)
+        except (artifact_poll.UnstableInventory, bridge.TransientReadError):
+            first_negative = None
+        else:
+            now = clock()
+            if now >= end:
+                break
+            if row is not None:
+                return row
+            if first_negative is None:
+                first_negative = now
+            elif now-first_negative >= settled:
+                return None
+        sleep(min(4,max(0,end-clock())))
+    raise ValueError('Original APK Artifact presence or absence did not settle')
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('mode', choices=['resolve','cache-prepare','cache-receipt'])
+    p.add_argument('mode', choices=['resolve','resolve-final','cache-prepare','cache-receipt'])
     p.add_argument('local', type=Path)
     p.add_argument('--id', type=int)
     args = p.parse_args()
@@ -66,19 +112,17 @@ def main():
                 print('R209_ENCRYPTED_CACHE', exact[0]['id'], cache_key, seal_sha)
                 return
         raise ValueError('Cache write not independently visible')
-    end = time.monotonic()+70
-    api = bridge.api_before(end)
-    while True:
-        a = artifact_poll.lookup(run, name, api, repo=bridge.REPO, head=os.environ['GITHUB_SHA'])
-        if a or time.monotonic()+4 >= end:
-            break
-        time.sleep(4)
-    if not a and not args.id:
-        bridge.output(decision='absent')
+    final = args.mode == 'resolve-final'
+    attempted, ids, safe_absence = final_history(os.environ) if final else (True,{args.id} if args.id else set(),True)
+    a = observe(run,name,os.environ['GITHUB_SHA'],settled=8 if final else 60)
+    if a is None and (final or not ids):
+        bridge.output(decision='absent' if safe_absence and not ids else 'unconfirmed')
         return
-    require(a and not a['expired'] and a['workflow_run']['id'] == run
+    require(a and attempted and not a['expired'] and a['workflow_run']['id'] == run
             and a['workflow_run']['head_sha'] == os.environ['GITHUB_SHA'] and
-            (not args.id or args.id == a['id']), 'Encrypted terminal artifact is missing or mismatched')
+            (not ids or a['id'] in ids) and a['workflow_run']['head_branch'] == owner.BRANCH and
+            a['workflow_run']['repository_id'] == a['workflow_run']['head_repository_id'] == owner.REPO_ID,
+            'Encrypted terminal artifact is missing, mismatched or had no physical PUT')
     # No credential goes to the signed-URL host (curl strips Authorization on redirect).
     with tempfile.TemporaryDirectory() as d:
         path = Path(d)/'terminal.zip'

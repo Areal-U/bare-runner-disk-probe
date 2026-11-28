@@ -4,6 +4,7 @@ Its source tree, simulated controller stop, and restore run belong only to
 the disk-probe workflow. No trial manifest can become a build predecessor.
 """
 import argparse
+import http.client
 import io
 import json
 import os
@@ -64,11 +65,12 @@ def physical_trial():
             checkpoint.valid_hex(run['head_sha'], 40) and checkpoint.valid_hex(event['inputs']['owner_alias_sha'])
             and env['R209_DRAFT_ALIAS_SHA'] == event['inputs']['owner_alias_sha'], 'Wrong diagnostic dispatch')
     created = int(owner.instant(run['created_at']).timestamp())
-    require(created <= time.time() < created + 75*60, 'Physical diagnostic window expired')
+    require(created <= time.time() < created + 140*60, 'Physical diagnostic window expired')
     return created
 
 
 def lease(created):
+    checkpoint.require(normal.slot() in (1,2) and os.environ['GITHUB_JOB']=='lease', 'Wrong trial registration')
     import unpublished_cold as origin
     by = normal.b.auth_api()
     release = normal.list_private(by)
@@ -92,14 +94,36 @@ def lease(created):
     storage.admit(by.metadata, config, 2*1024**2, 1, stage='peer')
     storage.cache_fallback(by.metadata, config, PACKET + 2*1024**2)
     checkpoint.require(len(release['assets']) + 26 <= 1000, 'Insufficient private Draft trial room')
-    record = normal.context() | dict(purpose='checkpoint-relay-trial-only', expires=created+75*60,
+    record = normal.context() | dict(purpose='checkpoint-relay-trial-only', expires=created+140*60,
                                      workflow=PATH, storage_ceiling=min(CEILING, ceiling), storage_until=until)
     binding = normal.put_json('diagnostic-binding.json', record)
     raw = io.BytesIO()
     by.download(binding['id'], binding['bytes'], binding['sha256'], raw)
     checkpoint.require(json.loads(raw.getvalue()) == record, 'Private diagnostic binding readback failed')
     bridge.output(claim=binding['id'], storage_ceiling=min(CEILING, ceiling), storage_until=until,
-                  latest_start=created+35*60, draft_id=bridge.RELEASE)
+                  latest_start=created+(25 if normal.slot()==1 else 80)*60, draft_id=bridge.RELEASE)
+
+
+def report_quota(stage):
+    # REST limits are shared and roll over hourly. Record the actual reset
+    # along with the timestamp so two different windows are never subtracted.
+    conn = http.client.HTTPSConnection('api.github.com', timeout=8)
+    try:
+        conn.request('GET','/rate_limit',headers={
+            'Authorization':'Bearer '+os.environ['GH_TOKEN'], 'User-Agent':'r209-diagnostic-read',
+            'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'})
+        reply = conn.getresponse()
+        if reply.status == 200:
+            core=json.loads(reply.read(16384))['resources']['core']
+            fields={k:core[k] for k in ('limit','used','remaining','reset')}
+            if all(type(v) is int and v>=0 for v in fields.values()):
+                print('R209_TRIAL_REST_QUOTA '+json.dumps(dict(stage=stage,epoch=int(time.time()),**fields)),flush=True)
+                return
+    except (OSError,http.client.HTTPException,ValueError,KeyError):
+        pass
+    finally:
+        conn.close()
+    print('R209_TRIAL_REST_QUOTA_UNAVAILABLE stage='+stage,flush=True)
 
 
 def stage_siso(dest):
@@ -188,6 +212,7 @@ def make_sample(root, siso, padding):
 
 
 def candidate():
+    checkpoint.require(normal.slot()==1 and os.environ['GITHUB_JOB']=='compile-probe', 'Wrong sample producer')
     # Only the diagnostic authenticator needs the worker's read credential.
     for key in ('GH_TOKEN', 'TRIAL_READ_TOKEN'):
         os.environ.pop(key, None)
@@ -204,6 +229,7 @@ def candidate():
 
 
 def route():
+    checkpoint.require(normal.slot()==1 and os.environ['GITHUB_JOB']=='compile-probe', 'Wrong trial relay invocation')
     import outcome_relay
     real = bridge.api_json
     old = [dict(id=1000+i,name=f'diagnostic-row-{i}',size_in_bytes=100+i,
@@ -243,31 +269,58 @@ def check_restore(root, siso, file, manifest):
 
 
 def restore():
+    checkpoint.require(normal.slot()==2 and os.environ['GITHUB_JOB']=='compile-probe',
+                       'Only the fresh ordinary worker can confirm the diagnostic predecessor')
+    # This is the same read-only job that normally follows an accepted slot.
+    # Its ephemeral key already decrypted the publisher's scoped descriptors
+    # and normal.acquire validated every part and the entire downloaded archive.
+    bridge.api_json(f'/repos/{owner.REPO}/releases/{bridge.RELEASE}', expected='denied')
+    fields=normal.info()
+    manifest=fields['source']
+    mid=bridge.env_int('R28_PARENT_MANIFEST')
+    sha=os.environ['R28_PARENT_MANIFEST_SHA']
+    checkpoint.require(fields['source_manifest_id']==mid and fields['source_manifest_sha']==sha and
+                       manifest['run']==bridge.env_int('GITHUB_RUN_ID') and manifest['attempt']==1 and
+                       manifest['ordinal']==1 and manifest['producer_sha']==os.environ['GITHUB_SHA'] and
+                       manifest['sha256']==os.environ['R28_PARENT_SHA'] and
+                       manifest['identity']==os.environ['R28_PARENT_IDENTITY'], 'Wrong authenticated trial predecessor')
+    for key in ('GH_TOKEN', 'TRIAL_READ_TOKEN'):
+        os.environ.pop(key, None)
     root=Path(os.environ['RUNNER_TEMP'])/'relay-trial-work'
     root.mkdir()
     siso=root/'tools/siso'
     stage_siso(siso)
-    mid=int(os.environ['MANIFEST'])
-    manifest=normal.get_manifest(mid,os.environ['MANIFEST_SHA'],1)
-    checkpoint.require(normal.same(manifest) and manifest['sha256']==os.environ['PARENT'] and
-                       manifest['identity']==os.environ['IDENTITY'], 'Wrong certified trial predecessor')
-    archive=root/'parent.tar.zst'
-    with archive.open('xb') as target:
-        by=normal.b.auth_api()
-        for part in manifest['parts']:
-            by.download(part['id'],part['bytes'],part['sha256'],target)
+    archive=normal.ROOT/'checkpoint.tar.zst'
     proof=check_restore(root,siso,archive,manifest)
+    bridge.output(kind='trial-restored',trial_manifest=mid,trial_manifest_sha=sha,
+                  trial_sha=manifest['sha256'], trial_identity=manifest['identity'])
     print(f'R209_TRIAL_RESTORED run={manifest["run"]} head={manifest["producer_sha"]} manifest={mid}'
-          f' bytes={manifest["bytes"]} sha256={manifest["sha256"]} remaining={proof["remaining"]}')
+          f' bytes={manifest["bytes"]} sha256={manifest["sha256"]} remaining={proof["remaining"]} ordinary_read_only=true')
+
+
+def certify():
+    env=os.environ
+    checkpoint.require(normal.slot()==2 and env['GITHUB_JOB']=='certify' and
+                       env['WORKER']=='trial-restored' and env['PEER']=='verify-only' and env['READBACK']=='false' and
+                       env['ADVANCED']=='false' and env['TRIAL_MANIFEST'].isdecimal() and
+                       env['TRIAL_MANIFEST']==env['R28_PARENT_MANIFEST'] and
+                       all(checkpoint.valid_hex(env[k]) and env[k]==env[v] for k,v in (
+                           ('TRIAL_MANIFEST_SHA','R28_PARENT_MANIFEST_SHA'),
+                           ('TRIAL_SHA','R28_PARENT_SHA'),('TRIAL_IDENTITY','R28_PARENT_IDENTITY'))),
+                       'Second worker, peer and original certified generation did not agree')
+    bridge.output(kind='trial-restored',manifest=env['TRIAL_MANIFEST'],manifest_sha=env['TRIAL_MANIFEST_SHA'],
+                  parent=env['TRIAL_SHA'],parent_identity=env['TRIAL_IDENTITY'])
 
 
 if __name__=='__main__':
     os.umask(0o077)
     arg=argparse.ArgumentParser(description=__doc__)
-    arg.add_argument('mode',choices=('lease','candidate','route','restore'))
+    arg.add_argument('mode',choices=('lease','candidate','route','restore','certify'))
     mode=arg.parse_args().mode
     created=physical_trial()
+    if mode in ('lease','route','certify'):
+        report_quota(f'slot{normal.slot()}-{mode}')
     if mode=='lease':
         lease(created)
     else:
-        {'candidate':candidate,'route':route,'restore':restore}[mode]()
+        {'candidate':candidate,'route':route,'restore':restore,'certify':certify}[mode]()

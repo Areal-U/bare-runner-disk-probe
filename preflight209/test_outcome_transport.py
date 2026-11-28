@@ -1,5 +1,7 @@
 """Exercise both ends of the workflow with real Python outcomes and disposable keys."""
 import hashlib
+import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -165,6 +167,73 @@ class OutcomeTransport(unittest.TestCase):
         self.assertEqual(archive.read_bytes(),recovered.read_bytes())
         with self.assertRaises(ValueError):
             owner_recovery.open_saved(envelope,receipt,owner_id,recovered,**(ctx|dict(claim_id=98)))
+
+
+    @unittest.skipUnless(shutil.which('age') and shutil.which('age-keygen'), 'requires age and age-keygen')
+    def test_guarded_trial_manifest_parts_and_ordinary_successor(self):
+        ref = self.env['GITHUB_REF']
+        event_file = self.tmp/'event.json'
+        event_file.write_text(json.dumps(dict(repository=dict(id=1450926240),sender=dict(id=292261483),
+             inputs=dict(checkpoint_trial='true', expected_head=self.env['GITHUB_SHA']))))
+        self.enterContext(patch.dict(os.environ,R209_RELAY_TRIAL='true',GITHUB_EVENT_PATH=str(event_file),
+                          GITHUB_WORKFLOW_REF=bridge.REPO+'/.github/workflows/bare-disk-probe.yml@'+ref))
+        archive, writer, _, draft = self.make_candidate()
+        (writer/'incoming').mkdir()
+        shutil.copyfile(self.normal/'input.json',writer/'input.json')
+        for name in ('checkpoint.cms','outcome.json'):
+            shutil.copyfile(self.normal/name,writer/'incoming'/name)
+        with patch.object(normal,'ROOT',writer),patch.object(bridge,'ROOT',writer):
+            normal.publish()
+        fields = dict(row.split('=',1) for row in self.outputs.read_text().splitlines())
+        mid, digest = int(fields['checkpoint_manifest_id']), fields['checkpoint_manifest_sha']
+        prefix = 'trial-r209-17-a1-s01'
+        manifest = normal.get_manifest(mid,digest,1)
+        self.assertEqual([p['name'] for p in manifest['parts']],[prefix+'-p00'])
+        row, = [asset for asset in draft.assets if asset['id']==mid]
+        self.assertEqual(row['name'],prefix+'-manifest.json')
+        with patch.dict(os.environ,R209_RELAY_TRIAL='false'):
+            with self.assertRaisesRegex(ValueError, 'Unrecognized private manifest'):
+                normal.get_manifest(mid,digest,1)
+            # Even a renamed manifest cannot authorize its diagnostic parts.
+            with patch.dict(row,name=row['name'].removeprefix('trial-')):
+                with self.assertRaisesRegex(ValueError,'Unbound checkpoint part'):
+                    normal.get_manifest(mid,digest,1)
+        self.enterContext(patch.dict(os.environ,R28_SLOT='2',R28_PARENT_SHA=manifest['sha256'],
+                          R28_PARENT_IDENTITY=manifest['identity'],R28_PARENT_MANIFEST=str(mid),
+                          R28_PARENT_MANIFEST_SHA=digest))
+        worker2, writer2 = self.tmp/'new-ordinary', self.tmp/'new-writer'
+        for role, target in [('ordinary',worker2),('limited',writer2)]:
+            with patch.object(normal,'ROOT',target),patch.object(bridge,'ROOT',target):
+                normal.keygen(role,25 if role=='ordinary' else 26,
+                              int(time.time()) if role=='limited' else None)
+                (target/'incoming').mkdir()
+        for name in ('holder.json','public.pem'):
+            shutil.copyfile(worker2/name,writer2/'incoming'/name)
+        with patch.object(normal,'ROOT',writer2),patch.object(bridge,'ROOT',writer2):
+            normal.issue()
+        shutil.copyfile(writer2/'input.cms',worker2/'incoming/input.cms')
+
+        class ScopedCDN:
+            def __init__(self,host,timeout):
+                if host not in bridge.CDN:
+                    raise AssertionError('Unexpected scoped read host')
+            def request(self,method,path,headers):
+                if method!='GET' or 'Authorization' in headers:
+                    raise AssertionError('Ordinary GET carried a repository credential')
+                self.asset=int(path.split('?',1)[0].rsplit('/',1)[1])
+            def getresponse(self):
+                class Response(io.BytesIO):
+                    status=200
+                return Response(draft.data[self.asset])
+            def close(self):
+                pass
+
+        with patch.object(normal,'ROOT',worker2),patch.object(bridge,'ROOT',worker2), \
+             patch.object(http.client,'HTTPSConnection',ScopedCDN), \
+             patch.object(bridge,'auth_api',side_effect=AssertionError('Ordinary job accessed the private API')):
+            normal.acquire()
+            self.assertEqual((worker2/'checkpoint.tar.zst').read_bytes(),archive.read_bytes())
+            self.assertEqual(normal.info()['source_manifest_id'],mid)
 
 
 if __name__ == '__main__':

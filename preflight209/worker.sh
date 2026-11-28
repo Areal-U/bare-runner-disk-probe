@@ -21,6 +21,8 @@ export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0 PYTHONDONTWRITEBYTECODE=1
 worker_start=$(cat "$RUNNER_TEMP/bare-probe-start")
 [[ $R209_FALLBACK_SECONDS =~ ^[1-9][0-9]{0,4}$ ]]
 (( R209_FALLBACK_SECONDS >= 15*60 && R209_FALLBACK_SECONDS < 350*60 ))
+[[ $R209_COMPILE_DISK_FLOOR =~ ^[1-9][0-9]{9,11}$ ]]
+(( R209_COMPILE_DISK_FLOOR >= 20*1024**3 ))
 # Both VMs must still exist while the cache confirmation is outstanding.
 worker_cutoff=$(( worker_start + 350*60 ))
 (( R209_SENDER_UNTIL <= worker_cutoff )) || export R209_SENDER_UNTIL=$worker_cutoff
@@ -45,7 +47,7 @@ phase=seed
 echo "R209_CONTROLLER_START slot=$R28_SLOT utc=$(date -u +%FT%TZ) allowed_seconds=$remaining command=autoninja target=chrome_public_apk"
 "${ctx[@]}" -e "COMPILE_STOP_EPOCH=$end" chromium-builder python3 /exchange/build_trial.py --phase "$phase" \
     --result /exchange/slot209/trial.json --log /exchange/slot209/trial.log --production --jobs 2 \
-    --seconds "$remaining" --max-output-bytes "$((18*1024**3))"
+    --seconds "$remaining" --min-free-bytes "$R209_COMPILE_DISK_FLOOR" --max-output-bytes "$((18*1024**3))"
 container=$(docker compose ps -q chromium-builder)
 [[ -n $container ]]
 volume=$(docker inspect "$container" --format '{{range .Mounts}}{{if eq .Destination "/work"}}{{.Name}}{{end}}{{end}}')

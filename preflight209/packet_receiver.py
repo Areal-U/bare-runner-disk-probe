@@ -11,6 +11,7 @@ import bridge as b
 import normal
 import owner_recovery
 import checkpoint_packets as packets
+import packet_space
 
 
 MANIFEST_SCHEMA = "bare-personal-209-private-packet-v1"
@@ -125,8 +126,6 @@ class Receiver:
             b.require(json.loads(seen.getvalue()) == piece, "Private control record differs")
             return
         size = outcome["sealed_bytes"]
-        if self.index == 0:
-            b.disk("before-private-packet-assembly", size + 16 * 1024**2)
         partial = normal.ROOT / "checkpoint-packets.partial"
         with partial.open("w+b" if self.index == 0 else "r+b") as dest:
             dest.seek(0, os.SEEK_END)
@@ -134,6 +133,7 @@ class Receiver:
                       "Gap in checkpoint packet assembly")
             dest.seek(self.received)
             dest.truncate()
+            packet_space.before_assembly(size, self.received)
             self.api.download(data["id"], data["bytes"], data["sha256"], dest)
             b.require(dest.tell() == self.received + piece["bytes"], "Incomplete private packet readback")
 
